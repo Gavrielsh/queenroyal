@@ -1,0 +1,23 @@
+node_modules
+.next
+out
+dist
+coverage
+
+# env / secrets
+.env
+.env.local
+.env.*.local
+
+# logs
+*.log
+npm-debug.log*
+
+# next generated
+next-env.d.ts
+
+# typescript incremental build info
+*.tsbuildinfo
+
+# misc
+.DS_Store

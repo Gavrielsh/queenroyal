@@ -1,0 +1,55 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Gateway & Cashier — local datastore.
+//
+// HARD RULE (ARCHITECTURE.md / .claude-instructions):
+//   This database holds IDENTITY, COMPLIANCE and STORE CATALOG data ONLY.
+//   It MUST NOT contain gc_balance, sc_balance, deposits, withdrawals, or any
+//   monetary state. The Go "True Engine" is the single source of truth for money.
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// A player identity. `id` is the canonical `user_id` the True Engine references.
+/// Auth + compliance attributes only — absolutely no financial fields.
+model User {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String
+  kycStatus    KycStatus @default(PENDING)
+  vipLevel     Int       @default(0)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  // 🚫 FORBIDDEN by architecture: gc_balance, sc_balance, deposits, withdrawals.
+  //    All balances are owned by the True Engine (Go) — never mirrored here.
+
+  @@map("users")
+}
+
+enum KycStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+/// Fiat purchase catalog. Pricing METADATA only (no balances).
+/// Seeded from `src/config/store-packages.ts`, which is the code source of truth.
+model StorePackage {
+  id            String   @id // e.g. "pkg_value_20"
+  label         String
+  priceUsdCents Int // integer USD cents charged by the PSP
+  gc            Int // Gold Coins granted (integer, whole coins)
+  sc            Int // Sweeps Coins granted as SC_Unplayed (integer, whole coins)
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@map("store_packages")
+}
