@@ -1,73 +1,113 @@
 /**
- * Data Transfer Objects for the Go "True Engine" ledger.
+ * Data Transfer Objects for the Go "True Engine" ledger, matching its ACTUAL wire
+ * contract (`internal/api/dto.go`, `internal/api/casino.go`, `internal/repository`).
  *
- * Every monetary field is a non-negative INTEGER in the currency's smallest engine
- * unit. No floating point values are ever constructed or forwarded.
+ * Every monetary field is a decimal **string** (whole-coin units, ≤ 4 dp) — never a
+ * number. The gateway validates the shape (`@/lib/money`) and forwards it verbatim.
  */
 
 export type Currency = "GC" | "SC";
 
-/** Snapshot of a player's balances as reported by the engine (read-only here). */
+/** Engine balance snapshot. Money values are strings (e.g. "12.3400"). */
 export interface EngineBalances {
-  gc: number;
-  sc_unplayed: number;
-  sc_redeemable: number;
+  gc: string;
+  sc_unplayed: string;
+  sc_redeemable: string;
 }
 
-/** Debit a wager from the player's balance. */
+/** Optional, size-capped (≤ 512 B canonical JSON) operator metadata. */
+export type EngineMetadata = Record<string, unknown>;
+
+/** POST /api/v1/bet — debit a wager. */
 export interface BetPayload {
-  transaction_id: string; // UUID v4 — also used as the idempotency key
-  user_id: string;
-  round_id: string; // shared id linking this bet to its settlement
+  operator_transaction_id: string; // deterministic idempotency anchor (stable across retries)
+  player_id: string; // the engine's player UUID (NOT our local user id)
   currency: Currency;
-  amount: number; // integer, > 0
-  game_id: string;
-  provider?: string;
-}
-
-/** Credit a win to the player's balance, linked to the originating bet. */
-export interface WinPayload {
-  transaction_id: string; // UUID v4 — also used as the idempotency key
-  user_id: string;
-  round_id: string; // "win_" + bet round id
-  bet_round_id: string; // the originating bet's round id
-  currency: Currency;
-  amount: number; // integer, > 0
-  game_id: string;
-  provider?: string;
-}
-
-/** Credit purchased coins after a confirmed fiat charge. */
-export interface DepositPayload {
-  transaction_id: string; // UUID v4 — also used as the idempotency key
-  user_id: string;
-  gc: number; // integer, >= 0
-  sc: number; // integer, >= 0 (credited as SC_Unplayed)
-  usd_cents: number; // integer cents actually charged by the PSP
-  package_id: string;
-  payment_ref: string; // PSP reference (e.g. Stripe PaymentIntent id)
-}
-
-/** Best-effort typing of the engine's success envelope. Engine remains authoritative. */
-export interface EngineTxResult {
-  transaction_id: string;
+  amount: string; // decimal string, > 0
+  game_id?: string;
   round_id?: string;
-  status: string; // e.g. "applied" | "duplicate"
+  metadata?: EngineMetadata;
+}
+
+/** POST /api/v1/win — credit a win, optionally linked to the originating bet. */
+export interface WinPayload {
+  operator_transaction_id: string;
+  player_id: string;
+  currency: Currency;
+  amount: string; // decimal string, > 0
+  game_id?: string;
+  round_id?: string;
+  reference_transaction_id?: string; // the BET's ledger_transaction_id (FK in the engine)
+  metadata?: EngineMetadata;
+}
+
+/** POST /api/v1/store/purchase — issue GC (+ optional SC_UNPLAYED promo) for a fiat buy. */
+export interface PurchasePayload {
+  operator_transaction_id: string;
+  player_id: string;
+  gc_amount: string; // decimal string, >= 0
+  sc_promo_amount?: string; // decimal string, >= 0 (credited as SC_UNPLAYED)
+  metadata?: EngineMetadata;
+}
+
+/** POST /api/v1/rollback — reverse a previously-committed BET. */
+export interface RollbackPayload {
+  operator_transaction_id: string; // the rollback's own (distinct) id
+  player_id: string;
+  reference_transaction_id: string; // the BET's ledger_transaction_id to reverse
+  metadata?: EngineMetadata;
+}
+
+/** POST /api/v1/player/create — provision a player (idempotent on external_id). */
+export interface CreatePlayerPayload {
+  external_id: string; // our local user id
+  username?: string;
+  email?: string;
+  country_code?: string;
+  status?: string;
+}
+
+export type EngineTxStatus = "PROCESSED" | "CACHED" | "GHOST_RECOVERED";
+
+/** The `result` object inside a successful bet/win/purchase/rollback envelope. */
+export interface EngineTxResult {
+  operator_code: string;
+  operator_transaction_id: string;
+  ledger_transaction_id: string;
+  player_id: string;
+  transaction_type: string; // "BET" | "WIN" | "DEPOSIT" | "WITHDRAWAL" | "ROLLBACK"
+  family: string; // "GC" | "SC" | ""
+  amount: string;
+  post_balances: EngineBalances;
+  status: EngineTxStatus | string;
+}
+
+/** POST /api/v1/player/create 2xx body (flat — NOT wrapped in `result`). */
+export interface CreatePlayerResult {
+  player_id: string;
+  created: boolean; // false = already existed (idempotent replay)
   balances: EngineBalances;
 }
 
-/** Normalized error body surfaced to the caller (and onward to the frontend). */
+/** Engine success envelope for bet/win/purchase/rollback: `{ code, result }`. */
+export interface EngineSuccessEnvelope<T> {
+  code: string; // "OK"
+  result: T;
+}
+
+/** Engine error envelope: `{ code, message, trace_id }`. */
 export interface TrueEngineErrorBody {
-  code: string; // e.g. "INSUFFICIENT_FUNDS", "UNAUTHORIZED_SIGNATURE"
+  code: string; // e.g. "INSUFFICIENT_FUNDS", "AUTHENTICATION_FAILED"
   message: string;
+  trace_id?: string;
   details?: unknown;
 }
 
 /**
  * Discriminated result of any engine call. The client NEVER throws for HTTP/engine
- * or transport failures — callers branch on `ok` so a bad ledger response can never
- * crash the Node process.
+ * or transport failures. `retryable` follows the engine's documented status policy
+ * (409 + 5xx + timeout are safe to retry with the SAME operator_transaction_id).
  */
 export type TrueEngineResult<T> =
   | { ok: true; status: number; data: T }
-  | { ok: false; status: number; error: TrueEngineErrorBody };
+  | { ok: false; status: number; retryable: boolean; error: TrueEngineErrorBody };

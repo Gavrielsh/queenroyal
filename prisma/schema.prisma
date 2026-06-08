@@ -24,8 +24,14 @@ model User {
   passwordHash String
   kycStatus    KycStatus @default(PENDING)
   vipLevel     Int       @default(0)
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+
+  // Identity bridge (NOT financial state): the True Engine's own player UUID, returned
+  // by POST /api/v1/player/create where our `id` is sent as `external_id`. Every ledger
+  // call addresses the player by THIS id, never by our local `id`.
+  trueEnginePlayerId String? @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   // 🚫 FORBIDDEN by architecture: gc_balance, sc_balance, deposits, withdrawals.
   //    All balances are owned by the True Engine (Go) — never mirrored here.
@@ -37,6 +43,48 @@ enum KycStatus {
   PENDING
   VERIFIED
   REJECTED
+}
+
+/// Append-only INTENT JOURNAL (an outbox) — NOT financial state. Records every
+/// money intent forwarded to the True Engine so a crash between PSP capture and the
+/// ledger credit (or between a bet and its win) is recoverable by reconciliation.
+/// Holds no balances: only the deterministic idempotency key, type, status, and refs.
+model EngineRequestLog {
+  id                    String              @id @default(uuid())
+  operatorTransactionId String              @unique // the deterministic key sent to the engine
+  type                  EngineRequestType
+  status                EngineRequestStatus @default(PENDING)
+  playerId              String? // the engine player_id this intent targets
+  providerRef           String? // upstream ref the key was derived from (provider txn / payment_ref)
+  ledgerTransactionId   String? // engine-assigned id once the call succeeds
+  // The exact request body sent to the engine, so the reconciler can REPLAY it verbatim
+  // with the same idempotency key. This is an instruction log, not balance state.
+  requestPayload        Json?
+  retryable             Boolean             @default(false) // last failure was retryable (409/5xx/timeout)
+  attempts              Int                 @default(0) // reconciler attempt counter (bounded)
+  lastError             String? // last engine error code/message (diagnostics)
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+
+  // Hot path for the reconciler: scan unfinished work oldest-first.
+  @@index([status, updatedAt])
+  @@map("engine_request_log")
+}
+
+enum EngineRequestType {
+  BET
+  WIN
+  DEPOSIT
+  ROLLBACK
+  PLAYER_CREATE
+}
+
+enum EngineRequestStatus {
+  PENDING // in-flight, or crashed mid-call (reconciler re-drives once stale)
+  SUCCEEDED // committed at the ledger
+  FAILED // last attempt failed; eligible for reconciliation
+  COMPENSATED // a terminally-failed WIN whose originating BET was rolled back
+  ABANDONED // gave up (max attempts) or terminal with nothing to compensate
 }
 
 /// Fiat purchase catalog. Pricing METADATA only (no balances).

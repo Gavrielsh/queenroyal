@@ -2,6 +2,7 @@ import bcrypt from "bcryptjs";
 
 import { prisma } from "@/lib/prisma";
 import { signToken, type AuthClaims } from "@/lib/jwt";
+import { provisionTrueEnginePlayer } from "@/services/player-provisioning.service";
 import type { LoginInput, RegisterInput } from "@/schemas/auth.schema";
 
 const BCRYPT_ROUNDS = 12;
@@ -71,6 +72,16 @@ export async function register(input: RegisterInput): Promise<AuthResult> {
   const user = await prisma.user.create({
     data: { email: input.email, passwordHash },
   });
+
+  // Provision the player in the True Engine and persist its player_id. We do this at
+  // registration but treat a transient failure as non-fatal: the account is created and
+  // `resolveTransactingPlayer()` will lazily (idempotently) provision on first
+  // transaction. We never block account creation on the ledger being momentarily down.
+  try {
+    await provisionTrueEnginePlayer(user.id, user.email);
+  } catch (err) {
+    console.error("[auth/register] deferred engine provisioning", err);
+  }
 
   return issue(toSafeUser(user));
 }

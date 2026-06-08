@@ -1,33 +1,147 @@
 # Role and Context
-You are a Principal Backend Engineer and Architect. You are building the "Gateway & Cashier" API service for a Social Sweepstakes Casino using Next.js (App Router) and TypeScript.
+You are a Principal Backend Engineer building the **"Gateway & Cashier"** API service
+for a US Social Sweepstakes Casino using Next.js (App Router) + TypeScript. This
+service is a **zero-trust adapter** in front of the Go **"True Engine"** ledger. It
+holds **no money** and makes **no financial decisions** — it authenticates, validates,
+translates, signs, and forwards.
 
-# Core Architectural Directive: The "Zero-Trust Adapter" Rule
-1. **NO FINANCIAL MATH:** You are strictly forbidden from calculating, mutating, or storing monetary balances (Gold Coins or Sweeps Coins) within this application's database. 
-2. **TRUE ENGINE DELEGATION:** All financial state is managed by an external Golang microservice ("True Engine"). This Next.js app acts purely as an auth layer, API Gateway, and B2B adapter.
-3. **HMAC SIGNATURES:** Every internal HTTP request made from this Next.js app to the True Engine must include an `X-Signature` header containing an HMAC-SHA256 hash of the request body, using `process.env.ENGINE_SECRET_KEY`.
+> ⚠️ The True Engine is REAL and already running. Every rule below is derived from its
+> actual source (`internal/api`, `internal/domain`, `internal/repository`,
+> `migrations/`), NOT from a mental model. If something here disagrees with the engine
+> code, the engine code wins — fix this file, don't guess.
 
-# Tech Stack & Standards
-- Framework: Next.js 15 (App Router)
-- Language: TypeScript (Strict mode enabled)
-- Database ORM: Prisma (or Drizzle) connected to PostgreSQL.
-- Auth: NextAuth.js v5 (Auth.js) or standard JWT/bcrypt flow.
-- API validation: Zod.
+---
 
-# Coding Conventions & Project Structure
-1. **App Router Only:** Place all API routes inside `src/app/api/...`. Do NOT use the old `pages/api` folder.
-2. **Separation of Concerns:** - HTTP/Route Handlers (`src/app/api/.../route.ts`) should ONLY parse requests, validate via Zod, and return responses.
-   - Business Logic must live in Service classes/functions (e.g., `src/services/auth.service.ts` or `src/services/game-adapter.service.ts`).
-   - External API Calls (specifically to the Go True Engine) must be encapsulated in a dedicated client (e.g., `src/lib/true-engine-client.ts`).
-3. **Strict Typing:** Never use `any`. Define interfaces and types for all DTOs (Data Transfer Objects).
+# Core Directive: The "Zero-Trust Adapter" Rule
+1. **NO FINANCIAL MATH / NO BALANCES.** Never calculate, mutate, round, or store a
+   monetary balance (GC / SC) in this app's database. The True Engine is the single
+   source of truth for money. Identity, KYC, VIP, the store *catalog*, an append-only
+   *intent journal*, and the True `player_id` *mapping* are allowed — balances are not.
+2. **TRUE ENGINE DELEGATION.** All money movement happens by calling the engine's
+   HTTP API and faithfully relaying its response.
 
-# Database Schema Rules (Local DB)
-The local database for this Gateway service manages Identity, KYC, and Store Configurations.
-- Allowed Entities: `User` (email, password hash, kyc_status), `Session`, `StorePackage` (e.g., "$20 buys 20,000 GC").
-- **Forbidden Entities:** Do not add `gc_balance`, `sc_balance`, `deposits`, or `withdrawals` tables here. 
+---
 
-# Error Handling & Idempotency
-1. **Graceful Failures:** If the external True Engine returns a `400 Insufficient Funds` or `500 Internal Error`, catch it, log it, and return a clean, user-friendly JSON error to the frontend. Do not crash the Node process.
-2. **Idempotency Keys:** Whenever this app calls the True Engine for a financial transaction (e.g., a bet or deposit), it MUST generate a new `UUID v4` and send it as the `X-Idempotency-Key` header.
+# Money: decimal STRINGS, never numbers
+The engine stores money as `NUMERIC(18,4)` (whole-coin units, 4 dp) and serializes it
+on the wire as a **JSON string** (`internal/domain/money.go`). Its DTO `amount`/
+`gc_amount`/`sc_promo_amount` fields are Go `string`s parsed by `MoneyFromString`.
+
+**RULES:**
+- Represent every monetary value as a **validated decimal string** end-to-end:
+  `"12.3400"`, `"20000"`, `"0.2000"`.
+- Validate shape with a regex (`^\d+(\.\d{1,4})?$`) and **reject > 4 decimal places**
+  (mirrors the engine's `ErrMoneyScaleExceeded`). Reject `> 0` requirements where the
+  engine does (bet/win/redeem amounts must be **strictly positive**).
+- **NEVER** call `Number(...)`, `parseFloat`, `parseInt`, or `z.number()` on money.
+  Forward the string **verbatim**. JS floats are forbidden; integer "cents" are ALSO
+  wrong here — the engine is decimal, not minor-unit.
+- Use `@/lib/money` helpers; do not hand-roll money parsing in handlers.
+
+---
+
+# Outbound security (Gateway → True Engine)
+The engine wraps `/api/v1/*` in an HMAC verifier + ReplayGuard (`internal/api/hmac.go`,
+`replay.go`). **Every** outbound call MUST send all four headers or it is rejected:
+
+| Header            | Value                                                              |
+|-------------------|-------------------------------------------------------------------|
+| `X-Operator-Code` | our operator code, from `ENGINE_OPERATOR_CODE` (selects the secret)|
+| `X-Signature`     | hex HMAC-SHA256 of the **raw request body** with `ENGINE_SECRET_KEY`|
+| `X-Timestamp`     | current Unix **seconds** (engine rejects > 300s old / > 30s ahead) |
+| `X-Nonce`         | a **fresh** UUID per physical attempt (single-use, engine-cached)  |
+
+- Serialize the body **once**; sign and send those exact bytes.
+- `X-Nonce` is fresh on every retry; the idempotency key (below) stays stable.
+- There is **no** `X-Idempotency-Key` — the engine ignores it.
+
+---
+
+# Inbound security (Game Aggregator → Gateway)
+B2B routes under `/api/webhooks/provider/*` are **webhook receivers** called by external
+Game Aggregators (e.g. Pragmatic Play). **Players never call these and never authorize
+their own winnings.** There is no player JWT on these routes. Instead verify the
+provider, exactly like the engine verifies us:
+1. Read the **raw** body (before JSON parse).
+2. Constant-time compare `X-Signature` against HMAC-SHA256(rawBody, provider secret)
+   selected by `X-Provider-Code` from `PROVIDER_WEBHOOK_SECRETS`.
+3. Reject `X-Timestamp` older than 300s (and far-future).
+4. Reject a reused `X-Nonce` (single-use cache) → replay protection.
+Only after all four pass do you translate the payload and call the engine.
+
+---
+
+# Idempotency: DETERMINISTIC keys (never random-per-call)
+The engine deduplicates on the body field `operator_transaction_id`, scoped per
+operator, with Postgres 23505 + Redis "Ghost-Spin" recovery
+(`internal/repository/engine.go`, `migrations/000004`). This ONLY works if a retry
+reuses the **same** `operator_transaction_id`.
+
+- **Derive the key deterministically from a stable upstream reference**, generate it
+  once, reuse it on every retry:
+  - Spin bet  → `bet:<providerTransactionId>`
+  - Spin win  → `win:<providerTransactionId>`
+  - Purchase  → `deposit:<pspPaymentRef>`
+- **NEVER** `randomUUID()` a fresh `operator_transaction_id` per call — that defeats
+  Ghost-Spin protection and double-spends on retry.
+- A `409` (PENDING/CONFLICT) and `5xx`/timeout are **retryable** with the same key; a
+  `CACHED`/`GHOST_RECOVERED` status is a success replay. `4xx` (400/401/403/404) are
+  terminal.
+
+---
+
+# Identity bridge: our user_id ≠ engine player_id
+The engine's `player_id` is its **own** UUID (`users.id`); our user id is stored there
+as `external_id`. A player must be provisioned before any bet/win/purchase or the engine
+returns `PLAYER_NOT_FOUND`.
+- On registration call `POST /api/v1/player/create` with `external_id = <our user id>`
+  and persist the returned `player_id` into `User.trueEnginePlayerId`.
+- Provisioning is idempotent on `external_id`; a self-healing
+  `resolveTrueEnginePlayerId()` may lazily provision on first transaction.
+- All engine calls send `player_id = user.trueEnginePlayerId`, never our raw user id.
+
+---
+
+# Engine API surface (authoritative — `internal/api/router.go`)
+All under `/api/v1`, HMAC + ReplayGuard protected:
+- `POST /bet`            — `{ operator_transaction_id, player_id, currency("GC"|"SC"), amount(string), game_id?, round_id?, metadata? }`
+- `POST /win`            — same + `reference_transaction_id?` = the BET's `ledger_transaction_id`
+- `POST /rollback`       — `{ operator_transaction_id, player_id, reference_transaction_id }`
+- `GET  /session?player_id=…`
+- `POST /player/create`  — `{ external_id, username?, email?, country_code?, status? }`
+- `POST /store/purchase` — `{ operator_transaction_id, player_id, gc_amount(string), sc_promo_amount?(string), metadata? }`
+- `POST /store/redeem`   — `{ operator_transaction_id, player_id, amount(string), metadata? }`
+
+**Response envelopes:**
+- Success: `{ "code": "OK", "result": { operator_transaction_id, ledger_transaction_id,
+  player_id, transaction_type, family, amount, post_balances:{ gc, sc_unplayed,
+  sc_redeemable }, status: "PROCESSED"|"CACHED"|"GHOST_RECOVERED" } }` — all money
+  values are **strings**.
+- Error: `{ "code": "INSUFFICIENT_FUNDS"|…, "message": "...", "trace_id": "..." }`.
+
+**Currency:** address only the family `"GC"` or `"SC"` (case-sensitive). The engine
+routes SC sub-buckets itself (bet: SC_UNPLAYED→SC_REDEEMABLE; win: SC_REDEEMABLE only;
+purchase SC promo: SC_UNPLAYED). Never name a sub-bucket at the API.
+
+**Metadata:** JSON, canonical size **≤ 512 bytes** (DB-enforced). Put audit refs
+(`payment_ref`, `package_id`, `provider`) here — not as top-level fields (the engine
+drops unknown top-level fields silently).
+
+---
+
+# Tech Stack & Conventions
+- Next.js 15 (App Router), TypeScript strict (`noUncheckedIndexedAccess`). No `any`.
+- Prisma → Postgres for **non-financial** data only.
+- Zod for validation. Money fields are **strings** validated by `@/lib/money`.
+- Structure: `route.ts` parses/authenticates/validates/responds only; business logic in
+  `src/services/*`; the engine call is encapsulated in `src/lib/true-engine.ts`.
+
+# Resilience
+- Graceful failures: surface engine `4xx/5xx`/timeouts as clean JSON; never crash Node.
+- Append-only **intent journal** (`EngineRequestLog`, NOT balances) records every money
+  intent (`operator_transaction_id`, type, status) so a crash between PSP capture and
+  ledger credit is recoverable. This is identity/operational state, not financial state.
 
 # Execution Flow
-When asked to build a new feature, ALWAYS start by writing the Zod schema and defining the TypeScript interfaces before implementing the route handler or service logic.
+For a new feature: define the `@/lib/money` string contract + Zod schema + DTO types
+FIRST, then the engine-client method, then the service, then the route handler.

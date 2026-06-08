@@ -1,15 +1,18 @@
 import { randomUUID } from "node:crypto";
 
 import { getPackage } from "@/config/store-packages";
-import { mockStripeCharge } from "@/lib/mock-stripe";
-import { trueEngine } from "@/lib/true-engine";
+import { assertKycAllows, KycGateError } from "@/lib/kyc-policy";
+import { wholeCoinsToMoneyString } from "@/lib/money";
 import type { AuthClaims } from "@/lib/jwt";
 import type { PurchaseInput } from "@/schemas/store.schema";
-import type { EngineTxResult, TrueEngineErrorBody } from "@/types/true-engine";
+import { type DepositInstruction, settleDepositIntent } from "@/services/deposit.service";
+import { beginEngineRequest, completeEngineRequest } from "@/services/engine-journal.service";
+import { ProvisioningError, resolveTransactingPlayer } from "@/services/player-provisioning.service";
+import type { EngineTxResult, PurchasePayload, TrueEngineErrorBody } from "@/types/true-engine";
 
 export interface PurchaseSuccess {
   paymentIntentId: string;
-  transactionId: string;
+  operatorTransactionId: string;
   package: {
     id: string;
     label: string;
@@ -25,8 +28,18 @@ export type PurchaseOutcome =
   | { ok: false; status: number; error: TrueEngineErrorBody };
 
 /**
- * Cashier flow: validate package → MOCK fiat charge → instruct the True Engine to
- * credit the exact integer coin amounts. No balances are ever written locally.
+ * Cashier flow with a PRE-CHARGE OUTBOX (zero financial loss):
+ *   validate package → KYC gate → journal a PENDING DEPOSIT intent (with the full,
+ *   replayable charge+credit instruction) → settle (capture + ledger credit).
+ *
+ * Because the intent is durably journaled BEFORE the PSP is charged, a crash at any
+ * point — including immediately after capture — leaves a record the reconciler settles
+ * idempotently (re-capture is a no-op; the ledger credit de-duplicates). No captured
+ * funds can ever be orphaned.
+ *
+ * The stable anchor is a per-attempt id (the client idempotency key when supplied, else a
+ * generated UUID). The PSP charge keys on it (charge-once) and the ledger credit's
+ * `operator_transaction_id` is `deposit:<attemptId>`.
  */
 export async function purchasePackage(
   user: AuthClaims,
@@ -41,56 +54,103 @@ export async function purchasePackage(
     };
   }
 
-  // 1) MOCK the PSP charge for the exact integer cent price.
-  const charge = await mockStripeCharge({
-    amountCents: pkg.priceUsdCents,
-    token: input.paymentToken,
-    userId: user.sub,
+  // Identity bridge + current KYC status (single DB read; lazy provisioning).
+  let player;
+  try {
+    player = await resolveTransactingPlayer(user.sub);
+  } catch (err) {
+    if (err instanceof ProvisioningError) {
+      return {
+        ok: false,
+        status: 404,
+        error: { code: "PLAYER_NOT_FOUND", message: "Player is not provisioned in the ledger", details: err.message },
+      };
+    }
+    throw err;
+  }
+
+  // Server-side KYC gate (real-money entry point) — never trust the JWT claim.
+  try {
+    assertKycAllows(player.kycStatus, "PURCHASE");
+  } catch (err) {
+    if (err instanceof KycGateError) {
+      return { ok: false, status: 403, error: { code: err.code, message: err.message } };
+    }
+    throw err;
+  }
+
+  const playerId = player.trueEnginePlayerId;
+  const attemptId = input.idempotencyKey ?? randomUUID();
+  const operatorTransactionId = `deposit:${attemptId}`;
+
+  const scPromo = pkg.sc > 0 ? wholeCoinsToMoneyString(pkg.sc) : undefined;
+  const purchase: PurchasePayload = {
+    operator_transaction_id: operatorTransactionId,
+    player_id: playerId,
+    gc_amount: wholeCoinsToMoneyString(pkg.gc),
+    ...(scPromo ? { sc_promo_amount: scPromo } : {}),
+    metadata: { package_id: pkg.id, usd_cents: pkg.priceUsdCents, purchase_attempt: attemptId },
+  };
+  const instruction: DepositInstruction = {
+    charge: { amountCents: pkg.priceUsdCents, token: input.paymentToken, userId: user.sub, idempotencyKey: attemptId },
+    purchase,
+  };
+
+  // ── PRE-CHARGE OUTBOX: durably record the intent BEFORE touching the PSP. ──
+  await beginEngineRequest({
+    operatorTransactionId,
+    type: "DEPOSIT",
+    playerId,
+    providerRef: attemptId,
+    requestPayload: instruction,
   });
-  if (!charge.ok) {
+
+  // Settle: capture (idempotent) + ledger credit (idempotent).
+  const settlement = await settleDepositIntent(instruction);
+  if (settlement.kind === "declined") {
+    await completeEngineRequest(operatorTransactionId, "FAILED", {
+      retryable: false,
+      lastError: `PAYMENT_DECLINED: ${settlement.reason ?? "card_declined"}`,
+    });
     return {
       ok: false,
       status: 402,
-      error: { code: "PAYMENT_DECLINED", message: "Payment was declined", details: charge.declineReason },
+      error: { code: "PAYMENT_DECLINED", message: "Payment was declined", details: settlement.reason },
     };
   }
 
-  // 2) Instruct the ledger to credit coins. Integers only; idempotent via transaction_id.
-  const transactionId = randomUUID();
-  const result = await trueEngine().sendDeposit({
-    transaction_id: transactionId,
-    user_id: user.sub,
-    gc: pkg.gc,
-    sc: pkg.sc,
-    usd_cents: pkg.priceUsdCents,
-    package_id: pkg.id,
-    payment_ref: charge.paymentIntentId,
-  });
-
+  const result = settlement.engine;
   if (!result.ok) {
-    // Money was captured by the PSP but the ledger credit failed. Surface clearly with
-    // the payment + transaction refs so reconciliation / auto-refund can act. The
-    // transaction_id makes a retry safe (idempotent) without double-crediting.
+    await completeEngineRequest(operatorTransactionId, "FAILED", {
+      retryable: result.retryable,
+      lastError: `${result.error.code}: ${result.error.message}`,
+    });
+    // Money captured but the ledger credit failed. The intent is journaled; the
+    // reconciler re-drives it to completion idempotently (no re-charge, no double credit).
     return {
       ok: false,
       status: result.status === 0 ? 502 : result.status,
       error: {
         code: result.error.code,
-        message: `Payment captured (${charge.paymentIntentId}) but ledger credit failed: ${result.error.message}`,
+        message: `Payment captured (${settlement.paymentIntentId}) but ledger credit failed: ${result.error.message}`,
         details: {
-          paymentRef: charge.paymentIntentId,
-          transactionId,
-          engine: result.error.details,
+          paymentRef: settlement.paymentIntentId,
+          operatorTransactionId,
+          retryable: result.retryable,
+          engine: result.error,
         },
       },
     };
   }
+  await completeEngineRequest(operatorTransactionId, "SUCCEEDED", {
+    ledgerTransactionId: result.data.ledger_transaction_id,
+  });
 
   return {
     ok: true,
     data: {
-      paymentIntentId: charge.paymentIntentId,
-      transactionId,
+      paymentIntentId: settlement.paymentIntentId,
+      operatorTransactionId,
       package: {
         id: pkg.id,
         label: pkg.label,

@@ -1,56 +1,117 @@
-# 🏛️ Sweepstakes Casino - Enterprise Architecture Blueprint
+# 🏛️ Sweepstakes Casino — Architecture Blueprint
 
-## 📌 Project Overview
-This document outlines the macro-architecture for a High-Frequency US Social Sweepstakes Casino. The system is explicitly designed around a **Zero-Trust, Microservices/Event-Driven paradigm**, separating financial state from business logic and user interfaces.
+## 📌 Overview
+A high-frequency US Social Sweepstakes Casino built on a **Zero-Trust** separation of
+concerns. Three decoupled zones:
 
-The architecture is divided into three completely decoupled zones:
-1.  **The Core Ledger (True Engine - Golang)**: The absolute source of truth for all money.
-2.  **The Gateway & Cashier (Node.js/Next.js Backend)**: The security perimeter and business logic orchestrator.
-3.  **The Frontend (Next.js App Router)**: The "Dumb" UI presentation layer.
+1. **The Core Ledger ("True Engine" — Go)** — the single source of truth for all money.
+2. **The Gateway & Cashier (this repo — Next.js/TS)** — security perimeter, B2B adapter,
+   and orchestrator. **Holds zero money.**
+3. **The Frontend (Next.js App Router)** — presentation only.
+
+> This document is kept in lock-step with the **actual** True Engine source. Where it
+> describes the engine's contract, the engine code (`internal/api`, `internal/domain`,
+> `internal/repository`, `migrations/`) is authoritative.
 
 ---
 
 ## 🏗️ Zone 1: The Core Ledger ("True Engine")
-**Status: COMPLETED & SEALED.** *(AI INSTRUCTION: Do NOT attempt to modify, calculate balances, or write SQL queries bypassing this engine).*
+**Status: COMPLETED & SEALED.** *(Do NOT modify it, compute balances, or write SQL that
+bypasses it.)*
 
-* **Tech Stack:** Go (Golang), PostgreSQL, Redis.
-* **Role:** An ACID-compliant, Double-Entry Bookkeeping Ledger. 
-* **Mechanics:**
-    * Maintains strict separation between `GC` (Gold Coins), `SC_Unplayed`, and `SC_Redeemable`.
-    * Uses Pessimistic Locking (`SELECT ... FOR UPDATE`) to prevent race conditions during high-speed slots spinning.
-    * Enforces mathematical precision by storing all values as integers (Cents/Micro-cents). No Floating Point Math allowed.
-    * Implements a Redis-backed Idempotency layer to prevent double-spending from duplicated webhook retries.
-* **Security:** Only accepts HTTP requests that include an `X-Signature` header containing a valid HMAC-SHA256 hash matching the `ENGINE_SECRET_KEY`.
+* **Stack:** Go, PostgreSQL, Redis.
+* **Role:** ACID double-entry bookkeeping ledger. Maintains strict separation of `GC`,
+  `SC_UNPLAYED`, and `SC_REDEEMABLE`; pessimistic `SELECT … FOR UPDATE`; append-only
+  ledger with offsetting `ROLLBACK` entries (no in-place mutation).
+* **Money model — DECIMAL, not integer:** every amount is `NUMERIC(18,4)` (whole-coin
+  units, 4 dp) and is sent/received on the wire as a **JSON string** (`"12.3400"`) to
+  preserve precision across JS/Java decoders. Integer "cents" are NOT used. *(This
+  corrects a prior misconception in this doc — there are no integer minor-units.)*
+* **Idempotency / Ghost-Spin:** deduplicates on the body field
+  `operator_transaction_id` (scoped per operator). A duplicate raises Postgres `23505`,
+  which the engine catches to reconstruct and replay the original result **without
+  re-deducting** funds. Safe retries therefore REQUIRE a **stable** key.
+* **Security (every `/api/v1/*` call):** HMAC-SHA256 over the **raw body** in
+  `X-Signature` (constant-time compared), an operator selector `X-Operator-Code`
+  (per-operator secret), plus ReplayGuard: `X-Timestamp` (reject > 300s old) and a
+  single-use `X-Nonce` cached in Redis. All four headers are mandatory.
+
+### Engine API (authoritative — `internal/api/router.go`)
+| Method & Path                 | Purpose                                                  |
+|-------------------------------|----------------------------------------------------------|
+| `POST /api/v1/bet`            | Debit a wager (GC or SC family).                         |
+| `POST /api/v1/win`            | Credit a win (SC wins land in SC_REDEEMABLE).            |
+| `POST /api/v1/rollback`       | Reverse a committed BET by its `ledger_transaction_id`.  |
+| `GET  /api/v1/session`        | Read balances (`?player_id=`).                           |
+| `POST /api/v1/player/create`  | Provision a player (idempotent on `external_id`).        |
+| `POST /api/v1/store/purchase` | Fiat purchase → issue GC (+ optional SC_UNPLAYED promo). |
+| `POST /api/v1/store/redeem`   | Fiat redemption from SC_REDEEMABLE only.                 |
+
+**Success:** `{ "code":"OK", "result": { operator_transaction_id, ledger_transaction_id,
+player_id, transaction_type, family, amount, post_balances:{ gc, sc_unplayed,
+sc_redeemable }, status:"PROCESSED"|"CACHED"|"GHOST_RECOVERED" } }` (money = strings).
+**Error:** `{ "code":"…", "message":"…", "trace_id":"…" }`. Status codes drive retries:
+`409`/`5xx`/timeout = retry with the same key; `4xx` = terminal.
 
 ---
 
-## 🛡️ Zone 2: The Gateway & Cashier (Adapter Layer)
-**Status: CURRENT FOCUS.** *(AI INSTRUCTION: This is the environment you are currently building).*
+## 🛡️ Zone 2: The Gateway & Cashier (this repo)
+**Status: CURRENT FOCUS.**
 
-* **Tech Stack:** Node.js, Express/Next.js API Routes, Prisma/Drizzle (for non-financial data), MongoDB/PostgreSQL.
-* **Rule #1 (Zero Financial State):** The database for this layer holds User Profiles, KYC status, VIP levels, and Auth Credentials. **It MUST NOT contain `gc_balance` or `sc_balance`.** * **Rule #2 (HMAC Broker):** Every financial action generated here (Bet, Win, Deposit) must be hashed via HMAC-SHA256 and forwarded to the True Engine.
-* **Components to Build:**
-    1.  **Auth Service:** Registers users and assigns a UUID (`user_id`). The Go Engine only cares about this ID.
-    2.  **Cashier Service:** Interfaces with payment providers (e.g., Stripe). Upon a successful fiat purchase, it instructs the True Engine to execute a `/deposit` of GC and SC.
-    3.  **B2B Game Adapter:** Acts as a webhook receiver for external Game Aggregators (e.g., Pragmatic Play). It translates their proprietary payload formats into the strict DTO format required by the True Engine, signs it, and forwards it.
+* **Stack:** Next.js 15 API routes, TypeScript (strict), Prisma → Postgres (non-financial).
+
+### Rule #1 — Zero Financial State
+The local DB holds **identity, KYC, VIP, store catalog, the True `player_id` mapping,
+and an append-only intent journal** — and absolutely **no** `gc_balance`, `sc_balance`,
+`deposits`, or `withdrawals`. Balances live only in the engine.
+
+### Rule #2 — Money is a validated decimal string
+All monetary values are validated decimal strings (`^\d+(\.\d{1,4})?$`, ≤ 4 dp) and
+forwarded **verbatim**. No `Number()`/`parseFloat`/`z.number()` ever touches money.
+
+### Rule #3 — Outbound HMAC + replay headers
+Every engine call carries `X-Operator-Code`, `X-Signature` (HMAC of raw body with
+`ENGINE_SECRET_KEY`), a fresh `X-Timestamp`, and a fresh `X-Nonce`.
+
+### Rule #4 — Deterministic idempotency
+`operator_transaction_id` is derived from a stable upstream reference (game provider
+txn id for spins, PSP `payment_ref` for purchases), generated once and reused on retry.
+
+### Components
+1. **Auth Service** — registers users (bcrypt + JWT), and **provisions** each user in the
+   engine via `/player/create`, persisting `trueEnginePlayerId`.
+2. **Cashier Service** — charges the PSP (Stripe; integer USD cents is correct *for the
+   PSP only*), then instructs `/store/purchase` to issue GC + SC_UNPLAYED, journaling the
+   intent for crash recovery.
+3. **B2B Game Adapter** — **webhook receiver** for external Game Aggregators under
+   `/api/webhooks/provider/*`. It verifies the provider's inbound HMAC + timestamp +
+   nonce, translates the proprietary payload into the engine DTO, signs it, and forwards
+   it. **Players do not call this route and cannot supply their own win amounts.**
+
+### Identity bridge
+Our `User.id` ≠ engine `player_id`. We register as the engine's `external_id` and store
+the engine-issued `player_id`. Every money call uses `trueEnginePlayerId`.
+
+### Resilience — the intent journal
+`EngineRequestLog` (append-only, no balances) records each money intent
+(`operator_transaction_id`, type, status, refs). Combined with deterministic keys it
+makes the PSP-capture → ledger-credit window and the bet → win saga recoverable.
 
 ---
 
-## 💻 Zone 3: The Showroom (Frontend Layer)
-**Status: PENDING / IN PROGRESS.**
-
-* **Tech Stack:** Next.js 15 (App Router), React 19, Tailwind CSS, Zustand (Global State).
-* **Role:** UI presentation, game iframe hosting, and real-time balance display.
-* **Mechanics:**
-    * It does NOT calculate winnings or losses locally.
-    * **Real-Time Sync:** It connects to a Server-Sent Events (SSE) or WebSocket endpoint. When the True Engine confirms a bet/win, it pushes the updated integer balances to the frontend, which visually updates the top-nav balance counters seamlessly.
+## 💻 Zone 3: The Showroom (Frontend)
+**Status: PENDING.** Pure presentation. Never computes win/loss. Subscribes to a
+real-time channel; when the engine confirms a bet/win it renders the engine's
+authoritative balances. Balances are strings — render, don't arithmetic.
 
 ---
 
-## 🚀 The AI Execution Contract (.cursorrules)
-Whenever interacting with this codebase, the AI must strictly adhere to the following:
-
-1.  **No Financial Mocks:** Do not create dummy `balance` fields in User schemas "just to make it work".
-2.  **Idempotency First:** Every call to the True Engine must be accompanied by a newly generated UUIDv4 `transaction_id`.
-3.  **Graceful Failures:** Anticipate Go Engine HTTP 400 (Insufficient Funds) or HTTP 401 (Unauthorized HMAC) errors and pipe them cleanly to the frontend without crashing the Node.js process.
-4.  **Integers Only:** If mapping DTOs, ensure all monetary values are cast to integers before sending to the Core Ledger.
+## 🚀 Execution Contract
+1. **No financial mocks.** Never add a `balance` field "just to make it work."
+2. **Money is a string.** Validate shape, reject > 4 dp, forward verbatim. No floats, no
+   integer cents.
+3. **Deterministic idempotency.** Stable `operator_transaction_id` from an upstream ref;
+   fresh `X-Nonce` per attempt.
+4. **Verify inbound, sign outbound.** B2B webhooks are HMAC-verified before any engine
+   call; engine calls carry all four security headers.
+5. **Graceful failures.** Map engine `4xx/5xx`/timeouts to clean JSON; never crash Node.

@@ -1,12 +1,21 @@
-import { randomUUID } from "node:crypto";
-
+import { assertKycAllows, KycGateError } from "@/lib/kyc-policy";
+import { isPositiveMoneyString } from "@/lib/money";
 import { trueEngine } from "@/lib/true-engine";
-import type { AuthClaims } from "@/lib/jwt";
-import type { SpinInput } from "@/schemas/game.schema";
-import type { Currency, EngineBalances, EngineTxResult, TrueEngineErrorBody } from "@/types/true-engine";
+import type { ProviderSpinInput } from "@/schemas/game.schema";
+import { beginEngineRequest, completeEngineRequest } from "@/services/engine-journal.service";
+import { ProvisioningError, resolveTransactingPlayer } from "@/services/player-provisioning.service";
+import type {
+  BetPayload,
+  Currency,
+  EngineBalances,
+  EngineTxResult,
+  TrueEngineErrorBody,
+  WinPayload,
+} from "@/types/true-engine";
 
 export interface SpinSuccess {
-  roundId: string;
+  providerTransactionId: string;
+  roundId: string | undefined;
   currency: Currency;
   bet: EngineTxResult;
   win: EngineTxResult | null;
@@ -18,58 +27,120 @@ export type SpinOutcome =
   | { ok: false; status: number; error: TrueEngineErrorBody };
 
 /**
- * B2B game-aggregator adapter: translate a spin into ledger calls.
+ * B2B game-aggregator adapter. The inbound webhook has ALREADY been HMAC/timestamp/nonce
+ * verified by the route — this function trusts the provider, not the player.
  *
- *   1. Generate ONE shared round_id.
- *   2. sendBet() and wait for 200 OK (stop on failure — nothing is credited).
- *   3. If winAmount > 0, sendWin() with the SAME round ("win_" + round_id).
- *
- * Each call carries its own UUID transaction_id (idempotency key), so any retry is
- * safe and a bet can never be paired with a duplicate win.
+ *   1. Resolve OUR user id → engine player_id (+ current KYC status), provisioning lazily.
+ *   2. Server-side KYC gate (never trust a stale JWT claim — this path has no JWT anyway).
+ *   3. Derive STABLE, deterministic idempotency keys from the provider's txn id
+ *      (`bet:<id>` / `win:<id>`) and journal the exact payloads for replay/compensation.
+ *   4. sendBet → on success, sendWin (when win > 0) referencing the bet's
+ *      `ledger_transaction_id`.
  */
-export async function processSpin(user: AuthClaims, input: SpinInput): Promise<SpinOutcome> {
+export async function processProviderSpin(
+  providerCode: string,
+  input: ProviderSpinInput,
+): Promise<SpinOutcome> {
   const engine = trueEngine();
-  const roundId = randomUUID();
 
-  // 1 + 2) Debit the bet first.
-  const betTransactionId = randomUUID();
-  const bet = await engine.sendBet({
-    transaction_id: betTransactionId,
-    user_id: user.sub,
-    round_id: roundId,
-    currency: input.currency,
-    amount: input.betAmount,
-    game_id: input.gameId,
-  });
-
-  if (!bet.ok) {
-    // e.g. 400 insufficient funds — stop; no win is attempted.
-    return { ok: false, status: bet.status === 0 ? 502 : bet.status, error: bet.error };
+  // 1) Identity bridge + current KYC status (single DB read).
+  let player;
+  try {
+    player = await resolveTransactingPlayer(input.player_id);
+  } catch (err) {
+    if (err instanceof ProvisioningError) {
+      return {
+        ok: false,
+        status: 404,
+        error: { code: "PLAYER_NOT_FOUND", message: "Player is not provisioned in the ledger", details: err.message },
+      };
+    }
+    throw err;
   }
 
+  // 2) Server-side KYC gate.
+  try {
+    assertKycAllows(player.kycStatus, "SPIN", input.currency);
+  } catch (err) {
+    if (err instanceof KycGateError) {
+      return { ok: false, status: 403, error: { code: err.code, message: err.message } };
+    }
+    throw err;
+  }
+
+  const playerId = player.trueEnginePlayerId;
+  const betOpTxId = `bet:${input.provider_transaction_id}`;
+  const winOpTxId = `win:${input.provider_transaction_id}`;
+  const metadata = { provider: providerCode };
+
+  // 3) Debit the bet first.
+  const betPayload: BetPayload = {
+    operator_transaction_id: betOpTxId,
+    player_id: playerId,
+    currency: input.currency,
+    amount: input.bet_amount,
+    game_id: input.game_id,
+    round_id: input.round_id,
+    metadata,
+  };
+  await beginEngineRequest({
+    operatorTransactionId: betOpTxId,
+    type: "BET",
+    playerId,
+    providerRef: input.provider_transaction_id,
+    requestPayload: betPayload,
+  });
+  const bet = await engine.sendBet(betPayload);
+  if (!bet.ok) {
+    await completeEngineRequest(betOpTxId, "FAILED", {
+      retryable: bet.retryable,
+      lastError: `${bet.error.code}: ${bet.error.message}`,
+    });
+    return { ok: false, status: bet.status === 0 ? 502 : bet.status, error: bet.error };
+  }
+  await completeEngineRequest(betOpTxId, "SUCCEEDED", { ledgerTransactionId: bet.data.ledger_transaction_id });
+
   // No win → return the post-bet state.
-  if (input.winAmount <= 0) {
+  if (!isPositiveMoneyString(input.win_amount)) {
     return {
       ok: true,
-      data: { roundId, currency: input.currency, bet: bet.data, win: null, balances: bet.data.balances },
+      data: {
+        providerTransactionId: input.provider_transaction_id,
+        roundId: input.round_id,
+        currency: input.currency,
+        bet: bet.data,
+        win: null,
+        balances: bet.data.post_balances,
+      },
     };
   }
 
-  // 3) Credit the win against the SAME round, prefixed with "win_".
-  const winTransactionId = randomUUID();
-  const win = await engine.sendWin({
-    transaction_id: winTransactionId,
-    user_id: user.sub,
-    round_id: `win_${roundId}`,
-    bet_round_id: roundId,
+  // 4) Credit the win, linked to the bet's ledger transaction id.
+  const winPayload: WinPayload = {
+    operator_transaction_id: winOpTxId,
+    player_id: playerId,
     currency: input.currency,
-    amount: input.winAmount,
-    game_id: input.gameId,
+    amount: input.win_amount,
+    game_id: input.game_id,
+    round_id: input.round_id,
+    reference_transaction_id: bet.data.ledger_transaction_id,
+    metadata,
+  };
+  await beginEngineRequest({
+    operatorTransactionId: winOpTxId,
+    type: "WIN",
+    playerId,
+    providerRef: input.provider_transaction_id,
+    requestPayload: winPayload,
   });
-
+  const win = await engine.sendWin(winPayload);
   if (!win.ok) {
-    // The bet was already debited. The win is safely retryable thanks to idempotency
-    // (winTransactionId + round "win_<round>"). Surface for reconciliation.
+    await completeEngineRequest(winOpTxId, "FAILED", {
+      retryable: win.retryable,
+      lastError: `${win.error.code}: ${win.error.message}`,
+    });
+    // The bet was already debited. The win is journaled under winOpTxId and will be
+    // reconciled (retried, or the bet rolled back) by the reconciliation worker.
     return {
       ok: false,
       status: win.status === 0 ? 502 : win.status,
@@ -77,18 +148,26 @@ export async function processSpin(user: AuthClaims, input: SpinInput): Promise<S
         code: "WIN_SETTLEMENT_FAILED",
         message: `Bet accepted but win settlement failed: ${win.error.message}`,
         details: {
-          roundId,
-          winRoundId: `win_${roundId}`,
-          betTransactionId,
-          winTransactionId,
-          engine: win.error.details,
+          betOperatorTransactionId: betOpTxId,
+          winOperatorTransactionId: winOpTxId,
+          betLedgerTransactionId: bet.data.ledger_transaction_id,
+          retryable: win.retryable,
+          engine: win.error,
         },
       },
     };
   }
+  await completeEngineRequest(winOpTxId, "SUCCEEDED", { ledgerTransactionId: win.data.ledger_transaction_id });
 
   return {
     ok: true,
-    data: { roundId, currency: input.currency, bet: bet.data, win: win.data, balances: win.data.balances },
+    data: {
+      providerTransactionId: input.provider_transaction_id,
+      roundId: input.round_id,
+      currency: input.currency,
+      bet: bet.data,
+      win: win.data,
+      balances: win.data.post_balances,
+    },
   };
 }
