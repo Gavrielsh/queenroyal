@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 
-import { verifyToken, type AuthClaims } from "@/lib/jwt";
+import { verifyAccessToken, type AuthClaims } from "@/lib/jwt";
 
 export class UnauthorizedError extends Error {
   constructor(message = "Authentication required") {
@@ -28,7 +28,7 @@ export function requireAuth(req: NextRequest): AuthClaims {
   }
 
   try {
-    return verifyToken(token);
+    return verifyAccessToken(token);
   } catch {
     throw new UnauthorizedError("Invalid or expired token");
   }

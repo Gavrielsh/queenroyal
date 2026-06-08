@@ -2,6 +2,7 @@
 --   * User.trueEnginePlayerId  (identity bridge to the True Engine player_id)
 --   * engine_request_log        (append-only intent journal / outbox — NO balances)
 --   * EngineRequestType / EngineRequestStatus enums
+--   * requestPayload is JSONB (queryable); indexes on (status, updatedAt) and createdAt
 --
 -- Generated with:
 --   prisma migrate diff \
@@ -45,6 +46,9 @@ CREATE UNIQUE INDEX "engine_request_log_operatorTransactionId_key" ON "engine_re
 
 -- CreateIndex
 CREATE INDEX "engine_request_log_status_updatedAt_idx" ON "engine_request_log"("status", "updatedAt");
+
+-- CreateIndex
+CREATE INDEX "engine_request_log_createdAt_idx" ON "engine_request_log"("createdAt");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "users_trueEnginePlayerId_key" ON "users"("trueEnginePlayerId");

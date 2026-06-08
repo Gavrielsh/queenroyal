@@ -1,13 +1,18 @@
 import type { NextRequest } from "next/server";
 
+import { traceId } from "@/lib/auth-http";
 import { requireAuth, UnauthorizedError } from "@/lib/auth-guard";
 import { ok, fail } from "@/lib/http";
+import { childLogger } from "@/lib/logger";
 import { purchaseSchema } from "@/schemas/store.schema";
 import { purchasePackage } from "@/services/store.service";
 
 export const runtime = "nodejs";
 
 export async function POST(req: NextRequest) {
+  const trace_id = traceId(req);
+  const reqLog = childLogger({ trace_id, route: "store/purchase" });
+
   let user;
   try {
     user = requireAuth(req);
@@ -36,7 +41,7 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const outcome = await purchasePackage(user, parsed.data);
+    const outcome = await purchasePackage(user, parsed.data, { traceId: trace_id });
     if (!outcome.ok) {
       return fail({
         code: outcome.error.code,
@@ -47,7 +52,7 @@ export async function POST(req: NextRequest) {
     }
     return ok(outcome.data, 200);
   } catch (err) {
-    console.error("[store/purchase] unexpected error", err);
+    reqLog.error({ err, user_id: user.sub }, "unexpected error processing purchase");
     return fail({ code: "INTERNAL_ERROR", message: "Unexpected server error", status: 500 });
   }
 }

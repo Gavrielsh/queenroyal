@@ -1,6 +1,8 @@
 import type { NextRequest } from "next/server";
 
+import { traceId } from "@/lib/auth-http";
 import { ok, fail } from "@/lib/http";
+import { childLogger } from "@/lib/logger";
 import { verifyProviderWebhook, WebhookVerificationError } from "@/lib/webhook-security";
 import { providerSpinSchema } from "@/schemas/game.schema";
 import { processProviderSpin } from "@/services/game-adapter.service";
@@ -16,6 +18,9 @@ export const runtime = "nodejs";
  * signed provider payload.
  */
 export async function POST(req: NextRequest) {
+  const trace_id = traceId(req);
+  const reqLog = childLogger({ trace_id, route: "webhooks/provider/spin" });
+
   // 1) Verify the provider FIRST. This reads the raw body (used for the HMAC), so we
   //    parse JSON from the returned raw bytes rather than calling req.json() again.
   let verified;
@@ -23,9 +28,10 @@ export async function POST(req: NextRequest) {
     verified = await verifyProviderWebhook(req);
   } catch (err) {
     if (err instanceof WebhookVerificationError) {
+      reqLog.warn({ err_code: err.code, status: err.status }, "webhook verification rejected");
       return fail({ code: err.code, message: err.message, status: err.status });
     }
-    console.error("[webhooks/provider/spin] verification error", err);
+    reqLog.error({ err }, "webhook verification error");
     return fail({ code: "INTERNAL_ERROR", message: "Unexpected server error", status: 500 });
   }
 
@@ -49,7 +55,7 @@ export async function POST(req: NextRequest) {
 
   // 3) Translate and forward to the ledger.
   try {
-    const outcome = await processProviderSpin(verified.providerCode, parsed.data);
+    const outcome = await processProviderSpin(verified.providerCode, parsed.data, { traceId: trace_id });
     if (!outcome.ok) {
       return fail({
         code: outcome.error.code,
@@ -60,7 +66,7 @@ export async function POST(req: NextRequest) {
     }
     return ok(outcome.data, 200);
   } catch (err) {
-    console.error("[webhooks/provider/spin] unexpected error", err);
+    reqLog.error({ err, provider_transaction_id: parsed.data.provider_transaction_id }, "unexpected error processing spin");
     return fail({ code: "INTERNAL_ERROR", message: "Unexpected server error", status: 500 });
   }
 }

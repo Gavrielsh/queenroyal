@@ -58,7 +58,8 @@ model EngineRequestLog {
   providerRef           String? // upstream ref the key was derived from (provider txn / payment_ref)
   ledgerTransactionId   String? // engine-assigned id once the call succeeds
   // The exact request body sent to the engine, so the reconciler can REPLAY it verbatim
-  // with the same idempotency key. This is an instruction log, not balance state.
+  // with the same idempotency key. JSONB (Postgres) so payloads are queryable. This is an
+  // instruction log, not balance state.
   requestPayload        Json?
   retryable             Boolean             @default(false) // last failure was retryable (409/5xx/timeout)
   attempts              Int                 @default(0) // reconciler attempt counter (bounded)
@@ -68,6 +69,8 @@ model EngineRequestLog {
 
   // Hot path for the reconciler: scan unfinished work oldest-first.
   @@index([status, updatedAt])
+  // Time-range queries over the journal (audit / payload inspection).
+  @@index([createdAt])
   @@map("engine_request_log")
 }
 

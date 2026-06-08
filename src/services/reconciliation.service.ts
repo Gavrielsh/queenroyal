@@ -1,5 +1,7 @@
 import type { EngineRequestLog } from "@prisma/client";
 
+import { getEnv } from "@/lib/env";
+import { childLogger } from "@/lib/logger";
 import { prisma } from "@/lib/prisma";
 import { trueEngine } from "@/lib/true-engine";
 import { type DepositInstruction, settleDepositIntent } from "@/services/deposit.service";
@@ -46,13 +48,16 @@ export interface ReconcileSummary {
 
 type Disposition = "succeeded" | "compensated" | "abandoned" | "stillFailing";
 
-const DEFAULTS = { batchSize: 50, staleAfterMs: 60_000, maxAttempts: 10 } as const;
-
-/** Process one batch of actionable journal rows. Safe to call repeatedly. */
+/**
+ * Process one batch of actionable journal rows. Safe to call repeatedly. Thresholds
+ * default to the Zod-validated env (RECONCILE_BATCH_SIZE / RECONCILE_STALE_AFTER_MS /
+ * RECONCILE_MAX_ATTEMPTS) and can be overridden per call (e.g. in tests).
+ */
 export async function reconcileEngineRequests(opts: ReconcileOptions = {}): Promise<ReconcileSummary> {
-  const batchSize = opts.batchSize ?? DEFAULTS.batchSize;
-  const staleAfterMs = opts.staleAfterMs ?? DEFAULTS.staleAfterMs;
-  const maxAttempts = opts.maxAttempts ?? DEFAULTS.maxAttempts;
+  const env = getEnv();
+  const batchSize = opts.batchSize ?? env.RECONCILE_BATCH_SIZE;
+  const staleAfterMs = opts.staleAfterMs ?? env.RECONCILE_STALE_AFTER_MS;
+  const maxAttempts = opts.maxAttempts ?? env.RECONCILE_MAX_ATTEMPTS;
   const staleCutoff = new Date(Date.now() - staleAfterMs);
 
   const rows = await prisma.engineRequestLog.findMany({
@@ -84,28 +89,50 @@ export async function reconcileEngineRequests(opts: ReconcileOptions = {}): Prom
 
 async function reconcileOne(row: EngineRequestLog, maxAttempts: number): Promise<Disposition> {
   const attempts = row.attempts + 1;
+  const rowLog = childLogger({
+    component: "reconciler",
+    operator_transaction_id: row.operatorTransactionId,
+    type: row.type,
+    player_id: row.playerId ?? undefined,
+    provider_ref: row.providerRef ?? undefined,
+    attempt: attempts,
+  });
   await prisma.engineRequestLog.update({ where: { id: row.id }, data: { attempts } });
 
-  // Without the original body we cannot replay. PLAYER_CREATE is non-financial and not
-  // reconciled here either.
+  let disposition: Disposition;
   if (row.requestPayload == null || row.type === "PLAYER_CREATE") {
+    // Without the original body we cannot replay. PLAYER_CREATE is non-financial and not
+    // reconciled here either.
     await setStatus(row.id, "ABANDONED", "no replayable payload");
-    return "abandoned";
+    disposition = "abandoned";
+  } else {
+    switch (row.type) {
+      case "BET":
+        disposition = await finalizeReplay(row, await trueEngine().sendBet(asPayload<BetPayload>(row)), attempts, maxAttempts);
+        break;
+      case "DEPOSIT":
+        disposition = await reconcileDeposit(row, attempts, maxAttempts);
+        break;
+      case "ROLLBACK":
+        disposition = await finalizeReplay(row, await trueEngine().sendRollback(asPayload<RollbackPayload>(row)), attempts, maxAttempts);
+        break;
+      case "WIN":
+        disposition = await reconcileWin(row, attempts, maxAttempts);
+        break;
+      default:
+        await setStatus(row.id, "ABANDONED", `unhandled type ${row.type}`);
+        disposition = "abandoned";
+    }
   }
 
-  switch (row.type) {
-    case "BET":
-      return finalizeReplay(row, await trueEngine().sendBet(asPayload<BetPayload>(row)), attempts, maxAttempts);
-    case "DEPOSIT":
-      return reconcileDeposit(row, attempts, maxAttempts);
-    case "ROLLBACK":
-      return finalizeReplay(row, await trueEngine().sendRollback(asPayload<RollbackPayload>(row)), attempts, maxAttempts);
-    case "WIN":
-      return reconcileWin(row, attempts, maxAttempts);
-    default:
-      await setStatus(row.id, "ABANDONED", `unhandled type ${row.type}`);
-      return "abandoned";
+  if (disposition === "succeeded" || disposition === "compensated") {
+    rowLog.info({ disposition }, "intent reconciled");
+  } else if (disposition === "abandoned") {
+    rowLog.error({ disposition }, "intent abandoned");
+  } else {
+    rowLog.warn({ disposition }, "intent still failing; will retry");
   }
+  return disposition;
 }
 
 /** BET / DEPOSIT / ROLLBACK: a plain idempotent replay. */
@@ -138,7 +165,18 @@ async function finalizeReplay(
 async function reconcileDeposit(row: EngineRequestLog, attempts: number, maxAttempts: number): Promise<Disposition> {
   const settlement = await settleDepositIntent(asPayload<DepositInstruction>(row));
   if (settlement.kind === "declined") {
+    // No funds were captured → nothing owed. Terminal.
     await setStatus(row.id, "ABANDONED", `psp declined: ${settlement.reason ?? "card_declined"}`);
+    return "abandoned";
+  }
+  if (settlement.kind === "pending_action") {
+    // SCA/3DS not yet completed (no capture). Primary settlement is the PSP webhook; keep
+    // retrying as a backstop until the attempt cap, then give up (safe — nothing captured).
+    if (attempts < maxAttempts) {
+      await markFailed(row.id, true, "awaiting customer action (SCA)");
+      return "stillFailing";
+    }
+    await setStatus(row.id, "ABANDONED", "SCA not completed within attempt budget");
     return "abandoned";
   }
   return finalizeReplay(row, settlement.engine, attempts, maxAttempts);

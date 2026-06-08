@@ -9,7 +9,7 @@ vi.mock("@/lib/prisma", async () => {
 import { getJournal, resetDb, seedJournalRow, seedUser } from "./fakes/prisma.fake";
 import { type Directive, type EngineCall, engineCalls, resetEngine, setEngineHandler } from "./fakes/engine.fake";
 import type { AuthClaims } from "@/lib/jwt";
-import { mockStripeCharge } from "@/lib/mock-stripe";
+import { getPaymentProvider } from "@/lib/payments";
 import { processProviderSpin } from "@/services/game-adapter.service";
 import { reconcileEngineRequests } from "@/services/reconciliation.service";
 import { purchasePackage } from "@/services/store.service";
@@ -129,7 +129,14 @@ describe("crash & recovery", () => {
     const attemptId = "attempt-3";
     const opTx = `deposit:${attemptId}`;
     const instruction = {
-      charge: { amountCents: 2000, token: "tok_ok", userId: USER_ID, idempotencyKey: attemptId },
+      charge: {
+        amountCents: 2000,
+        currency: "USD",
+        paymentMethodToken: "tok_ok",
+        idempotencyKey: attemptId,
+        customerRef: USER_ID,
+        metadata: { operator_transaction_id: opTx, package_id: "pkg_value_20" },
+      },
       purchase: {
         operator_transaction_id: opTx,
         player_id: ENGINE_PLAYER_ID,
@@ -149,9 +156,16 @@ describe("crash & recovery", () => {
       requestPayload: instruction,
       updatedAt: new Date(Date.now() - 10 * 60_000), // stale (process died 10 min ago)
     });
-    // (b) ...the PSP captured the card...
-    const captured = await mockStripeCharge({ amountCents: 2000, token: "tok_ok", userId: USER_ID, idempotencyKey: attemptId });
-    expect(captured.ok).toBe(true);
+    // (b) ...the PSP captured the card (same idempotency key the reconciler will reuse)...
+    const captured = await getPaymentProvider().charge({
+      amountCents: 2000,
+      currency: "USD",
+      paymentMethodToken: "tok_ok",
+      idempotencyKey: attemptId,
+      customerRef: USER_ID,
+      metadata: { operator_transaction_id: opTx },
+    });
+    expect(captured.status).toBe("succeeded");
     // (c) ...then the process crashed before the ledger credit (no completion recorded).
 
     setEngineHandler((call: EngineCall) =>
