@@ -24,8 +24,14 @@ model User {
   passwordHash String
   kycStatus    KycStatus @default(PENDING)
   vipLevel     Int       @default(0)
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @updatedAt
+
+  // Identity bridge (NOT financial state): the True Engine's own player UUID, returned
+  // by POST /api/v1/player/create where our `id` is sent as `external_id`. Every ledger
+  // call addresses the player by THIS id, never by our local `id`.
+  trueEnginePlayerId String? @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   // 🚫 FORBIDDEN by architecture: gc_balance, sc_balance, deposits, withdrawals.
   //    All balances are owned by the True Engine (Go) — never mirrored here.
@@ -37,6 +43,39 @@ enum KycStatus {
   PENDING
   VERIFIED
   REJECTED
+}
+
+/// Append-only INTENT JOURNAL (an outbox) — NOT financial state. Records every
+/// money intent forwarded to the True Engine so a crash between PSP capture and the
+/// ledger credit (or between a bet and its win) is recoverable by reconciliation.
+/// Holds no balances: only the deterministic idempotency key, type, status, and refs.
+model EngineRequestLog {
+  id                    String              @id @default(uuid())
+  operatorTransactionId String              @unique // the deterministic key sent to the engine
+  type                  EngineRequestType
+  status                EngineRequestStatus @default(PENDING)
+  playerId              String? // the engine player_id this intent targets
+  providerRef           String? // upstream ref the key was derived from (provider txn / payment_ref)
+  ledgerTransactionId   String? // engine-assigned id once the call succeeds
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+
+  @@index([status])
+  @@map("engine_request_log")
+}
+
+enum EngineRequestType {
+  BET
+  WIN
+  DEPOSIT
+  ROLLBACK
+  PLAYER_CREATE
+}
+
+enum EngineRequestStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
 }
 
 /// Fiat purchase catalog. Pricing METADATA only (no balances).

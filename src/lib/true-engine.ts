@@ -3,8 +3,12 @@ import { createHmac, randomUUID } from "node:crypto";
 import { getEnv } from "@/lib/env";
 import type {
   BetPayload,
-  DepositPayload,
+  CreatePlayerPayload,
+  CreatePlayerResult,
+  EngineSuccessEnvelope,
   EngineTxResult,
+  PurchasePayload,
+  RollbackPayload,
   TrueEngineErrorBody,
   TrueEngineResult,
   WinPayload,
@@ -13,68 +17,90 @@ import type {
 /**
  * TrueEngineClient — the signed bridge between this Gateway and the Go ledger.
  *
- * Responsibilities (Zero-Trust + Idempotency, per ARCHITECTURE.md):
+ * Outbound zero-trust contract (every `/api/v1/*` call — see internal/api/hmac.go,
+ * replay.go):
  *   1. Serialize the payload exactly once and sign those exact bytes with
- *      HMAC-SHA256(rawBody, ENGINE_SECRET_KEY) → `X-Signature`.
- *   2. Attach an `X-Idempotency-Key` (UUID v4), auto-generated if not supplied.
- *   3. Never throw for HTTP / transport failures — return a discriminated
+ *      HMAC-SHA256(rawBody, ENGINE_SECRET_KEY) → `X-Signature` (hex).
+ *   2. `X-Operator-Code` selects our per-operator secret on the engine side.
+ *   3. `X-Timestamp` (unix seconds) + a fresh `X-Nonce` (UUID) satisfy the engine's
+ *      ReplayGuard. The nonce is fresh per physical attempt; the idempotency anchor
+ *      (`operator_transaction_id`, in the body) stays stable across retries.
+ *   4. Never throw for HTTP / transport failures — return a discriminated
  *      `TrueEngineResult` so the route layer can fail gracefully.
  *
- * NOTE for the engine side: it must recompute the HMAC over the RAW request body
- * bytes (not a re-serialized object) for the signature to match.
+ * The engine recomputes the HMAC over the RAW request body bytes, so we sign and send
+ * the identical string (no re-serialization).
  */
 
 const ENGINE_ENDPOINTS = {
-  bet: "/v1/ledger/bet",
-  win: "/v1/ledger/win",
-  deposit: "/v1/ledger/deposit",
+  bet: "/api/v1/bet",
+  win: "/api/v1/win",
+  rollback: "/api/v1/rollback",
+  purchase: "/api/v1/store/purchase",
+  createPlayer: "/api/v1/player/create",
 } as const;
 
 export class TrueEngineClient {
   private readonly baseUrl: string;
   private readonly secret: string;
+  private readonly operatorCode: string;
   private readonly timeoutMs: number;
 
-  constructor(opts?: { baseUrl?: string; secret?: string; timeoutMs?: number }) {
+  constructor(opts?: {
+    baseUrl?: string;
+    secret?: string;
+    operatorCode?: string;
+    timeoutMs?: number;
+  }) {
     const env = getEnv();
     this.baseUrl = (opts?.baseUrl ?? env.ENGINE_BASE_URL).replace(/\/+$/, "");
     this.secret = opts?.secret ?? env.ENGINE_SECRET_KEY;
+    this.operatorCode = opts?.operatorCode ?? env.ENGINE_OPERATOR_CODE;
     this.timeoutMs = opts?.timeoutMs ?? env.ENGINE_TIMEOUT_MS;
   }
 
   // ── Public API ────────────────────────────────────────────────────────────
 
-  /** Debit a wager. Idempotency key defaults to the payload's `transaction_id`. */
-  sendBet(payload: BetPayload, idempotencyKey?: string): Promise<TrueEngineResult<EngineTxResult>> {
-    return this.post<EngineTxResult>(
-      ENGINE_ENDPOINTS.bet,
-      payload,
-      idempotencyKey ?? payload.transaction_id,
-    );
+  /** Debit a wager. `operator_transaction_id` must be a stable, deterministic key. */
+  sendBet(payload: BetPayload): Promise<TrueEngineResult<EngineTxResult>> {
+    return this.postTx(ENGINE_ENDPOINTS.bet, payload);
   }
 
-  /** Credit a win. Idempotency key defaults to the payload's `transaction_id`. */
-  sendWin(payload: WinPayload, idempotencyKey?: string): Promise<TrueEngineResult<EngineTxResult>> {
-    return this.post<EngineTxResult>(
-      ENGINE_ENDPOINTS.win,
-      payload,
-      idempotencyKey ?? payload.transaction_id,
-    );
+  /** Credit a win, optionally linked to the bet's `ledger_transaction_id`. */
+  sendWin(payload: WinPayload): Promise<TrueEngineResult<EngineTxResult>> {
+    return this.postTx(ENGINE_ENDPOINTS.win, payload);
   }
 
-  /** Credit purchased coins after a confirmed fiat charge. */
-  sendDeposit(
-    payload: DepositPayload,
-    idempotencyKey?: string,
-  ): Promise<TrueEngineResult<EngineTxResult>> {
-    return this.post<EngineTxResult>(
-      ENGINE_ENDPOINTS.deposit,
-      payload,
-      idempotencyKey ?? payload.transaction_id,
-    );
+  /** Issue purchased coins (GC + optional SC_UNPLAYED promo) after a fiat charge. */
+  sendPurchase(payload: PurchasePayload): Promise<TrueEngineResult<EngineTxResult>> {
+    return this.postTx(ENGINE_ENDPOINTS.purchase, payload);
+  }
+
+  /** Reverse a previously-committed BET by its ledger transaction id. */
+  sendRollback(payload: RollbackPayload): Promise<TrueEngineResult<EngineTxResult>> {
+    return this.postTx(ENGINE_ENDPOINTS.rollback, payload);
+  }
+
+  /**
+   * Provision a player. Idempotent on `external_id` (a repeat returns the existing
+   * player with `created=false`). The response is flat (not wrapped in `result`).
+   */
+  async createPlayer(payload: CreatePlayerPayload): Promise<TrueEngineResult<CreatePlayerResult>> {
+    const res = await this.post<CreatePlayerResult>(ENGINE_ENDPOINTS.createPlayer, payload);
+    return res; // already the right shape
   }
 
   // ── Internals ──────────────────────────────────────────────────────────────
+
+  /** Post a tx-style call and unwrap the `{ code, result }` envelope to `result`. */
+  private async postTx(
+    path: string,
+    payload: object,
+  ): Promise<TrueEngineResult<EngineTxResult>> {
+    const res = await this.post<EngineSuccessEnvelope<EngineTxResult>>(path, payload);
+    if (!res.ok) return res;
+    return { ok: true, status: res.status, data: res.data.result };
+  }
 
   /** HMAC-SHA256 of the exact serialized body, hex-encoded. */
   private sign(rawBody: string): string {
@@ -82,17 +108,15 @@ export class TrueEngineClient {
   }
 
   /**
-   * Signed POST. Serializes once, signs those bytes, sends that exact string.
-   * Converts every failure mode (4xx/5xx, timeout, network) into a typed result.
+   * Signed POST. Serializes once, signs those bytes, sends that exact string with the
+   * full four-header zero-trust set. Converts every failure mode (4xx/5xx, timeout,
+   * network) into a typed result.
    */
-  private async post<T>(
-    path: string,
-    payload: object,
-    idempotencyKey?: string,
-  ): Promise<TrueEngineResult<T>> {
+  private async post<T>(path: string, payload: object): Promise<TrueEngineResult<T>> {
     const rawBody = JSON.stringify(payload); // serialize ONCE; sign & send identical bytes
     const signature = this.sign(rawBody);
-    const key = idempotencyKey ?? randomUUID();
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const nonce = randomUUID();
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -102,8 +126,10 @@ export class TrueEngineClient {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          "X-Operator-Code": this.operatorCode,
           "X-Signature": signature,
-          "X-Idempotency-Key": key,
+          "X-Timestamp": timestamp,
+          "X-Nonce": nonce,
         },
         body: rawBody,
         signal: controller.signal,
@@ -114,7 +140,12 @@ export class TrueEngineClient {
       const parsed = text ? safeJsonParse(text) : null;
 
       if (!res.ok) {
-        return { ok: false, status: res.status, error: normalizeEngineError(res.status, parsed) };
+        return {
+          ok: false,
+          status: res.status,
+          retryable: isRetryableStatus(res.status),
+          error: normalizeEngineError(res.status, parsed),
+        };
       }
       return { ok: true, status: res.status, data: (parsed ?? {}) as T };
     } catch (err) {
@@ -122,6 +153,7 @@ export class TrueEngineClient {
       return {
         ok: false,
         status: 0,
+        retryable: true, // timeouts / network errors are safe to retry with the same key
         error: {
           code: isAbort ? "ENGINE_TIMEOUT" : "ENGINE_UNREACHABLE",
           message: isAbort
@@ -136,6 +168,14 @@ export class TrueEngineClient {
   }
 }
 
+/**
+ * Engine status → retry policy (internal/api/errors.go): 409 (pending/conflict) and 5xx
+ * are safely retryable with the same operator_transaction_id; 4xx are terminal.
+ */
+function isRetryableStatus(status: number): boolean {
+  return status === 409 || status >= 500;
+}
+
 function safeJsonParse(text: string): unknown {
   try {
     return JSON.parse(text);
@@ -144,7 +184,7 @@ function safeJsonParse(text: string): unknown {
   }
 }
 
-/** Map an engine HTTP status + body into a stable, frontend-safe error shape. */
+/** Map an engine error body into a stable, frontend-safe error shape. */
 function normalizeEngineError(status: number, parsed: unknown): TrueEngineErrorBody {
   const fallback = STATUS_FALLBACK[status] ?? {
     code: "ENGINE_ERROR",
@@ -156,7 +196,8 @@ function normalizeEngineError(status: number, parsed: unknown): TrueEngineErrorB
     return {
       code: typeof obj.code === "string" ? obj.code : fallback.code,
       message: typeof obj.message === "string" ? obj.message : fallback.message,
-      details: obj.details ?? obj.error ?? undefined,
+      trace_id: typeof obj.trace_id === "string" ? obj.trace_id : undefined,
+      details: obj.details ?? undefined,
     };
   }
   return fallback;
@@ -164,9 +205,10 @@ function normalizeEngineError(status: number, parsed: unknown): TrueEngineErrorB
 
 const STATUS_FALLBACK: Record<number, TrueEngineErrorBody> = {
   400: { code: "LEDGER_REJECTED", message: "The ledger rejected the transaction (e.g. insufficient funds)" },
-  401: { code: "UNAUTHORIZED_SIGNATURE", message: "True Engine rejected the HMAC signature" },
-  404: { code: "ENGINE_ROUTE_NOT_FOUND", message: "True Engine endpoint not found" },
-  409: { code: "IDEMPOTENCY_CONFLICT", message: "A transaction with this idempotency key already exists" },
+  401: { code: "AUTHENTICATION_FAILED", message: "True Engine rejected the request credentials" },
+  403: { code: "PLAYER_NOT_ACTIVE", message: "Player is not allowed to transact" },
+  404: { code: "NOT_FOUND", message: "Player or transaction not found" },
+  409: { code: "TRANSACTION_CONFLICT", message: "Duplicate or concurrent transaction (retryable)" },
   422: { code: "LEDGER_VALIDATION_ERROR", message: "True Engine rejected the payload" },
   500: { code: "ENGINE_INTERNAL_ERROR", message: "True Engine internal error" },
   503: { code: "ENGINE_UNAVAILABLE", message: "True Engine temporarily unavailable" },
