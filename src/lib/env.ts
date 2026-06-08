@@ -10,6 +10,10 @@ const envSchema = z.object({
   JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
   JWT_EXPIRES_IN: z.string().default("7d"),
 
+  // Distributed state (replay-nonce store, reconciler coordination). Optional in dev;
+  // REQUIRED in any multi-instance deployment so nonces are shared across nodes.
+  REDIS_URL: z.string().url("REDIS_URL must be a valid URL").optional(),
+
   // Outbound — this gateway acting as an operator of the True Engine.
   ENGINE_BASE_URL: z.string().url("ENGINE_BASE_URL must be a valid URL"),
   ENGINE_SECRET_KEY: z.string().min(16, "ENGINE_SECRET_KEY must be at least 16 characters"),

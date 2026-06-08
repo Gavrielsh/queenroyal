@@ -75,7 +75,7 @@ export async function register(input: RegisterInput): Promise<AuthResult> {
 
   // Provision the player in the True Engine and persist its player_id. We do this at
   // registration but treat a transient failure as non-fatal: the account is created and
-  // `resolveTrueEnginePlayerId()` will lazily (idempotently) provision on first
+  // `resolveTransactingPlayer()` will lazily (idempotently) provision on first
   // transaction. We never block account creation on the ledger being momentarily down.
   try {
     await provisionTrueEnginePlayer(user.id, user.email);

@@ -1,9 +1,17 @@
+import { assertKycAllows, KycGateError } from "@/lib/kyc-policy";
 import { isPositiveMoneyString } from "@/lib/money";
 import { trueEngine } from "@/lib/true-engine";
 import type { ProviderSpinInput } from "@/schemas/game.schema";
 import { beginEngineRequest, completeEngineRequest } from "@/services/engine-journal.service";
-import { ProvisioningError, resolveTrueEnginePlayerId } from "@/services/player-provisioning.service";
-import type { Currency, EngineBalances, EngineTxResult, TrueEngineErrorBody } from "@/types/true-engine";
+import { ProvisioningError, resolveTransactingPlayer } from "@/services/player-provisioning.service";
+import type {
+  BetPayload,
+  Currency,
+  EngineBalances,
+  EngineTxResult,
+  TrueEngineErrorBody,
+  WinPayload,
+} from "@/types/true-engine";
 
 export interface SpinSuccess {
   providerTransactionId: string;
@@ -22,12 +30,12 @@ export type SpinOutcome =
  * B2B game-aggregator adapter. The inbound webhook has ALREADY been HMAC/timestamp/nonce
  * verified by the route — this function trusts the provider, not the player.
  *
- *   1. Resolve OUR user id → the engine player_id (provisioning lazily if needed).
- *   2. Derive STABLE, deterministic idempotency keys from the provider's txn id
- *      (`bet:<id>` / `win:<id>`), so a provider retry de-duplicates at the ledger and
- *      can never double-debit (this is what makes Ghost-Spin recovery work).
- *   3. sendBet → on success, sendWin (when win > 0) referencing the bet's
- *      `ledger_transaction_id`. Each step is journaled for crash recovery.
+ *   1. Resolve OUR user id → engine player_id (+ current KYC status), provisioning lazily.
+ *   2. Server-side KYC gate (never trust a stale JWT claim — this path has no JWT anyway).
+ *   3. Derive STABLE, deterministic idempotency keys from the provider's txn id
+ *      (`bet:<id>` / `win:<id>`) and journal the exact payloads for replay/compensation.
+ *   4. sendBet → on success, sendWin (when win > 0) referencing the bet's
+ *      `ledger_transaction_id`.
  */
 export async function processProviderSpin(
   providerCode: string,
@@ -35,10 +43,10 @@ export async function processProviderSpin(
 ): Promise<SpinOutcome> {
   const engine = trueEngine();
 
-  // 1) Identity bridge.
-  let playerId: string;
+  // 1) Identity bridge + current KYC status (single DB read).
+  let player;
   try {
-    playerId = await resolveTrueEnginePlayerId(input.player_id);
+    player = await resolveTransactingPlayer(input.player_id);
   } catch (err) {
     if (err instanceof ProvisioningError) {
       return {
@@ -50,13 +58,23 @@ export async function processProviderSpin(
     throw err;
   }
 
+  // 2) Server-side KYC gate.
+  try {
+    assertKycAllows(player.kycStatus, "SPIN", input.currency);
+  } catch (err) {
+    if (err instanceof KycGateError) {
+      return { ok: false, status: 403, error: { code: err.code, message: err.message } };
+    }
+    throw err;
+  }
+
+  const playerId = player.trueEnginePlayerId;
   const betOpTxId = `bet:${input.provider_transaction_id}`;
   const winOpTxId = `win:${input.provider_transaction_id}`;
   const metadata = { provider: providerCode };
 
-  // 2) Debit the bet first.
-  await beginEngineRequest({ operatorTransactionId: betOpTxId, type: "BET", playerId, providerRef: input.provider_transaction_id });
-  const bet = await engine.sendBet({
+  // 3) Debit the bet first.
+  const betPayload: BetPayload = {
     operator_transaction_id: betOpTxId,
     player_id: playerId,
     currency: input.currency,
@@ -64,13 +82,23 @@ export async function processProviderSpin(
     game_id: input.game_id,
     round_id: input.round_id,
     metadata,
+  };
+  await beginEngineRequest({
+    operatorTransactionId: betOpTxId,
+    type: "BET",
+    playerId,
+    providerRef: input.provider_transaction_id,
+    requestPayload: betPayload,
   });
+  const bet = await engine.sendBet(betPayload);
   if (!bet.ok) {
-    await completeEngineRequest(betOpTxId, "FAILED");
-    // e.g. 400 insufficient funds — stop; no win is attempted.
+    await completeEngineRequest(betOpTxId, "FAILED", {
+      retryable: bet.retryable,
+      lastError: `${bet.error.code}: ${bet.error.message}`,
+    });
     return { ok: false, status: bet.status === 0 ? 502 : bet.status, error: bet.error };
   }
-  await completeEngineRequest(betOpTxId, "SUCCEEDED", bet.data.ledger_transaction_id);
+  await completeEngineRequest(betOpTxId, "SUCCEEDED", { ledgerTransactionId: bet.data.ledger_transaction_id });
 
   // No win → return the post-bet state.
   if (!isPositiveMoneyString(input.win_amount)) {
@@ -87,9 +115,8 @@ export async function processProviderSpin(
     };
   }
 
-  // 3) Credit the win, linked to the bet's ledger transaction id.
-  await beginEngineRequest({ operatorTransactionId: winOpTxId, type: "WIN", playerId, providerRef: input.provider_transaction_id });
-  const win = await engine.sendWin({
+  // 4) Credit the win, linked to the bet's ledger transaction id.
+  const winPayload: WinPayload = {
     operator_transaction_id: winOpTxId,
     player_id: playerId,
     currency: input.currency,
@@ -98,11 +125,22 @@ export async function processProviderSpin(
     round_id: input.round_id,
     reference_transaction_id: bet.data.ledger_transaction_id,
     metadata,
+  };
+  await beginEngineRequest({
+    operatorTransactionId: winOpTxId,
+    type: "WIN",
+    playerId,
+    providerRef: input.provider_transaction_id,
+    requestPayload: winPayload,
   });
+  const win = await engine.sendWin(winPayload);
   if (!win.ok) {
-    await completeEngineRequest(winOpTxId, "FAILED");
-    // The bet was already debited. The win is safely retryable via the SAME winOpTxId
-    // (the journal row records it); surface for reconciliation / saga compensation.
+    await completeEngineRequest(winOpTxId, "FAILED", {
+      retryable: win.retryable,
+      lastError: `${win.error.code}: ${win.error.message}`,
+    });
+    // The bet was already debited. The win is journaled under winOpTxId and will be
+    // reconciled (retried, or the bet rolled back) by the reconciliation worker.
     return {
       ok: false,
       status: win.status === 0 ? 502 : win.status,
@@ -119,7 +157,7 @@ export async function processProviderSpin(
       },
     };
   }
-  await completeEngineRequest(winOpTxId, "SUCCEEDED", win.data.ledger_transaction_id);
+  await completeEngineRequest(winOpTxId, "SUCCEEDED", { ledgerTransactionId: win.data.ledger_transaction_id });
 
   return {
     ok: true,

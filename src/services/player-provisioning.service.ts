@@ -14,19 +14,27 @@ export class ProvisioningError extends Error {
   }
 }
 
+/** The fields a money-mutating path needs: the engine player id + the CURRENT KYC status. */
+export interface TransactingPlayer {
+  userId: string;
+  kycStatus: string;
+  trueEnginePlayerId: string;
+}
+
 /**
- * Return the engine `player_id` for a local user, provisioning lazily (and persisting)
- * if we don't have it yet. Self-healing: createPlayer is idempotent, so calling it for
- * an already-provisioned external_id simply returns the existing player.
+ * Resolve everything a money path needs in a single read: the engine `player_id`
+ * (provisioning lazily and persisting if absent) and the player's current KYC status
+ * (sourced from the DB, never from a stale JWT claim).
  */
-export async function resolveTrueEnginePlayerId(userId: string): Promise<string> {
+export async function resolveTransactingPlayer(userId: string): Promise<TransactingPlayer> {
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: { id: true, email: true, trueEnginePlayerId: true },
+    select: { id: true, email: true, kycStatus: true, trueEnginePlayerId: true },
   });
   if (!user) throw new ProvisioningError(`Unknown user ${userId}`);
-  if (user.trueEnginePlayerId) return user.trueEnginePlayerId;
-  return provisionTrueEnginePlayer(user.id, user.email);
+
+  const trueEnginePlayerId = user.trueEnginePlayerId ?? (await provisionTrueEnginePlayer(user.id, user.email));
+  return { userId: user.id, kycStatus: user.kycStatus, trueEnginePlayerId };
 }
 
 /**

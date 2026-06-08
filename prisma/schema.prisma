@@ -57,10 +57,17 @@ model EngineRequestLog {
   playerId              String? // the engine player_id this intent targets
   providerRef           String? // upstream ref the key was derived from (provider txn / payment_ref)
   ledgerTransactionId   String? // engine-assigned id once the call succeeds
+  // The exact request body sent to the engine, so the reconciler can REPLAY it verbatim
+  // with the same idempotency key. This is an instruction log, not balance state.
+  requestPayload        Json?
+  retryable             Boolean             @default(false) // last failure was retryable (409/5xx/timeout)
+  attempts              Int                 @default(0) // reconciler attempt counter (bounded)
+  lastError             String? // last engine error code/message (diagnostics)
   createdAt             DateTime            @default(now())
   updatedAt             DateTime            @updatedAt
 
-  @@index([status])
+  // Hot path for the reconciler: scan unfinished work oldest-first.
+  @@index([status, updatedAt])
   @@map("engine_request_log")
 }
 
@@ -73,9 +80,11 @@ enum EngineRequestType {
 }
 
 enum EngineRequestStatus {
-  PENDING
-  SUCCEEDED
-  FAILED
+  PENDING // in-flight, or crashed mid-call (reconciler re-drives once stale)
+  SUCCEEDED // committed at the ledger
+  FAILED // last attempt failed; eligible for reconciliation
+  COMPENSATED // a terminally-failed WIN whose originating BET was rolled back
+  ABANDONED // gave up (max attempts) or terminal with nothing to compensate
 }
 
 /// Fiat purchase catalog. Pricing METADATA only (no balances).
