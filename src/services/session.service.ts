@@ -1,5 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 
+import type { Redis } from "ioredis";
+
+import { withRedisBreaker } from "@/lib/circuit-breaker";
 import { getEnv } from "@/lib/env";
 import { getRedis } from "@/lib/redis";
 
@@ -28,10 +31,21 @@ interface SessionRecord {
   createdAt: number;
 }
 
-function requireRedis() {
+/**
+ * Run a refresh-session Redis op through the shared circuit breaker. FAIL CLOSED: a
+ * missing/unreachable store (or an open breaker) surfaces as {@link SessionStoreUnavailableError}
+ * so auth never silently degrades into issuing an unrevocable, long-lived credential. The
+ * breaker makes that rejection FAST instead of hanging on driver retries.
+ */
+async function withSessionStore<T>(fn: (redis: Redis) => Promise<T>): Promise<T> {
   const redis = getRedis();
   if (!redis) throw new SessionStoreUnavailableError("REDIS_URL is required for refresh sessions");
-  return redis;
+  try {
+    return await withRedisBreaker(() => fn(redis));
+  } catch (err) {
+    if (err instanceof SessionStoreUnavailableError) throw err;
+    throw new SessionStoreUnavailableError(err instanceof Error ? err.message : "session store unavailable");
+  }
 }
 
 function hashToken(token: string): string {
@@ -44,11 +58,10 @@ function keyFor(token: string): string {
 
 /** Issue a fresh opaque refresh token bound to a user, stored hashed with the refresh TTL. */
 export async function issueRefreshToken(userId: string): Promise<string> {
-  const redis = requireRedis();
   const ttl = getEnv().JWT_REFRESH_TTL_SECONDS;
   const token = randomBytes(32).toString("hex");
   const record: SessionRecord = { userId, createdAt: Date.now() };
-  await redis.set(keyFor(token), JSON.stringify(record), "EX", ttl);
+  await withSessionStore((redis) => redis.set(keyFor(token), JSON.stringify(record), "EX", ttl));
   return token;
 }
 
@@ -58,26 +71,24 @@ export async function issueRefreshToken(userId: string): Promise<string> {
  * (reuse of a rotated token therefore fails closed).
  */
 export async function rotateRefreshToken(token: string): Promise<{ userId: string; refreshToken: string } | null> {
-  const redis = requireRedis();
   const key = keyFor(token);
-  const raw = await redis.get(key);
+  const raw = await withSessionStore((redis) => redis.get(key));
   if (!raw) return null;
 
   let record: SessionRecord;
   try {
     record = JSON.parse(raw) as SessionRecord;
   } catch {
-    await redis.del(key);
+    await withSessionStore((redis) => redis.del(key));
     return null;
   }
 
-  await redis.del(key); // single-use: invalidate the presented token
+  await withSessionStore((redis) => redis.del(key)); // single-use: invalidate the presented token
   const refreshToken = await issueRefreshToken(record.userId);
   return { userId: record.userId, refreshToken };
 }
 
 /** Revoke a refresh token (logout). Idempotent. */
 export async function revokeRefreshToken(token: string): Promise<void> {
-  const redis = requireRedis();
-  await redis.del(keyFor(token));
+  await withSessionStore((redis) => redis.del(keyFor(token)));
 }

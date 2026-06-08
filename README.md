@@ -48,10 +48,20 @@ All bodies are JSON. Authenticated routes require `Authorization: Bearer <jwt>`.
 
 ### `POST /api/store/purchase` (auth)
 ```json
-{ "packageId": "pkg_value_20", "paymentToken": "tok_mock_visa" }
+{ "packageId": "pkg_value_20", "idempotencyKey": "optional-stable-key" }
 ```
-Validates the package → mocks the Stripe charge → `TrueEngineClient.sendDeposit()` with exact
-integer cents → returns the engine's response. Use `"tok_decline"` to simulate a declined card.
+Validates the package → KYC gate → journals a `PENDING` deposit intent → opens a PSP
+PaymentIntent (no capture) → returns `{ status: "requires_payment_confirmation",
+clientSecret, paymentIntentId, operatorTransactionId, package }`. The frontend confirms the
+card (and any 3DS/SCA) with `clientSecret`; the ledger is credited **asynchronously, exactly
+once**, when the verified `payment_intent.succeeded` webhook arrives (see below). No raw card
+data ever reaches this service.
+
+### `POST /api/webhooks/psp` (PSP → gateway)
+The PSP's signed settlement webhook. The raw body's HMAC signature is verified, then a
+`payment_intent.succeeded` triggers the idempotent True Engine credit for the referenced
+deposit intent, while `payment_intent.payment_failed` marks it terminal. A lost webhook is
+recovered by the reconciler polling the PSP.
 
 ### `POST /api/game/spin` (auth)
 ```json

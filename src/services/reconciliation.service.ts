@@ -1,10 +1,15 @@
 import type { EngineRequestLog } from "@prisma/client";
 
 import { getEnv } from "@/lib/env";
-import { childLogger } from "@/lib/logger";
+import { childLogger, type Logger } from "@/lib/logger";
 import { prisma } from "@/lib/prisma";
 import { trueEngine } from "@/lib/true-engine";
-import { type DepositInstruction, settleDepositIntent } from "@/services/deposit.service";
+import {
+  type DepositInstruction,
+  parseEngineRequestPayload,
+  type ReplayableEngineRequestType,
+} from "@/schemas/engine-payloads.schema";
+import { creditConfirmedDeposit, pollDepositIntent } from "@/services/deposit.service";
 import { beginEngineRequest, completeEngineRequest } from "@/services/engine-journal.service";
 import type {
   BetPayload,
@@ -18,15 +23,19 @@ import type {
  * Saga compensation / reconciliation. Consumes the EngineRequestLog outbox and drives
  * every orphaned intent to a terminal state.
  *
- * The two failure modes from the directive:
+ * The failure modes:
  *   - A BET succeeds but its WIN settlement fails → retry the win with the same key; if
  *     the win is terminally rejected, COMPENSATE by rolling back the bet's
  *     `ledger_transaction_id` so the player isn't left debited for an unpaid spin.
- *   - A PSP charge succeeds but the ledger DEPOSIT fails (network/timeout) → retry the
- *     deposit with the same key (idempotent; never re-charges the card).
+ *   - A DEPOSIT whose PSP capture is confirmed (webhook `succeeded`) but whose ledger
+ *     credit failed → retry the credit with the same key (idempotent; never re-charges).
+ *   - A DEPOSIT still PENDING past the stale window → poll the PSP directly (lost-webhook
+ *     backstop): credit if it actually succeeded, abandon if it failed, else wait.
  *
  * Every replay reuses the STABLE operator_transaction_id, so the engine de-duplicates
- * (CACHED / GHOST_RECOVERED) and funds are never moved twice.
+ * (CACHED / GHOST_RECOVERED) and funds are never moved twice. Every payload is STRICTLY
+ * re-validated (Zod) before replay — a corrupted JSONB row is abandoned with a critical
+ * alert, never blindly forwarded to the ledger.
  */
 
 export interface ReconcileOptions {
@@ -99,31 +108,7 @@ async function reconcileOne(row: EngineRequestLog, maxAttempts: number): Promise
   });
   await prisma.engineRequestLog.update({ where: { id: row.id }, data: { attempts } });
 
-  let disposition: Disposition;
-  if (row.requestPayload == null || row.type === "PLAYER_CREATE") {
-    // Without the original body we cannot replay. PLAYER_CREATE is non-financial and not
-    // reconciled here either.
-    await setStatus(row.id, "ABANDONED", "no replayable payload");
-    disposition = "abandoned";
-  } else {
-    switch (row.type) {
-      case "BET":
-        disposition = await finalizeReplay(row, await trueEngine().sendBet(asPayload<BetPayload>(row)), attempts, maxAttempts);
-        break;
-      case "DEPOSIT":
-        disposition = await reconcileDeposit(row, attempts, maxAttempts);
-        break;
-      case "ROLLBACK":
-        disposition = await finalizeReplay(row, await trueEngine().sendRollback(asPayload<RollbackPayload>(row)), attempts, maxAttempts);
-        break;
-      case "WIN":
-        disposition = await reconcileWin(row, attempts, maxAttempts);
-        break;
-      default:
-        await setStatus(row.id, "ABANDONED", `unhandled type ${row.type}`);
-        disposition = "abandoned";
-    }
-  }
+  const disposition = await dispatch(row, attempts, maxAttempts, rowLog);
 
   if (disposition === "succeeded" || disposition === "compensated") {
     rowLog.info({ disposition }, "intent reconciled");
@@ -135,7 +120,46 @@ async function reconcileOne(row: EngineRequestLog, maxAttempts: number): Promise
   return disposition;
 }
 
-/** BET / DEPOSIT / ROLLBACK: a plain idempotent replay. */
+async function dispatch(
+  row: EngineRequestLog,
+  attempts: number,
+  maxAttempts: number,
+  rowLog: Logger,
+): Promise<Disposition> {
+  // PLAYER_CREATE is non-financial and not reconciled here; a row with no payload cannot
+  // be replayed at all.
+  if (row.requestPayload == null || row.type === "PLAYER_CREATE") {
+    await setStatus(row.id, "ABANDONED", "no replayable payload");
+    return "abandoned";
+  }
+  if (!isReplayableType(row.type)) {
+    await setStatus(row.id, "ABANDONED", `unhandled type ${row.type}`);
+    return "abandoned";
+  }
+
+  // Phase 3: STRICT-validate the JSONB payload before ANY replay logic runs. A corrupted
+  // row is a runtime crash (or a malformed ledger call) waiting to happen → abandon it and
+  // raise a critical alert instead of trusting `Prisma.JsonValue`.
+  const parsed = parseEngineRequestPayload(row.type, row.requestPayload);
+  if (!parsed.ok) {
+    rowLog.fatal({ alert: "corrupt_engine_payload", reason: parsed.error }, "CRITICAL: journal payload failed schema validation; abandoning");
+    await setStatus(row.id, "ABANDONED", `corrupt payload: ${parsed.error}`);
+    return "abandoned";
+  }
+
+  switch (parsed.type) {
+    case "BET":
+      return finalizeReplay(row, await trueEngine().sendBet(parsed.data), attempts, maxAttempts);
+    case "ROLLBACK":
+      return finalizeReplay(row, await trueEngine().sendRollback(parsed.data), attempts, maxAttempts);
+    case "WIN":
+      return reconcileWin(row, parsed.data, attempts, maxAttempts);
+    case "DEPOSIT":
+      return reconcileDeposit(row, parsed.data, attempts, maxAttempts, rowLog);
+  }
+}
+
+/** BET / ROLLBACK: a plain idempotent replay. */
 async function finalizeReplay(
   row: EngineRequestLog,
   res: TrueEngineResult<EngineTxResult>,
@@ -157,34 +181,96 @@ async function finalizeReplay(
 }
 
 /**
- * DEPOSIT: settle idempotently. This re-runs the PSP capture (a no-op if it already
- * happened, or the FIRST capture if the process crashed before charging) and then the
- * idempotent ledger credit. A declined card means no funds were ever captured → nothing
- * is owed, so the intent is terminal.
+ * DEPOSIT reconciliation. The PSP is the authority on whether funds were captured:
+ *   - status FAILED  → a `succeeded` webhook already confirmed capture but the ledger
+ *     credit failed. Retry the credit ONLY (idempotent; never a re-charge).
+ *   - status PENDING → the webhook may have been lost. Poll the PSP: credit if it actually
+ *     succeeded, abandon if it failed/cancelled, else keep waiting (nothing captured yet).
  */
-async function reconcileDeposit(row: EngineRequestLog, attempts: number, maxAttempts: number): Promise<Disposition> {
-  const settlement = await settleDepositIntent(asPayload<DepositInstruction>(row));
-  if (settlement.kind === "declined") {
-    // No funds were captured → nothing owed. Terminal.
-    await setStatus(row.id, "ABANDONED", `psp declined: ${settlement.reason ?? "card_declined"}`);
+async function reconcileDeposit(
+  row: EngineRequestLog,
+  instruction: DepositInstruction,
+  attempts: number,
+  maxAttempts: number,
+  rowLog: Logger,
+): Promise<Disposition> {
+  if (row.status === "FAILED") {
+    return finalizeDepositCredit(row, await creditConfirmedDeposit(instruction), attempts, maxAttempts, rowLog);
+  }
+
+  // PENDING & stale → reconcile against the PSP's own view of the intent.
+  const snapshot = await pollDepositIntent(instruction.paymentIntentId);
+  if (!snapshot) {
+    // The intent was never opened (or has expired/purged) → nothing was captured.
+    return waitOrAbandon(row, attempts, maxAttempts, "psp intent not found");
+  }
+  if (snapshot.status === "succeeded") {
+    rowLog.warn("recovered a lost PSP success via poll; crediting deposit");
+    return finalizeDepositCredit(row, await creditConfirmedDeposit(instruction), attempts, maxAttempts, rowLog);
+  }
+  if (snapshot.status === "failed" || snapshot.status === "canceled") {
+    await setStatus(row.id, "ABANDONED", `psp intent ${snapshot.status} (no capture)`);
     return "abandoned";
   }
-  if (settlement.kind === "pending_action") {
-    // SCA/3DS not yet completed (no capture). Primary settlement is the PSP webhook; keep
-    // retrying as a backstop until the attempt cap, then give up (safe — nothing captured).
-    if (attempts < maxAttempts) {
-      await markFailed(row.id, true, "awaiting customer action (SCA)");
-      return "stillFailing";
-    }
-    await setStatus(row.id, "ABANDONED", "SCA not completed within attempt budget");
-    return "abandoned";
+  // requires_* / processing → the customer has not completed payment. Nothing captured.
+  return waitOrAbandon(row, attempts, maxAttempts, `awaiting payment (${snapshot.status})`);
+}
+
+/**
+ * Resolve a deposit credit result. Unlike a bet, a TERMINAL failure here means funds were
+ * already captured but the ledger refused the credit — a money-out-of-balance condition
+ * that needs human intervention (refund), so it is abandoned with a CRITICAL alert.
+ */
+async function finalizeDepositCredit(
+  row: EngineRequestLog,
+  res: TrueEngineResult<EngineTxResult>,
+  attempts: number,
+  maxAttempts: number,
+  rowLog: Logger,
+): Promise<Disposition> {
+  if (res.ok) {
+    await completeEngineRequest(row.operatorTransactionId, "SUCCEEDED", {
+      ledgerTransactionId: res.data.ledger_transaction_id,
+    });
+    return "succeeded";
   }
-  return finalizeReplay(row, settlement.engine, attempts, maxAttempts);
+  if (res.retryable && attempts < maxAttempts) {
+    await markFailed(row.id, res.retryable, errText(res));
+    return "stillFailing";
+  }
+  rowLog.fatal({ alert: "captured_deposit_uncredited", err: errText(res) }, "CRITICAL: captured deposit could not be credited; manual refund required");
+  await setStatus(row.id, "ABANDONED", `captured but uncredited: ${errText(res)}`);
+  return "abandoned";
+}
+
+/**
+ * Keep an uncaptured PENDING deposit alive for another cycle (NOT FAILED — that status is
+ * reserved for confirmed-capture-credit-pending), or give up once the attempt budget is
+ * spent. Either way no funds were captured, so abandoning is safe.
+ */
+async function waitOrAbandon(
+  row: EngineRequestLog,
+  attempts: number,
+  maxAttempts: number,
+  note: string,
+): Promise<Disposition> {
+  if (attempts < maxAttempts) {
+    // Touch the row (bumps updatedAt) so it leaves the stale window and is rescanned later.
+    await prisma.engineRequestLog.update({ where: { id: row.id }, data: { lastError: note } });
+    return "stillFailing";
+  }
+  await setStatus(row.id, "ABANDONED", `${note}; attempt budget exhausted`);
+  return "abandoned";
 }
 
 /** WIN: retry first; on a terminal failure, compensate by rolling back the bet. */
-async function reconcileWin(row: EngineRequestLog, attempts: number, maxAttempts: number): Promise<Disposition> {
-  const res = await trueEngine().sendWin(asPayload<WinPayload>(row));
+async function reconcileWin(
+  row: EngineRequestLog,
+  payload: WinPayload,
+  attempts: number,
+  maxAttempts: number,
+): Promise<Disposition> {
+  const res = await trueEngine().sendWin(payload);
   if (res.ok) {
     await completeEngineRequest(row.operatorTransactionId, "SUCCEEDED", {
       ledgerTransactionId: res.data.ledger_transaction_id,
@@ -255,8 +341,8 @@ async function compensateWin(row: EngineRequestLog, attempts: number, maxAttempt
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-function asPayload<T>(row: EngineRequestLog): T {
-  return row.requestPayload as unknown as T;
+function isReplayableType(type: EngineRequestLog["type"]): type is ReplayableEngineRequestType {
+  return type === "BET" || type === "WIN" || type === "DEPOSIT" || type === "ROLLBACK";
 }
 
 function errText(res: Extract<TrueEngineResult<EngineTxResult>, { ok: false }>): string {

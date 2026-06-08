@@ -8,11 +8,11 @@ vi.mock("@/lib/prisma", async () => {
 
 import { getJournal, resetDb, seedJournalRow, seedUser } from "./fakes/prisma.fake";
 import { type Directive, type EngineCall, engineCalls, resetEngine, setEngineHandler } from "./fakes/engine.fake";
-import type { AuthClaims } from "@/lib/jwt";
-import { getPaymentProvider } from "@/lib/payments";
+import { setPaymentProvider } from "@/lib/payments";
+import { MockPaymentProvider } from "@/lib/payments/mock";
 import { processProviderSpin } from "@/services/game-adapter.service";
+import { handlePspWebhookEvent } from "@/services/psp-webhook.service";
 import { reconcileEngineRequests } from "@/services/reconciliation.service";
-import { purchasePackage } from "@/services/store.service";
 
 const USER_ID = "11111111-1111-4111-8111-111111111111";
 const ENGINE_PLAYER_ID = "engine-player-1";
@@ -41,9 +41,30 @@ function okTx(operatorTransactionId: string, ledgerTxId: string, status = "PROCE
 
 const unexpected: Directive = { ok: false, status: 500, body: { code: "UNEXPECTED" } };
 
+const PSP_SECRET = "test_psp_secret";
+let psp: MockPaymentProvider;
+
+/** The DEPOSIT credit instruction journaled for the $20 package. */
+function depositInstruction(opTx: string, paymentIntentId: string, attemptId: string) {
+  return {
+    paymentIntentId,
+    expectedAmountCents: 2000,
+    currency: "USD",
+    purchase: {
+      operator_transaction_id: opTx,
+      player_id: ENGINE_PLAYER_ID,
+      gc_amount: "20000",
+      sc_promo_amount: "20",
+      metadata: { package_id: "pkg_value_20", usd_cents: 2000, purchase_attempt: attemptId },
+    },
+  };
+}
+
 beforeEach(() => {
   resetDb();
   resetEngine();
+  psp = new MockPaymentProvider(PSP_SECRET);
+  setPaymentProvider(psp);
   seedUser({ id: USER_ID, email: "player@test.io", kycStatus: "VERIFIED", trueEnginePlayerId: ENGINE_PLAYER_ID });
 });
 
@@ -125,90 +146,94 @@ describe("crash & recovery", () => {
     expect(getJournal(`rollback:${ref}`)?.status).toBe("SUCCEEDED");
   });
 
-  it("Scenario 3 — PSP Crash: a captured charge with only a PENDING intent is settled", async () => {
+  it("Scenario 3 — Lost PSP webhook: a captured intent is recovered by the reconciler polling the PSP", async () => {
     const attemptId = "attempt-3";
     const opTx = `deposit:${attemptId}`;
-    const instruction = {
-      charge: {
-        amountCents: 2000,
-        currency: "USD",
-        paymentMethodToken: "tok_ok",
-        idempotencyKey: attemptId,
-        customerRef: USER_ID,
-        metadata: { operator_transaction_id: opTx, package_id: "pkg_value_20" },
-      },
-      purchase: {
-        operator_transaction_id: opTx,
-        player_id: ENGINE_PLAYER_ID,
-        gc_amount: "20000",
-        sc_promo_amount: "20",
-        metadata: { package_id: "pkg_value_20", usd_cents: 2000, purchase_attempt: attemptId },
-      },
-    };
 
-    // (a) The gateway wrote a PENDING intent BEFORE charging (pre-charge outbox)...
+    // (a) The gateway opened the intent and journaled a PENDING deposit (pre-intent outbox)...
+    const intent = await psp.createPaymentIntent({
+      amountCents: 2000,
+      currency: "USD",
+      idempotencyKey: attemptId,
+      customerRef: USER_ID,
+      metadata: { operator_transaction_id: opTx, package_id: "pkg_value_20" },
+    });
     seedJournalRow({
       operatorTransactionId: opTx,
       type: "DEPOSIT",
       status: "PENDING",
       playerId: ENGINE_PLAYER_ID,
-      providerRef: attemptId,
-      requestPayload: instruction,
-      updatedAt: new Date(Date.now() - 10 * 60_000), // stale (process died 10 min ago)
+      providerRef: intent.paymentIntentId,
+      requestPayload: depositInstruction(opTx, intent.paymentIntentId, attemptId),
+      updatedAt: new Date(Date.now() - 10 * 60_000), // stale (webhook lost 10 min ago)
     });
-    // (b) ...the PSP captured the card (same idempotency key the reconciler will reuse)...
-    const captured = await getPaymentProvider().charge({
-      amountCents: 2000,
-      currency: "USD",
-      paymentMethodToken: "tok_ok",
-      idempotencyKey: attemptId,
-      customerRef: USER_ID,
-      metadata: { operator_transaction_id: opTx },
-    });
-    expect(captured.status).toBe("succeeded");
-    // (c) ...then the process crashed before the ledger credit (no completion recorded).
+    // (b) ...the customer confirmed and the PSP captured the card, but the `succeeded`
+    //     webhook never reached us (dropped). The PSP's own view says succeeded.
+    psp.markIntentSucceeded(intent.paymentIntentId);
 
     setEngineHandler((call: EngineCall) =>
       call.path === "/api/v1/store/purchase" ? okTx(call.body.operator_transaction_id, "ltx-dep-3") : unexpected,
     );
 
+    // The reconciler polls the PSP as a backstop, sees the capture, and credits once.
     const summary = await reconcileEngineRequests({ staleAfterMs: 1000, maxAttempts: 5 });
     expect(summary.succeeded).toBe(1);
 
     const purchase = engineCalls.find((c) => c.path === "/api/v1/store/purchase");
     expect(purchase).toBeDefined();
-    // Re-capture returned the SAME PaymentIntent → the card was never double-charged.
-    expect(purchase?.body.metadata.payment_ref).toBe(captured.paymentIntentId);
+    // The captured payment ref is stamped into the ledger metadata for audit.
+    expect(purchase?.body.metadata.payment_ref).toBe(intent.paymentIntentId);
 
     const row = getJournal(opTx);
     expect(row?.status).toBe("SUCCEEDED");
     expect(row?.ledgerTransactionId).toBe("ltx-dep-3");
   });
 
-  it("Scenario 3b — Orphaned Capture (live flow): ledger failure leaves a FAILED intent the reconciler settles", async () => {
+  it("Scenario 3b — Webhook credit failure: a captured deposit whose credit drops is re-driven (no re-charge)", async () => {
     const attemptId = "attempt-3b";
     const opTx = `deposit:${attemptId}`;
+
+    const intent = await psp.createPaymentIntent({
+      amountCents: 2000,
+      currency: "USD",
+      idempotencyKey: attemptId,
+      customerRef: USER_ID,
+      metadata: { operator_transaction_id: opTx, package_id: "pkg_value_20" },
+    });
+    psp.markIntentSucceeded(intent.paymentIntentId);
+    seedJournalRow({
+      operatorTransactionId: opTx,
+      type: "DEPOSIT",
+      status: "PENDING",
+      playerId: ENGINE_PLAYER_ID,
+      providerRef: intent.paymentIntentId,
+      requestPayload: depositInstruction(opTx, intent.paymentIntentId, attemptId),
+    });
+
     let purchaseAttempts = 0;
     setEngineHandler((call: EngineCall) => {
       if (call.path === "/api/v1/store/purchase") {
         purchaseAttempts += 1;
-        if (purchaseAttempts === 1) return { throwKind: "network" }; // captured, but credit drops
+        if (purchaseAttempts === 1) return { throwKind: "network" }; // capture confirmed, credit drops
         return okTx(call.body.operator_transaction_id, "ltx-dep-3b");
       }
       return unexpected;
     });
 
-    const user: AuthClaims = { sub: USER_ID, email: "player@test.io", kycStatus: "VERIFIED", vipLevel: 0 };
-    const live = await purchasePackage(user, { packageId: "pkg_value_20", paymentToken: "tok_ok", idempotencyKey: attemptId });
-    expect(live.ok).toBe(false);
-    // Pre-charge outbox => the captured purchase is durably recorded (not orphaned).
+    // A VERIFIED `succeeded` webhook arrives → the handler attempts the credit, which fails
+    // mid-flight → the deposit is left FAILED (capture confirmed, credit pending).
+    const wh = psp.buildSignedWebhook(intent.paymentIntentId, "payment_intent.succeeded");
+    const handled = await handlePspWebhookEvent(psp.parseWebhook(wh.rawBody, wh.signature));
+    expect(handled.handled).toBe(false);
     expect(getJournal(opTx)?.status).toBe("FAILED");
 
+    // The reconciler re-drives the CREDIT ONLY (never re-charges the card) → settled once.
     const summary = await reconcileEngineRequests({ staleAfterMs: 0, maxAttempts: 5 });
     expect(summary.succeeded).toBe(1);
     expect(getJournal(opTx)?.status).toBe("SUCCEEDED");
 
     const purchases = engineCalls.filter((c) => c.path === "/api/v1/store/purchase");
+    expect(purchases).toHaveLength(2);
     expect(purchases.every((c) => c.body.operator_transaction_id === opTx)).toBe(true); // same key, no double credit
   });
 

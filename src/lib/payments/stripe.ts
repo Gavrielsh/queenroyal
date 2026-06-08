@@ -1,6 +1,7 @@
 import {
-  type ChargeRequest,
-  type ChargeResult,
+  type CreateIntentRequest,
+  type PaymentIntentResult,
+  type PaymentIntentSnapshot,
   type PaymentProvider,
   PaymentProviderNotConfiguredError,
   type PspWebhookEvent,
@@ -8,8 +9,8 @@ import {
 
 /**
  * Stripe integration SEAM. This is the exact shape a real Stripe implementation plugs
- * into — same `PaymentProvider` contract the cashier already consumes. The `stripe` SDK
- * is intentionally NOT a dependency yet, so the methods fail loudly
+ * into — same async `PaymentProvider` contract the cashier already consumes. The `stripe`
+ * SDK is intentionally NOT a dependency yet, so the methods fail loudly
  * (PaymentProviderNotConfiguredError) until it is wired. The inline comments are the
  * literal SDK calls to drop in.
  *
@@ -28,24 +29,46 @@ export class StripePaymentProvider implements PaymentProvider {
 
   constructor(private readonly config: StripeConfig) {}
 
-  async charge(req: ChargeRequest): Promise<ChargeResult> {
+  async createPaymentIntent(req: CreateIntentRequest): Promise<PaymentIntentResult> {
     // const stripe = new Stripe(this.config.secretKey);
     // const intent = await stripe.paymentIntents.create(
     //   {
     //     amount: req.amountCents,
     //     currency: req.currency.toLowerCase(),
-    //     payment_method: req.paymentMethodToken,
     //     customer: req.customerRef, // or a mapped Stripe customer id
-    //     confirm: true,
-    //     metadata: req.metadata,    // carries operator_transaction_id for the webhook
-    //     automatic_payment_methods: { enabled: true, allow_redirects: "never" },
+    //     // No `confirm: true`: the frontend confirms with the client_secret (handles 3DS).
+    //     metadata: req.metadata, // carries operator_transaction_id for the webhook
+    //     automatic_payment_methods: { enabled: true },
     //   },
     //   { idempotencyKey: req.idempotencyKey }, // <-- real PSP idempotency key
     // );
-    // return mapPaymentIntent(intent); // status "succeeded" | "requires_action" | "failed"
+    // return {
+    //   paymentIntentId: intent.id,
+    //   clientSecret: intent.client_secret ?? "",
+    //   status: mapIntentStatus(intent.status),
+    //   amountCents: intent.amount,
+    //   currency: intent.currency.toUpperCase(),
+    // };
     void req;
     throw new PaymentProviderNotConfiguredError(
-      "Stripe provider selected but the SDK is not wired (install `stripe` and implement charge()).",
+      "Stripe provider selected but the SDK is not wired (install `stripe` and implement createPaymentIntent()).",
+    );
+  }
+
+  async retrievePaymentIntent(paymentIntentId: string): Promise<PaymentIntentSnapshot | null> {
+    // const stripe = new Stripe(this.config.secretKey);
+    // const intent = await stripe.paymentIntents.retrieve(paymentIntentId);
+    // if (!intent) return null;
+    // return {
+    //   paymentIntentId: intent.id,
+    //   status: mapIntentStatus(intent.status),
+    //   amountCents: intent.amount,
+    //   currency: intent.currency.toUpperCase(),
+    //   metadata: intent.metadata ?? {},
+    // };
+    void paymentIntentId;
+    throw new PaymentProviderNotConfiguredError(
+      "Stripe provider selected but the SDK is not wired (install `stripe` and implement retrievePaymentIntent()).",
     );
   }
 
@@ -56,7 +79,7 @@ export class StripePaymentProvider implements PaymentProvider {
     // const intent = event.data.object as Stripe.PaymentIntent;
     // return {
     //   id: event.id,
-    //   type: event.type, // e.g. "payment_intent.succeeded"
+    //   type: event.type, // e.g. "payment_intent.succeeded" | "payment_intent.payment_failed"
     //   paymentIntentId: intent.id,
     //   amountCents: intent.amount,
     //   currency: intent.currency.toUpperCase(),

@@ -5,7 +5,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { getEnv } from "@/lib/env";
 import { fail } from "@/lib/http";
 import { log } from "@/lib/logger";
-import { rateLimit } from "@/lib/rate-limit";
+import { rateLimitDegraded } from "@/lib/rate-limit";
 
 /** Name of the HttpOnly refresh-token cookie. Scoped to the auth routes only. */
 export const REFRESH_COOKIE = "qr_refresh_token";
@@ -44,24 +44,33 @@ export function clearRefreshCookie(res: NextResponse): void {
 }
 
 /**
- * Enforce the Redis-backed auth rate limit for `bucket` (e.g. "login") keyed by client IP.
- * Returns a 429 response when the limit is exceeded, a 503 when the limiter is unavailable
- * (FAIL CLOSED — never let unthrottled auth traffic through), or null to proceed.
+ * Enforce the auth rate limit for `bucket` (e.g. "login") keyed by client IP.
+ *
+ * Auth is a NON-financial path, so it GRACEFULLY DEGRADES (Phase 2): the distributed Redis
+ * limiter is preferred, but if Redis is down the request is throttled by a strict
+ * process-local leaky bucket instead of 503-ing — a dead Redis must not take the login
+ * route (and the gateway) offline. The fallback is intentionally tight, so brute-force
+ * protection is reduced but never removed.
+ *
+ * Returns a 429 response when the (Redis or fallback) limit is exceeded, or null to proceed.
  */
 export async function enforceAuthRateLimit(req: NextRequest, bucket: string): Promise<NextResponse | null> {
   const env = getEnv();
   const ip = clientIp(req);
-  try {
-    const result = await rateLimit(`auth:${bucket}:${ip}`, env.AUTH_RATE_LIMIT_MAX, env.AUTH_RATE_LIMIT_WINDOW_SECONDS);
-    if (!result.allowed) {
-      const res = fail({ code: "RATE_LIMITED", message: "Too many requests; please slow down", status: 429 });
-      res.headers.set("Retry-After", String(result.retryAfterSeconds));
-      return res;
-    }
-    return null;
-  } catch (err) {
-    // Fail closed: a degraded limiter must not become an open door for brute force.
-    log().error({ err, bucket, ip }, "auth rate limiter unavailable — rejecting (fail closed)");
-    return fail({ code: "RATE_LIMITER_UNAVAILABLE", message: "Service temporarily unavailable", status: 503 });
+  const result = await rateLimitDegraded(
+    `auth:${bucket}:${ip}`,
+    env.AUTH_RATE_LIMIT_MAX,
+    env.AUTH_RATE_LIMIT_WINDOW_SECONDS,
+    env.AUTH_DEGRADED_RATE_LIMIT_MAX,
+  );
+
+  if (result.degraded) {
+    log().warn({ bucket, ip }, "auth rate limiter degraded to in-memory fallback (Redis unavailable)");
   }
+  if (!result.allowed) {
+    const res = fail({ code: "RATE_LIMITED", message: "Too many requests; please slow down", status: 429 });
+    res.headers.set("Retry-After", String(result.retryAfterSeconds));
+    return res;
+  }
+  return null;
 }

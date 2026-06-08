@@ -14,6 +14,66 @@ import { getEnv } from "@/lib/env";
  *   const reqLog = childLogger({ trace_id }); reqLog.info({ user_id }, "login");
  */
 
+/**
+ * PCI-DSS / PII redaction paths (Phase 4). Secrets and PII must NEVER reach the log stream
+ * — leakage is a fatal compliance violation. Path-based redaction strips the listed keys
+ * (top level and one nesting level, plus common header locations). Exported so it can be
+ * asserted in tests; `remove: true` deletes the key entirely rather than printing a
+ * `[Redacted]` placeholder.
+ */
+export const REDACTION_PATHS: string[] = [
+  // Credentials
+  "password",
+  "*.password",
+  "passwordHash",
+  "*.passwordHash",
+  "newPassword",
+  "*.newPassword",
+  // Authorization headers (Bearer JWTs live here) — both casings, common nestings
+  "authorization",
+  "*.authorization",
+  "Authorization",
+  "*.Authorization",
+  "headers.authorization",
+  "*.headers.authorization",
+  "headers.Authorization",
+  "req.headers.authorization",
+  "request.headers.authorization",
+  // JWTs / opaque session tokens
+  "accessToken",
+  "*.accessToken",
+  "refreshToken",
+  "*.refreshToken",
+  "token",
+  "*.token",
+  "jwt",
+  "*.jwt",
+  // Payment-method details (never log raw instruments)
+  "payment_method",
+  "*.payment_method",
+  "paymentMethod",
+  "*.paymentMethod",
+  "paymentToken",
+  "*.paymentToken",
+  "paymentMethodToken",
+  "*.paymentMethodToken",
+  "card",
+  "*.card",
+  "cardNumber",
+  "*.cardNumber",
+  "cvv",
+  "*.cvv",
+  "clientSecret",
+  "*.clientSecret",
+  "client_secret",
+  "*.client_secret",
+  // PII — user email addresses
+  "email",
+  "*.email",
+  "userEmail",
+  "*.userEmail",
+];
+
 let instance: Logger | null = null;
 
 export function log(): Logger {
@@ -30,20 +90,9 @@ export function log(): Logger {
       // Preserve message + type + stack for anything logged under `err`.
       err: pino.stdSerializers.err,
     },
-    // Defense-in-depth: never let a secret reach the log stream.
+    // PCI-DSS / PII redaction — strip secrets and PII before serialization (see REDACTION_PATHS).
     redact: {
-      paths: [
-        "password",
-        "passwordHash",
-        "*.password",
-        "*.passwordHash",
-        "accessToken",
-        "refreshToken",
-        "*.accessToken",
-        "*.refreshToken",
-        "headers.authorization",
-        "*.headers.authorization",
-      ],
+      paths: REDACTION_PATHS,
       remove: true,
     },
   });

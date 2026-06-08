@@ -17,6 +17,9 @@ const envSchema = z.object({
   // Redis-backed auth rate limiting (per IP, fixed window).
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
   AUTH_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
+  // FALLBACK cap for the in-memory leaky bucket used when Redis is unavailable on the
+  // (non-financial) auth path. Deliberately tight so degraded mode never opens the door.
+  AUTH_DEGRADED_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(3),
 
   // ── Observability ─────────────────────────────────────────────────────────
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
@@ -26,6 +29,12 @@ const envSchema = z.object({
   // fail CLOSED (HTTP 503) when it is unavailable. Optional only for local single-process
   // dev that does not exercise those paths.
   REDIS_URL: z.string().url("REDIS_URL must be a valid URL").optional(),
+
+  // ── Redis circuit breaker (graceful degradation) ────────────────────────────
+  // Consecutive Redis failures that trip the shared breaker open, and how long it stays
+  // open (failing fast) before a half-open trial. Keeps a dead Redis from stalling routes.
+  REDIS_CB_FAILURE_THRESHOLD: z.coerce.number().int().positive().default(5),
+  REDIS_CB_COOLDOWN_MS: z.coerce.number().int().positive().default(10_000),
 
   // Shared secret authenticating the internal reconciliation cron endpoint. When unset
   // the endpoint is disabled (503) so it can never run unauthenticated.

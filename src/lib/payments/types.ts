@@ -1,19 +1,27 @@
 /**
  * Payment Service Provider (PSP) abstraction. The cashier depends on this interface, not
  * on any concrete SDK, so a real Stripe (or Adyen/Braintree) implementation drops in
- * without touching the ledger flow. The data structures are shaped to carry real PSP
- * idempotency keys and to normalize real PSP webhook events for async settlement.
+ * without touching the ledger flow.
+ *
+ * The model is ASYNCHRONOUS and event-driven, mirroring how real PSPs actually behave
+ * (3D Secure, delayed capture, chargebacks). The gateway NEVER assumes a synchronous
+ * capture:
+ *   1. `createPaymentIntent` registers the intent and returns a `client_secret` the
+ *      frontend uses to confirm the card (and complete SCA/3DS). No funds move yet.
+ *   2. The PSP fires a signed webhook (`payment_intent.succeeded` /
+ *      `payment_intent.payment_failed`) once the customer completes the flow. ONLY a
+ *      verified `succeeded` event drives the ledger credit.
+ *   3. `retrievePaymentIntent` lets the reconciler poll the PSP as a backstop for a lost
+ *      webhook, so a captured charge can never be orphaned.
  */
 
-/** A charge/capture request. `idempotencyKey` maps to the PSP's Idempotency-Key header. */
-export interface ChargeRequest {
+/** A request to OPEN a payment intent. Returns a `client_secret`; it does NOT capture. */
+export interface CreateIntentRequest {
   /** Integer minor units (cents) — correct at the PSP boundary only. */
   amountCents: number;
   /** ISO 4217 currency code, e.g. "USD". */
   currency: string;
-  /** PSP payment-method / token id (e.g. a Stripe PaymentMethod "pm_..."/ test token). */
-  paymentMethodToken: string;
-  /** Stable per-attempt key; replaying with the same key must NOT double-charge. */
+  /** Stable per-attempt key; replaying with the same key returns the SAME intent. */
   idempotencyKey: string;
   /** Our user id, forwarded to the PSP as the customer reference. */
   customerRef: string;
@@ -24,19 +32,38 @@ export interface ChargeRequest {
   metadata?: Record<string, string>;
 }
 
-/** Terminal-ish charge states. `requires_action` covers 3DS/SCA async confirmation. */
-export type ChargeStatus = "succeeded" | "requires_action" | "failed";
+/**
+ * PaymentIntent lifecycle states (a superset of Stripe's). The webhook/poll path only
+ * acts on the terminal `succeeded` / `failed` (and `canceled`).
+ */
+export type PaymentIntentStatus =
+  | "requires_payment_method"
+  | "requires_confirmation"
+  | "requires_action"
+  | "processing"
+  | "succeeded"
+  | "canceled"
+  | "failed";
 
-export interface ChargeResult {
-  status: ChargeStatus;
+/** Result of opening an intent. The `clientSecret` is returned to the frontend. */
+export interface PaymentIntentResult {
   /** PSP PaymentIntent id — our `payment_ref` for the ledger and reconciliation. */
   paymentIntentId: string;
+  /** Opaque secret the frontend uses to confirm the card / complete SCA. */
+  clientSecret: string;
+  status: PaymentIntentStatus;
   amountCents: number;
   currency: string;
-  /** Present when status === "failed". */
-  declineReason?: string;
-  /** Present when status === "requires_action" — the frontend completes SCA with it. */
-  clientSecret?: string;
+}
+
+/** A point-in-time read of an intent (reconciler backstop for a dropped webhook). */
+export interface PaymentIntentSnapshot {
+  paymentIntentId: string;
+  status: PaymentIntentStatus;
+  amountCents: number;
+  currency: string;
+  /** The metadata we attached at creation (carries `operator_transaction_id`). */
+  metadata: Record<string, string>;
 }
 
 /** A normalized, signature-verified PSP webhook event (async settlement path). */
@@ -47,8 +74,8 @@ export interface PspWebhookEvent {
   paymentIntentId: string;
   amountCents: number;
   currency: string;
-  status: ChargeStatus;
-  /** The metadata we attached at charge time (carries `operator_transaction_id`). */
+  status: PaymentIntentStatus;
+  /** The metadata we attached at creation (carries `operator_transaction_id`). */
   metadata: Record<string, string>;
 }
 
@@ -80,8 +107,16 @@ export class PspWebhookSignatureError extends PaymentProviderError {
 
 export interface PaymentProvider {
   readonly name: string;
-  /** Capture (or idempotently confirm a prior capture of) a charge. */
-  charge(req: ChargeRequest): Promise<ChargeResult>;
+  /**
+   * Open a PaymentIntent (idempotent on `idempotencyKey`) and return its `client_secret`.
+   * Captures NOTHING — settlement is driven later by the verified webhook.
+   */
+  createPaymentIntent(req: CreateIntentRequest): Promise<PaymentIntentResult>;
+  /**
+   * Read the current state of an intent directly from the PSP. Used by the reconciler as
+   * a backstop when a `succeeded` webhook is lost. Returns `null` if the intent is unknown.
+   */
+  retrievePaymentIntent(paymentIntentId: string): Promise<PaymentIntentSnapshot | null>;
   /**
    * Verify a PSP webhook's signature over the RAW body and parse it into a normalized
    * event. Throws {@link PspWebhookSignatureError} on a bad/absent signature.

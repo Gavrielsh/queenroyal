@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 import type { Redis } from "ioredis";
 
+import { withRedisBreaker } from "@/lib/circuit-breaker";
 import { getEnv } from "@/lib/env";
 import { log } from "@/lib/logger";
 import { getRedis } from "@/lib/redis";
@@ -15,7 +16,7 @@ import { getRedis } from "@/lib/redis";
  * Order of checks (fail closed, single generic-ish surface):
  *   1. Known provider (X-Provider-Code → PROVIDER_WEBHOOK_SECRETS).
  *   2. HMAC-SHA256(rawBody, secret) == X-Signature  (constant-time, hex).
- *   3. X-Timestamp within the freshness window (reject > 300s old / far future).
+ *   3. X-Timestamp within the freshness window (300s) ± a 5s symmetric clock-drift tolerance.
  *   4. X-Nonce single-use (per-provider) → replay protection, REQUIRED-Redis & distributed.
  *
  * Replay protection is backed EXCLUSIVELY by Redis. There is deliberately NO in-process
@@ -31,8 +32,14 @@ const HEADER_NONCE = "x-nonce";
 
 /** Reject requests older than this (matches the engine's 300s window). */
 export const MAX_AGE_SECONDS = 300;
-/** Tolerance for a provider clock slightly ahead of ours. */
-export const MAX_FUTURE_SKEW_SECONDS = 30;
+/**
+ * Symmetric clock-drift tolerance (Phase 4). Real provider and server clocks are never
+ * perfectly synced; strict timestamp validation would reject otherwise-legitimate webhooks
+ * over normal NTP drift. We allow the provider's `X-Timestamp` to differ from our
+ * `Date.now()` by up to exactly this many milliseconds in EITHER direction: it widens the
+ * acceptable-future bound to +5s and extends the staleness window by +5s.
+ */
+export const CLOCK_DRIFT_TOLERANCE_MS = 5000;
 /** Nonce lifetime — 10 minutes, exactly as the engine's ReplayGuard (SET NX EX 600). */
 export const NONCE_TTL_SECONDS = 600;
 
@@ -60,13 +67,16 @@ export interface NonceStore {
   reserve(key: string): Promise<boolean>;
 }
 
-/** Redis-backed, distributed nonce store. `SET key 1 EX 600 NX`. */
+/** Redis-backed, distributed nonce store. `SET key 1 EX 600 NX`, via the shared breaker. */
 class RedisNonceStore implements NonceStore {
   constructor(private readonly client: Redis) {}
 
   async reserve(key: string): Promise<boolean> {
-    // "OK" => the key did not exist and is now reserved (fresh). null => replay.
-    const res = await this.client.set(`${NONCE_KEY_PREFIX}${key}`, "1", "EX", NONCE_TTL_SECONDS, "NX");
+    // "OK" => the key did not exist and is now reserved (fresh). null => replay. The
+    // circuit breaker makes a Redis outage fail FAST here (financial path → fail closed).
+    const res = await withRedisBreaker(() =>
+      this.client.set(`${NONCE_KEY_PREFIX}${key}`, "1", "EX", NONCE_TTL_SECONDS, "NX"),
+    );
     return res === "OK";
   }
 }
@@ -130,14 +140,17 @@ export async function verifyProviderWebhook(req: Request): Promise<VerifiedWebho
     throw new WebhookVerificationError("AUTHENTICATION_FAILED", "authentication failed", 401);
   }
 
-  // 3. Timestamp freshness.
+  // 3. Timestamp freshness, with a symmetric ±CLOCK_DRIFT_TOLERANCE_MS clock-drift window
+  //    (Phase 4). Compare in milliseconds against Date.now():
+  //      acceptable iff  -tolerance <= (now - ts) <= MAX_AGE + tolerance
+  //    i.e. up to 5s in the future is tolerated (drift), and the staleness window is
+  //    likewise extended by 5s — so normal NTP drift no longer rejects legitimate events.
   if (!timestampRaw || !/^\d+$/.test(timestampRaw)) {
     throw new WebhookVerificationError("INVALID_TIMESTAMP", "X-Timestamp must be unix seconds", 400);
   }
-  const ts = Number(timestampRaw);
-  const nowSec = Math.floor(Date.now() / 1000);
-  const age = nowSec - ts;
-  if (age > MAX_AGE_SECONDS || age < -MAX_FUTURE_SKEW_SECONDS) {
+  const tsMs = Number(timestampRaw) * 1000;
+  const driftMs = Date.now() - tsMs; // > 0 → timestamp is in the past
+  if (driftMs > MAX_AGE_SECONDS * 1000 + CLOCK_DRIFT_TOLERANCE_MS || driftMs < -CLOCK_DRIFT_TOLERANCE_MS) {
     throw new WebhookVerificationError("STALE_REQUEST", "X-Timestamp outside acceptable window", 401);
   }
 
