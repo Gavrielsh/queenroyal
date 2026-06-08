@@ -2,11 +2,11 @@ import type { EngineRequestLog } from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
 import { trueEngine } from "@/lib/true-engine";
+import { type DepositInstruction, settleDepositIntent } from "@/services/deposit.service";
 import { beginEngineRequest, completeEngineRequest } from "@/services/engine-journal.service";
 import type {
   BetPayload,
   EngineTxResult,
-  PurchasePayload,
   RollbackPayload,
   TrueEngineResult,
   WinPayload,
@@ -97,7 +97,7 @@ async function reconcileOne(row: EngineRequestLog, maxAttempts: number): Promise
     case "BET":
       return finalizeReplay(row, await trueEngine().sendBet(asPayload<BetPayload>(row)), attempts, maxAttempts);
     case "DEPOSIT":
-      return finalizeReplay(row, await trueEngine().sendPurchase(asPayload<PurchasePayload>(row)), attempts, maxAttempts);
+      return reconcileDeposit(row, attempts, maxAttempts);
     case "ROLLBACK":
       return finalizeReplay(row, await trueEngine().sendRollback(asPayload<RollbackPayload>(row)), attempts, maxAttempts);
     case "WIN":
@@ -127,6 +127,21 @@ async function finalizeReplay(
   }
   await setStatus(row.id, "ABANDONED", errText(res));
   return "abandoned";
+}
+
+/**
+ * DEPOSIT: settle idempotently. This re-runs the PSP capture (a no-op if it already
+ * happened, or the FIRST capture if the process crashed before charging) and then the
+ * idempotent ledger credit. A declined card means no funds were ever captured → nothing
+ * is owed, so the intent is terminal.
+ */
+async function reconcileDeposit(row: EngineRequestLog, attempts: number, maxAttempts: number): Promise<Disposition> {
+  const settlement = await settleDepositIntent(asPayload<DepositInstruction>(row));
+  if (settlement.kind === "declined") {
+    await setStatus(row.id, "ABANDONED", `psp declined: ${settlement.reason ?? "card_declined"}`);
+    return "abandoned";
+  }
+  return finalizeReplay(row, settlement.engine, attempts, maxAttempts);
 }
 
 /** WIN: retry first; on a terminal failure, compensate by rolling back the bet. */

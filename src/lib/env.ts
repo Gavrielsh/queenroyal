@@ -14,6 +14,10 @@ const envSchema = z.object({
   // REQUIRED in any multi-instance deployment so nonces are shared across nodes.
   REDIS_URL: z.string().url("REDIS_URL must be a valid URL").optional(),
 
+  // Shared secret authenticating the internal reconciliation cron endpoint. When unset
+  // the endpoint is disabled (503) so it can never run unauthenticated.
+  CRON_SECRET: z.string().min(16, "CRON_SECRET must be at least 16 characters").optional(),
+
   // Outbound — this gateway acting as an operator of the True Engine.
   ENGINE_BASE_URL: z.string().url("ENGINE_BASE_URL must be a valid URL"),
   ENGINE_SECRET_KEY: z.string().min(16, "ENGINE_SECRET_KEY must be at least 16 characters"),
