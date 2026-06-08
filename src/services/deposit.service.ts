@@ -1,4 +1,5 @@
-import { mockStripeCharge } from "@/lib/mock-stripe";
+import { getPaymentProvider } from "@/lib/payments";
+import type { ChargeRequest } from "@/lib/payments/types";
 import { trueEngine } from "@/lib/true-engine";
 import type { EngineTxResult, PurchasePayload, TrueEngineResult } from "@/types/true-engine";
 
@@ -7,23 +8,20 @@ import type { EngineTxResult, PurchasePayload, TrueEngineResult } from "@/types/
  * the EngineRequestLog outbox BEFORE the PSP is charged, so a crash at ANY point — even
  * immediately after capture — leaves a durable record the reconciler can settle. It
  * carries everything needed to (re)settle with no external context:
- *   - `charge`: the PSP charge params, including the stable `idempotencyKey` so re-running
- *     it never double-charges (Stripe returns the existing PaymentIntent).
+ *   - `charge`: the PSP charge request, including the stable `idempotencyKey` so
+ *     re-running it never double-charges, and metadata carrying `operator_transaction_id`
+ *     for async webhook correlation.
  *   - `purchase`: the ledger body, keyed by a stable `operator_transaction_id` so the
  *     engine de-duplicates the credit.
  */
 export interface DepositInstruction {
-  charge: {
-    amountCents: number;
-    token: string;
-    userId: string;
-    idempotencyKey: string;
-  };
+  charge: ChargeRequest;
   purchase: PurchasePayload;
 }
 
 export type DepositSettlement =
   | { kind: "declined"; reason?: string }
+  | { kind: "pending_action"; paymentIntentId: string; clientSecret?: string }
   | { kind: "settled"; paymentIntentId: string; engine: TrueEngineResult<EngineTxResult> };
 
 /**
@@ -32,17 +30,24 @@ export type DepositSettlement =
  *   - The PSP charge is idempotent on `charge.idempotencyKey` (no double capture).
  *   - The ledger credit is idempotent on `purchase.operator_transaction_id`.
  *
- * Returns `declined` only when the PSP refuses the card (no funds captured → no coins).
- * Otherwise returns `settled` with the engine result (which may itself be ok or a
- * retryable failure the caller/reconciler will re-drive).
+ * Returns:
+ *   - `declined`        — the PSP refused the card (no funds captured → no coins).
+ *   - `pending_action`  — the charge needs customer SCA/3DS; the deposit stays PENDING and
+ *                         is settled later by the PSP webhook (or a subsequent reconcile).
+ *   - `settled`         — captured; carries the engine result (ok or a retryable failure
+ *                         the caller/reconciler will re-drive).
  */
 export async function settleDepositIntent(instruction: DepositInstruction): Promise<DepositSettlement> {
-  const charge = await mockStripeCharge(instruction.charge);
-  if (!charge.ok) {
+  const charge = await getPaymentProvider().charge(instruction.charge);
+
+  if (charge.status === "failed") {
     return { kind: "declined", reason: charge.declineReason };
   }
+  if (charge.status === "requires_action") {
+    return { kind: "pending_action", paymentIntentId: charge.paymentIntentId, clientSecret: charge.clientSecret };
+  }
 
-  // Stamp the captured payment ref into the ledger metadata for audit/reconciliation.
+  // succeeded → stamp the captured payment ref into the ledger metadata for audit.
   const purchase: PurchasePayload = {
     ...instruction.purchase,
     metadata: { ...(instruction.purchase.metadata ?? {}), payment_ref: charge.paymentIntentId },

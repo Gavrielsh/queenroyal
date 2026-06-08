@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 
 import { getPackage } from "@/config/store-packages";
+import type { FlowContext } from "@/lib/context";
 import { assertKycAllows, KycGateError } from "@/lib/kyc-policy";
+import { childLogger } from "@/lib/logger";
 import { wholeCoinsToMoneyString } from "@/lib/money";
 import type { AuthClaims } from "@/lib/jwt";
 import type { PurchaseInput } from "@/schemas/store.schema";
@@ -44,7 +46,10 @@ export type PurchaseOutcome =
 export async function purchasePackage(
   user: AuthClaims,
   input: PurchaseInput,
+  ctx: FlowContext = {},
 ): Promise<PurchaseOutcome> {
+  const flowLog = childLogger({ trace_id: ctx.traceId, user_id: user.sub, package_id: input.packageId });
+
   const pkg = getPackage(input.packageId);
   if (!pkg) {
     return {
@@ -74,6 +79,7 @@ export async function purchasePackage(
     assertKycAllows(player.kycStatus, "PURCHASE");
   } catch (err) {
     if (err instanceof KycGateError) {
+      flowLog.warn({ kyc_status: player.kycStatus, err_code: err.code }, "purchase rejected: KYC gate");
       return { ok: false, status: 403, error: { code: err.code, message: err.message } };
     }
     throw err;
@@ -92,7 +98,15 @@ export async function purchasePackage(
     metadata: { package_id: pkg.id, usd_cents: pkg.priceUsdCents, purchase_attempt: attemptId },
   };
   const instruction: DepositInstruction = {
-    charge: { amountCents: pkg.priceUsdCents, token: input.paymentToken, userId: user.sub, idempotencyKey: attemptId },
+    charge: {
+      amountCents: pkg.priceUsdCents,
+      currency: "USD",
+      paymentMethodToken: input.paymentToken,
+      idempotencyKey: attemptId,
+      customerRef: user.sub,
+      // Echoed back on the PSP webhook so async settlement can find this deposit intent.
+      metadata: { operator_transaction_id: operatorTransactionId, package_id: pkg.id },
+    },
     purchase,
   };
 
@@ -112,10 +126,33 @@ export async function purchasePackage(
       retryable: false,
       lastError: `PAYMENT_DECLINED: ${settlement.reason ?? "card_declined"}`,
     });
+    flowLog.warn({ operator_transaction_id: operatorTransactionId, reason: settlement.reason }, "purchase declined by PSP");
     return {
       ok: false,
       status: 402,
       error: { code: "PAYMENT_DECLINED", message: "Payment was declined", details: settlement.reason },
+    };
+  }
+
+  if (settlement.kind === "pending_action") {
+    // SCA/3DS required: the deposit intent stays PENDING and will be settled by the PSP
+    // webhook (payment_intent.succeeded) once the customer completes authentication.
+    flowLog.info(
+      { operator_transaction_id: operatorTransactionId, payment_ref: settlement.paymentIntentId },
+      "purchase requires customer action (async settlement pending)",
+    );
+    return {
+      ok: false,
+      status: 402,
+      error: {
+        code: "PAYMENT_REQUIRES_ACTION",
+        message: "Additional authentication is required to complete the purchase",
+        details: {
+          paymentRef: settlement.paymentIntentId,
+          clientSecret: settlement.clientSecret,
+          operatorTransactionId,
+        },
+      },
     };
   }
 
@@ -125,6 +162,15 @@ export async function purchasePackage(
       retryable: result.retryable,
       lastError: `${result.error.code}: ${result.error.message}`,
     });
+    flowLog.error(
+      {
+        operator_transaction_id: operatorTransactionId,
+        payment_ref: settlement.paymentIntentId,
+        err_code: result.error.code,
+        retryable: result.retryable,
+      },
+      "payment captured but ledger credit failed — handed to reconciler",
+    );
     // Money captured but the ledger credit failed. The intent is journaled; the
     // reconciler re-drives it to completion idempotently (no re-charge, no double credit).
     return {
@@ -145,6 +191,10 @@ export async function purchasePackage(
   await completeEngineRequest(operatorTransactionId, "SUCCEEDED", {
     ledgerTransactionId: result.data.ledger_transaction_id,
   });
+  flowLog.info(
+    { operator_transaction_id: operatorTransactionId, payment_ref: settlement.paymentIntentId },
+    "purchase settled (coins issued)",
+  );
 
   return {
     ok: true,

@@ -2,8 +2,9 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 import type { Redis } from "ioredis";
 
-import { getRedis } from "@/lib/redis";
 import { getEnv } from "@/lib/env";
+import { log } from "@/lib/logger";
+import { getRedis } from "@/lib/redis";
 
 /**
  * Inbound zero-trust verification for B2B game-aggregator webhooks. This is the mirror
@@ -15,7 +16,12 @@ import { getEnv } from "@/lib/env";
  *   1. Known provider (X-Provider-Code → PROVIDER_WEBHOOK_SECRETS).
  *   2. HMAC-SHA256(rawBody, secret) == X-Signature  (constant-time, hex).
  *   3. X-Timestamp within the freshness window (reject > 300s old / far future).
- *   4. X-Nonce single-use (per-provider) → replay protection (distributed via Redis).
+ *   4. X-Nonce single-use (per-provider) → replay protection, REQUIRED-Redis & distributed.
+ *
+ * Replay protection is backed EXCLUSIVELY by Redis. There is deliberately NO in-process
+ * fallback: in a multi-instance deployment a per-process Map is a split-brain replay hole
+ * (a nonce burned on one node is unseen by the others). If Redis is unconfigured or
+ * unreachable, every webhook is rejected with HTTP 503. Fail closed, always.
  */
 
 const HEADER_PROVIDER = "x-provider-code";
@@ -31,6 +37,7 @@ export const MAX_FUTURE_SKEW_SECONDS = 30;
 export const NONCE_TTL_SECONDS = 600;
 
 const HEX_RE = /^[0-9a-fA-F]+$/;
+const NONCE_KEY_PREFIX = "webhook:nonce:";
 
 export class WebhookVerificationError extends Error {
   constructor(
@@ -44,72 +51,44 @@ export class WebhookVerificationError extends Error {
 }
 
 /**
- * Single-use nonce store. Production uses Redis (`SET NX EX 600`) so a nonce burned on
- * one instance is rejected on every instance. The in-memory store is a dev-only fallback
- * for single-process runs (it CANNOT protect a horizontally-scaled deployment).
+ * Single-use nonce store. The ONLY production implementation is Redis-backed and
+ * distributed. Tests may inject a custom store via {@link setNonceStore}; there is no
+ * in-process default — a missing store fails closed.
  */
 export interface NonceStore {
   /** Returns true if the nonce was unseen (and is now reserved); false if a replay. */
   reserve(key: string): Promise<boolean>;
 }
 
-const NONCE_KEY_PREFIX = "webhook:nonce:";
-
 /** Redis-backed, distributed nonce store. `SET key 1 EX 600 NX`. */
 class RedisNonceStore implements NonceStore {
   constructor(private readonly client: Redis) {}
 
   async reserve(key: string): Promise<boolean> {
-    // "OK" => the key did not exist and is now reserved (fresh).
-    // null  => the key already existed (replay).
+    // "OK" => the key did not exist and is now reserved (fresh). null => replay.
     const res = await this.client.set(`${NONCE_KEY_PREFIX}${key}`, "1", "EX", NONCE_TTL_SECONDS, "NX");
     return res === "OK";
   }
 }
 
-/** Process-local fallback (dev / single instance only). */
-class InMemoryNonceStore implements NonceStore {
-  private readonly seen = new Map<string, number>(); // key → expiry (ms epoch)
-
-  async reserve(key: string): Promise<boolean> {
-    const now = Date.now();
-    if (this.seen.size > 50_000) this.sweep(now);
-    const exp = this.seen.get(key);
-    if (exp !== undefined && exp > now) return false;
-    this.seen.set(key, now + NONCE_TTL_SECONDS * 1000);
-    return true;
-  }
-
-  private sweep(now: number): void {
-    for (const [k, exp] of this.seen) {
-      if (exp <= now) this.seen.delete(k);
-    }
-  }
-}
-
 let nonceStoreOverride: NonceStore | null = null;
-let resolvedDefault: NonceStore | null = null;
 
-/** Override the nonce store (tests, or a custom distributed implementation). */
-export function setNonceStore(store: NonceStore): void {
+/** Override the nonce store (tests, or an alternative distributed implementation). */
+export function setNonceStore(store: NonceStore | null): void {
   nonceStoreOverride = store;
 }
 
+/**
+ * Resolve the nonce store. Throws a 503 {@link WebhookVerificationError} when Redis is not
+ * configured — there is no in-memory fallback (it would be a multi-instance replay hole).
+ */
 function nonceStore(): NonceStore {
   if (nonceStoreOverride) return nonceStoreOverride;
-  if (resolvedDefault) return resolvedDefault;
-
   const redis = getRedis();
-  if (redis) {
-    resolvedDefault = new RedisNonceStore(redis);
-  } else {
-    console.warn(
-      "[webhook-security] REDIS_URL is not set — using a process-local nonce store. " +
-        "This does NOT provide replay protection across multiple instances. Configure REDIS_URL in production.",
-    );
-    resolvedDefault = new InMemoryNonceStore();
+  if (!redis) {
+    throw new WebhookVerificationError("REPLAY_STORE_UNAVAILABLE", "replay protection unavailable", 503);
   }
-  return resolvedDefault;
+  return new RedisNonceStore(redis);
 }
 
 export interface VerifiedWebhook {
@@ -128,6 +107,9 @@ export async function verifyProviderWebhook(req: Request): Promise<VerifiedWebho
   const signature = req.headers.get(HEADER_SIGNATURE) ?? "";
   const timestampRaw = req.headers.get(HEADER_TIMESTAMP) ?? "";
   const nonce = req.headers.get(HEADER_NONCE) ?? "";
+
+  // Resolve the replay store FIRST — fail closed (503) before doing any work if it's down.
+  const store = nonceStore();
 
   // 1. Known provider → secret. Same opaque 401 for unknown provider and bad signature.
   const secret = getEnv().PROVIDER_WEBHOOK_SECRETS[providerCode];
@@ -159,17 +141,16 @@ export async function verifyProviderWebhook(req: Request): Promise<VerifiedWebho
     throw new WebhookVerificationError("STALE_REQUEST", "X-Timestamp outside acceptable window", 401);
   }
 
-  // 4. Nonce single-use (scoped per provider). FAIL CLOSED on a store error: a degraded
-  //    nonce store is indistinguishable from an unbounded replay window.
+  // 4. Nonce single-use (scoped per provider). FAIL CLOSED on a store error.
   if (!nonce) {
     throw new WebhookVerificationError("MISSING_NONCE", "X-Nonce header is required", 400);
   }
   let fresh: boolean;
   try {
-    fresh = await nonceStore().reserve(`${providerCode}:${nonce}`);
+    fresh = await store.reserve(`${providerCode}:${nonce}`);
   } catch (err) {
-    console.error("[webhook-security] nonce store unavailable", err instanceof Error ? err.message : err);
-    throw new WebhookVerificationError("NONCE_STORE_UNAVAILABLE", "replay protection unavailable", 503);
+    log().error({ err, provider: providerCode }, "nonce store unavailable — rejecting webhook (fail closed)");
+    throw new WebhookVerificationError("REPLAY_STORE_UNAVAILABLE", "replay protection unavailable", 503);
   }
   if (!fresh) {
     throw new WebhookVerificationError("REPLAY_DETECTED", "X-Nonce already used", 401);

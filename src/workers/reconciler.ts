@@ -1,3 +1,4 @@
+import { childLogger } from "@/lib/logger";
 import { reconcileEngineRequests, type ReconcileSummary } from "@/services/reconciliation.service";
 
 /**
@@ -7,10 +8,11 @@ import { reconcileEngineRequests, type ReconcileSummary } from "@/services/recon
  *   npm run worker:reconcile
  *
  * (In a serverless deployment, call `reconcileEngineRequests()` from a scheduled
- * function / cron instead of running this loop.)
+ * function / cron instead of running this loop — see /api/internal/cron/reconcile.)
  */
 
 const INTERVAL_MS = Number(process.env.RECONCILER_INTERVAL_MS ?? "15000");
+const workerLog = childLogger({ component: "reconciler-worker" });
 
 let running = true;
 
@@ -18,15 +20,15 @@ async function tick(): Promise<void> {
   try {
     const summary: ReconcileSummary = await reconcileEngineRequests();
     if (summary.scanned > 0) {
-      console.log(`[reconciler] ${JSON.stringify(summary)}`);
+      workerLog.info({ summary }, "reconcile batch processed");
     }
   } catch (err) {
-    console.error("[reconciler] tick error", err instanceof Error ? err.message : err);
+    workerLog.error({ err }, "reconcile tick failed");
   }
 }
 
 async function main(): Promise<void> {
-  console.log(`[reconciler] starting; interval=${INTERVAL_MS}ms`);
+  workerLog.info({ interval_ms: INTERVAL_MS }, "reconciler worker starting");
   const stop = (): void => {
     running = false;
   };
@@ -37,7 +39,7 @@ async function main(): Promise<void> {
     await tick();
     await new Promise((resolve) => setTimeout(resolve, INTERVAL_MS));
   }
-  console.log("[reconciler] stopped");
+  workerLog.info("reconciler worker stopped");
 }
 
 void main();

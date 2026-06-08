@@ -7,25 +7,52 @@ import { z } from "zod";
  */
 const envSchema = z.object({
   DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
-  JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
-  JWT_EXPIRES_IN: z.string().default("7d"),
 
-  // Distributed state (replay-nonce store, reconciler coordination). Optional in dev;
-  // REQUIRED in any multi-instance deployment so nonces are shared across nodes.
+  // ── Auth ──────────────────────────────────────────────────────────────────
+  JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
+  // Short-lived access token lifetime (e.g. "15m", "900"). Keep this small.
+  JWT_ACCESS_TTL: z.string().default("15m"),
+  // Opaque refresh token lifetime in seconds (default 7 days).
+  JWT_REFRESH_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24 * 7),
+  // Redis-backed auth rate limiting (per IP, fixed window).
+  AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
+  AUTH_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
+
+  // ── Observability ─────────────────────────────────────────────────────────
+  LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
+
+  // ── Distributed state (replay nonces, rate limiting, refresh sessions) ──────
+  // REQUIRED in production: replay protection, rate limiting, and refresh sessions all
+  // fail CLOSED (HTTP 503) when it is unavailable. Optional only for local single-process
+  // dev that does not exercise those paths.
   REDIS_URL: z.string().url("REDIS_URL must be a valid URL").optional(),
 
   // Shared secret authenticating the internal reconciliation cron endpoint. When unset
   // the endpoint is disabled (503) so it can never run unauthenticated.
   CRON_SECRET: z.string().min(16, "CRON_SECRET must be at least 16 characters").optional(),
 
-  // Outbound — this gateway acting as an operator of the True Engine.
+  // ── Reconciliation worker / cron thresholds (operational overrides) ─────────
+  RECONCILE_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+  RECONCILE_STALE_AFTER_MS: z.coerce.number().int().positive().default(60_000),
+  RECONCILE_MAX_ATTEMPTS: z.coerce.number().int().positive().default(10),
+
+  // ── Payment Service Provider (PSP) ──────────────────────────────────────────
+  // Which provider implementation backs the cashier. "mock" is dev/test only.
+  PAYMENT_PROVIDER: z.enum(["mock", "stripe"]).default("mock"),
+  // Real Stripe wiring (required when PAYMENT_PROVIDER=stripe).
+  STRIPE_SECRET_KEY: z.string().optional(),
+  STRIPE_WEBHOOK_SECRET: z.string().optional(),
+  // Generic PSP webhook signing secret (used by the mock provider's webhook verifier).
+  PSP_WEBHOOK_SECRET: z.string().optional(),
+
+  // ── Outbound — this gateway acting as an operator of the True Engine ─────────
   ENGINE_BASE_URL: z.string().url("ENGINE_BASE_URL must be a valid URL"),
   ENGINE_SECRET_KEY: z.string().min(16, "ENGINE_SECRET_KEY must be at least 16 characters"),
   // Our operator code, sent as `X-Operator-Code`; selects our secret on the engine side.
   ENGINE_OPERATOR_CODE: z.string().min(1, "ENGINE_OPERATOR_CODE is required"),
   ENGINE_TIMEOUT_MS: z.coerce.number().int().positive().default(8_000),
 
-  // Inbound — per-provider HMAC secrets for B2B game-aggregator webhooks.
+  // ── Inbound — per-provider HMAC secrets for B2B game-aggregator webhooks ─────
   // JSON object {"PRAGMATIC":"secret"} or CSV "PRAGMATIC:secret,HACKSAW:secret2".
   PROVIDER_WEBHOOK_SECRETS: z
     .string()
@@ -50,8 +77,7 @@ let cached: Env | null = null;
 export function getEnv(): Env {
   if (cached) return cached;
 
-  // Step 1 of the brief references `process.env.ENGINE_SECRET`, while the architecture
-  // docs use `ENGINE_SECRET_KEY`. Accept either, preferring the documented canonical name.
+  // Accept ENGINE_SECRET as an alias for the documented canonical ENGINE_SECRET_KEY.
   const raw = {
     ...process.env,
     ENGINE_SECRET_KEY: process.env.ENGINE_SECRET_KEY ?? process.env.ENGINE_SECRET,

@@ -2,8 +2,10 @@ import { timingSafeEqual } from "node:crypto";
 
 import type { NextRequest } from "next/server";
 
+import { traceId } from "@/lib/auth-http";
 import { getEnv } from "@/lib/env";
 import { ok, fail } from "@/lib/http";
+import { childLogger } from "@/lib/logger";
 import { reconcileEngineRequests } from "@/services/reconciliation.service";
 
 export const runtime = "nodejs";
@@ -20,6 +22,9 @@ export const dynamic = "force-dynamic";
  * can never run unauthenticated.
  */
 async function handle(req: NextRequest) {
+  const trace_id = traceId(req);
+  const reqLog = childLogger({ trace_id, route: "internal/cron/reconcile" });
+
   const configured = getEnv().CRON_SECRET;
   if (!configured) {
     return fail({ code: "CRON_DISABLED", message: "CRON_SECRET is not configured", status: 503 });
@@ -32,9 +37,10 @@ async function handle(req: NextRequest) {
 
   try {
     const summary = await reconcileEngineRequests();
+    reqLog.info({ summary }, "reconcile cron run complete");
     return ok(summary, 200);
   } catch (err) {
-    console.error("[cron/reconcile] error", err);
+    reqLog.error({ err }, "reconcile cron run failed");
     return fail({ code: "INTERNAL_ERROR", message: "reconciliation run failed", status: 500 });
   }
 }

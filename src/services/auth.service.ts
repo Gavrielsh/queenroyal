@@ -1,8 +1,10 @@
 import bcrypt from "bcryptjs";
 
+import { signAccessToken, type AuthClaims } from "@/lib/jwt";
+import { log } from "@/lib/logger";
 import { prisma } from "@/lib/prisma";
-import { signToken, type AuthClaims } from "@/lib/jwt";
 import { provisionTrueEnginePlayer } from "@/services/player-provisioning.service";
+import { issueRefreshToken } from "@/services/session.service";
 import type { LoginInput, RegisterInput } from "@/schemas/auth.schema";
 
 const BCRYPT_ROUNDS = 12;
@@ -31,7 +33,8 @@ export interface SafeUser {
 
 export interface AuthResult {
   user: SafeUser;
-  token: string;
+  accessToken: string;
+  refreshToken: string;
 }
 
 type UserRecord = {
@@ -52,14 +55,14 @@ function toSafeUser(u: UserRecord): SafeUser {
   };
 }
 
-function issue(user: SafeUser): AuthResult {
-  const claims: AuthClaims = {
-    sub: user.id,
-    email: user.email,
-    kycStatus: user.kycStatus,
-    vipLevel: user.vipLevel,
-  };
-  return { user, token: signToken(claims) };
+function claimsFor(user: SafeUser): AuthClaims {
+  return { sub: user.id, email: user.email, kycStatus: user.kycStatus, vipLevel: user.vipLevel };
+}
+
+async function issue(user: SafeUser): Promise<AuthResult> {
+  const accessToken = signAccessToken(claimsFor(user));
+  const refreshToken = await issueRefreshToken(user.id);
+  return { user, accessToken, refreshToken };
 }
 
 export async function register(input: RegisterInput): Promise<AuthResult> {
@@ -73,14 +76,13 @@ export async function register(input: RegisterInput): Promise<AuthResult> {
     data: { email: input.email, passwordHash },
   });
 
-  // Provision the player in the True Engine and persist its player_id. We do this at
-  // registration but treat a transient failure as non-fatal: the account is created and
-  // `resolveTransactingPlayer()` will lazily (idempotently) provision on first
-  // transaction. We never block account creation on the ledger being momentarily down.
+  // Provision the player in the True Engine and persist its player_id. Non-fatal: the
+  // account is created and `resolveTransactingPlayer()` will lazily (idempotently)
+  // provision on first transaction. We never block account creation on the ledger.
   try {
     await provisionTrueEnginePlayer(user.id, user.email);
   } catch (err) {
-    console.error("[auth/register] deferred engine provisioning", err);
+    log().warn({ err, user_id: user.id }, "deferred engine provisioning at registration");
   }
 
   return issue(toSafeUser(user));
@@ -98,4 +100,22 @@ export async function login(input: LoginInput): Promise<AuthResult> {
   }
 
   return issue(toSafeUser(user));
+}
+
+/**
+ * Load CURRENT claims for a user (used when minting a new access token on refresh) so a
+ * refreshed token always reflects the latest KYC/VIP state rather than a stale snapshot.
+ */
+export async function loadClaims(userId: string): Promise<AuthClaims> {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, email: true, kycStatus: true, vipLevel: true },
+  });
+  if (!user) throw new AuthError("USER_NOT_FOUND", "User no longer exists", 401);
+  return { sub: user.id, email: user.email, kycStatus: user.kycStatus, vipLevel: user.vipLevel };
+}
+
+/** Mint a new short-lived access token from claims (refresh flow). */
+export function mintAccessToken(claims: AuthClaims): string {
+  return signAccessToken(claims);
 }

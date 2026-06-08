@@ -1,4 +1,6 @@
+import type { FlowContext } from "@/lib/context";
 import { assertKycAllows, KycGateError } from "@/lib/kyc-policy";
+import { childLogger } from "@/lib/logger";
 import { isPositiveMoneyString } from "@/lib/money";
 import { trueEngine } from "@/lib/true-engine";
 import type { ProviderSpinInput } from "@/schemas/game.schema";
@@ -40,8 +42,15 @@ export type SpinOutcome =
 export async function processProviderSpin(
   providerCode: string,
   input: ProviderSpinInput,
+  ctx: FlowContext = {},
 ): Promise<SpinOutcome> {
   const engine = trueEngine();
+  const flowLog = childLogger({
+    trace_id: ctx.traceId,
+    provider: providerCode,
+    user_id: input.player_id,
+    provider_transaction_id: input.provider_transaction_id,
+  });
 
   // 1) Identity bridge + current KYC status (single DB read).
   let player;
@@ -49,6 +58,7 @@ export async function processProviderSpin(
     player = await resolveTransactingPlayer(input.player_id);
   } catch (err) {
     if (err instanceof ProvisioningError) {
+      flowLog.warn({ err }, "spin rejected: player not provisioned");
       return {
         ok: false,
         status: 404,
@@ -63,6 +73,7 @@ export async function processProviderSpin(
     assertKycAllows(player.kycStatus, "SPIN", input.currency);
   } catch (err) {
     if (err instanceof KycGateError) {
+      flowLog.warn({ kyc_status: player.kycStatus, err_code: err.code }, "spin rejected: KYC gate");
       return { ok: false, status: 403, error: { code: err.code, message: err.message } };
     }
     throw err;
@@ -96,6 +107,10 @@ export async function processProviderSpin(
       retryable: bet.retryable,
       lastError: `${bet.error.code}: ${bet.error.message}`,
     });
+    flowLog.warn(
+      { operator_transaction_id: betOpTxId, engine_status: bet.status, err_code: bet.error.code, retryable: bet.retryable },
+      "bet failed",
+    );
     return { ok: false, status: bet.status === 0 ? 502 : bet.status, error: bet.error };
   }
   await completeEngineRequest(betOpTxId, "SUCCEEDED", { ledgerTransactionId: bet.data.ledger_transaction_id });
@@ -139,6 +154,17 @@ export async function processProviderSpin(
       retryable: win.retryable,
       lastError: `${win.error.code}: ${win.error.message}`,
     });
+    flowLog.error(
+      {
+        operator_transaction_id: winOpTxId,
+        bet_operator_transaction_id: betOpTxId,
+        bet_ledger_transaction_id: bet.data.ledger_transaction_id,
+        engine_status: win.status,
+        err_code: win.error.code,
+        retryable: win.retryable,
+      },
+      "win settlement failed after committed bet — handed to reconciler",
+    );
     // The bet was already debited. The win is journaled under winOpTxId and will be
     // reconciled (retried, or the bet rolled back) by the reconciliation worker.
     return {
@@ -158,6 +184,10 @@ export async function processProviderSpin(
     };
   }
   await completeEngineRequest(winOpTxId, "SUCCEEDED", { ledgerTransactionId: win.data.ledger_transaction_id });
+  flowLog.info(
+    { bet_operator_transaction_id: betOpTxId, win_operator_transaction_id: winOpTxId },
+    "spin settled (bet + win)",
+  );
 
   return {
     ok: true,

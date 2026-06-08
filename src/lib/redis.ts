@@ -1,6 +1,7 @@
 import { Redis } from "ioredis";
 
 import { getEnv } from "@/lib/env";
+import { log } from "@/lib/logger";
 
 /**
  * Shared Redis client (lazy singleton, reused across hot reloads / serverless
@@ -24,7 +25,7 @@ export function getRedis(): Redis | null {
     maxRetriesPerRequest: 2,
   });
   client.on("error", (err: unknown) => {
-    console.error("[redis] client error", err instanceof Error ? err.message : err);
+    log().error({ err }, "redis client error");
   });
 
   globalForRedis.redis = client;
