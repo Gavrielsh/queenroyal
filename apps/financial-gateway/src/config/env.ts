@@ -46,6 +46,20 @@ const envSchema = z.object({
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
   AUTH_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
 
+  // ── Global HTTP rate limiting (@fastify/rate-limit, Redis-backed for cross-pod limits) ──
+  // A COARSE per-IP DoS guard applied to every route. The fine-grained, fail-closed auth limiter
+  // above still independently protects the brute-force-sensitive auth surface; this is a second,
+  // broader layer. Distributed via the same validated Redis client when present; in-memory
+  // single-process fallback otherwise.
+  RATE_LIMIT_MAX: z.coerce.number().int().positive().default(100),
+  RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
+
+  // ── Admin / Day-2 ops API (DLQ management) ──────────────────────────────────────
+  // Shared bearer token for the internal admin API (sent as X-Admin-Token). PLACEHOLDER auth:
+  // when UNSET the admin surface is LOCKED (every request → 403). Keep the API on an
+  // internal-only network boundary regardless. TODO(security): replace with real RBAC/mTLS/SSO.
+  ADMIN_API_TOKEN: z.string().min(1).optional(),
+
   // ── Event-driven reconciler / Redis-Streams broker (Phase 5) ──────────────────────
   // The reconciler is a long-lived CONSUMER (no DB polling, no cron): it blocks on the
   // Redis Stream and reacts to producer events. These tune the consume loop and the DLQ.

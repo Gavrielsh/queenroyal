@@ -1,11 +1,15 @@
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
-import Fastify, { type FastifyInstance } from "fastify";
+import rateLimit from "@fastify/rate-limit";
+import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 
 import { getEnv } from "./config/env";
 import { buildLoggerOptions } from "./lib/logger";
+import { registerMetrics } from "./lib/metrics";
+import { getRedis } from "./lib/redis";
 import { errBody } from "./lib/reply";
+import { adminRoutes } from "./routes/admin";
 import { authRoutes } from "./routes/auth";
 import { healthRoutes } from "./routes/health";
 import { storeRoutes } from "./routes/store";
@@ -50,13 +54,42 @@ export async function buildApp(): Promise<FastifyInstance> {
   // secret validated against Redis, so a separate cookie signature buys nothing.
   await app.register(cookie);
 
-  // ── Routes ─────────────────────────────────────────────────────────────────────
-  await app.register(healthRoutes);
-  await app.register(webhookRoutes);
-  await app.register(authRoutes);
-  await app.register(storeRoutes);
+  // ── Observability: Prometheus metrics ────────────────────────────────────────────
+  // Root-level hooks (global, un-encapsulated) + an unauthenticated GET /metrics. Registered
+  // BEFORE the rate limiter so the active-connections gauge increments before any 429
+  // short-circuit, and so /metrics scraping is never rate-limited.
+  registerMetrics(app);
+
+  // ── Global rate limiting (coarse per-IP DoS guard) ───────────────────────────────
+  // Distributed across pods via the validated Redis client when present (in-memory single-process
+  // fallback otherwise). This is a SECOND, broad layer; the fail-closed auth limiter still guards
+  // the brute-force-sensitive auth surface independently. Health probes and the metrics scrape are
+  // never throttled. Over-limit → a standard 429 in the gateway's uniform envelope (the plugin
+  // also sets Retry-After + RateLimit-* headers).
+  const redis = getRedis();
+  await app.register(rateLimit, {
+    global: true,
+    max: env.RATE_LIMIT_MAX,
+    timeWindow: env.RATE_LIMIT_WINDOW_SECONDS * 1000,
+    ...(redis ? { redis } : {}),
+    allowList: (req: FastifyRequest) =>
+      req.url.startsWith("/api/health") || req.url.startsWith("/metrics"),
+    // On breach the plugin THROWS this value, so return an Error carrying `statusCode` — the
+    // app's setErrorHandler then renders a clean 429 in the standard envelope (a plain object
+    // would fall through to 500). The Retry-After / RateLimit-* headers are already set by the
+    // plugin and survive the error handler.
+    errorResponseBuilder: (_req, context) =>
+      Object.assign(new Error("Too many requests; please slow down"), {
+        statusCode: context.statusCode,
+        code: "RATE_LIMITED",
+      }),
+  });
 
   // ── Uniform JSON envelopes for not-found and errors ──────────────────────────────
+  // Registered BEFORE the route plugins: a Fastify child context snapshots its parent's error
+  // handler at registration time, so setting this first is what makes the gateway envelope apply
+  // to errors thrown INSIDE the route plugins — and to errors thrown by global hooks such as the
+  // rate limiter's 429 (otherwise Fastify's default error shape would leak through).
   app.setNotFoundHandler((_req, reply) => {
     reply.code(404).send(errBody("NOT_FOUND", "Route not found"));
   });
@@ -75,6 +108,13 @@ export async function buildApp(): Promise<FastifyInstance> {
     // 4xx (including Fastify schema-validation failures) — safe to surface the message.
     reply.code(status).send(errBody(code, message));
   });
+
+  // ── Routes ─────────────────────────────────────────────────────────────────────
+  await app.register(healthRoutes);
+  await app.register(webhookRoutes);
+  await app.register(authRoutes);
+  await app.register(storeRoutes);
+  await app.register(adminRoutes);
 
   return app;
 }
