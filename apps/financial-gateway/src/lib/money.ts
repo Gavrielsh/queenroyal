@@ -30,6 +30,18 @@ export function isPositiveMoneyString(v: unknown): v is string {
   return isMoneyString(v) && /[1-9]/.test(v);
 }
 
+/**
+ * Format a trusted whole-coin integer (from the store catalog) as a money string. Throws on a
+ * non-integer / negative input so a bad catalog constant fails loudly rather than silently
+ * shipping a malformed amount to the ledger.
+ */
+export function wholeCoinsToMoneyString(coins: number): string {
+  if (!Number.isInteger(coins) || coins < 0) {
+    throw new Error(`wholeCoinsToMoneyString: expected a non-negative integer, got ${coins}`);
+  }
+  return String(coins);
+}
+
 /** Zod: a non-negative money string (allows "0"). */
 export const moneyString = z
   .string()

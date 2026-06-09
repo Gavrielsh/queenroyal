@@ -1,3 +1,4 @@
+import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
 import Fastify, { type FastifyInstance } from "fastify";
@@ -5,7 +6,9 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { getEnv } from "./config/env";
 import { buildLoggerOptions } from "./lib/logger";
 import { errBody } from "./lib/reply";
+import { authRoutes } from "./routes/auth";
 import { healthRoutes } from "./routes/health";
+import { storeRoutes } from "./routes/store";
 import { webhookRoutes } from "./routes/webhooks";
 
 /**
@@ -42,9 +45,16 @@ export async function buildApp(): Promise<FastifyInstance> {
     methods: ["GET", "POST", "OPTIONS"],
   });
 
+  // Parse/serialize cookies so the auth routes can read the HttpOnly refresh-token cookie and
+  // set/clear it. No global signing secret: the refresh token is itself a high-entropy opaque
+  // secret validated against Redis, so a separate cookie signature buys nothing.
+  await app.register(cookie);
+
   // ── Routes ─────────────────────────────────────────────────────────────────────
   await app.register(healthRoutes);
   await app.register(webhookRoutes);
+  await app.register(authRoutes);
+  await app.register(storeRoutes);
 
   // ── Uniform JSON envelopes for not-found and errors ──────────────────────────────
   app.setNotFoundHandler((_req, reply) => {

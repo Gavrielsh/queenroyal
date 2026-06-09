@@ -30,6 +30,21 @@ const envSchema = z.object({
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
     .default("info"),
 
+  // ── Auth (JWT access tokens + Redis refresh sessions) ─────────────────────────────
+  JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
+  // Short-lived access token lifetime (e.g. "15m", "900"). Keep this small.
+  JWT_ACCESS_TTL: z.string().default("15m"),
+  // Opaque refresh-token lifetime in seconds (default 7 days).
+  JWT_REFRESH_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24 * 7),
+  // Redis-backed auth rate limiting (per IP, fixed window). FAIL CLOSED: if Redis is down the
+  // auth path returns 503, never a process-local fallback (Phase 4 contract).
+  AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
+  AUTH_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
+
+  // ── Event-driven reconciler backstop (Phase 5) ────────────────────────────────────
+  // Delay before a freshly-opened deposit gets its lost-webhook backstop event scheduled.
+  RECONCILE_STALE_AFTER_MS: z.coerce.number().int().positive().default(60_000),
+
   /**
    * Comma-separated allow-list of browser origins permitted by CORS. Empty (the default) =>
    * NO cross-origin browser access at all (same-origin / server-to-server only), which is the

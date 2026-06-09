@@ -10,3 +10,7 @@ process.env.ENGINE_SECRET_KEY ??= "test-engine-secret-key-0123456789";
 process.env.ENGINE_OPERATOR_CODE ??= "TEST_OP";
 process.env.PROVIDER_WEBHOOK_SECRETS ??= '{"PRAGMATIC":"test-provider-secret"}';
 process.env.PSP_WEBHOOK_SECRET ??= "test-psp-secret";
+
+// Auth (JWT). A fixed test secret so tests can mint/verify access tokens deterministically.
+process.env.JWT_SECRET ??= "test-jwt-secret-0123456789abcdef";
+process.env.JWT_ACCESS_TTL ??= "15m";

@@ -72,8 +72,19 @@ npx prisma generate
 
 - `ENGINE_OPERATOR_CODE`, `ENGINE_SECRET_KEY`, `ENGINE_BASE_URL` — outbound to the engine.
 - `PROVIDER_WEBHOOK_SECRETS` — inbound B2B webhook HMAC secrets.
-- `REDIS_URL` — required for multi-instance replay protection.
-- `CRON_SECRET` — enables `POST/GET /api/internal/cron/reconcile`.
-- Reconciliation: either run the worker (`npm run worker:reconcile`) or schedule the cron
-  endpoint (e.g. Vercel Cron hitting `/api/internal/cron/reconcile` with
-  `Authorization: Bearer $CRON_SECRET`).
+- `JWT_SECRET` — signs the short-lived HS256 access tokens.
+- `REDIS_URL` — **required** (fail-closed). Backs replay nonces, the auth rate limiter, refresh
+  sessions, and the reconciliation event broker. Every one of these returns `503` if Redis is
+  down — there is no in-memory fallback.
+
+### Reconciliation is event-driven (no cron, no DB polling)
+
+The legacy DB poller and its `CRON_SECRET`-gated `/api/internal/cron/reconcile` route have been
+**removed**. Recovery now flows over Redis Streams:
+
+- Run the long-lived consumer: **`npm run worker:reconcile`**. It blocks on `XREADGROUP`,
+  claims each journal row with `READ COMMITTED` + `SELECT … FOR UPDATE SKIP LOCKED`, re-drives
+  it, and `XACK`s; crashed-consumer messages are recovered with `XAUTOCLAIM`.
+- Terminal failures / poison messages are parked in the **Dead Letter Queue** (`reconcile:dlq`)
+  for manual review — zero transaction loss.
+- `CRON_SECRET` is **no longer used** and can be removed from the environment.
