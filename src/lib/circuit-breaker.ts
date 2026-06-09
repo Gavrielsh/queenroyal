@@ -6,10 +6,12 @@ import { log } from "@/lib/logger";
  *
  * The problem it solves (Phase 2): when Redis goes down, every Redis-backed call would
  * otherwise block on the driver's per-request retries before failing. Applied to a
- * fail-closed gateway that means a dead Redis stalls — and then 503s — EVERY route,
- * including health checks and non-financial paths. The breaker detects the outage after a
- * few failures and then FAILS FAST (no waiting), so callers can make an instant policy
- * decision: financial paths reject (503), non-financial paths degrade and stay alive.
+ * fail-closed gateway that means a dead Redis stalls — and then 503s — EVERY route. The
+ * breaker detects the outage after a few failures and then FAILS FAST (no waiting), so
+ * callers can make an instant policy decision: every protected path (financial AND auth)
+ * rejects with `503 Service Unavailable`. There is no process-local degrade-and-stay-alive
+ * path — see {@link rateLimit} — so the breaker exists purely to bound latency, not to
+ * license untracked traffic.
  *
  * States:
  *   closed     → calls flow; consecutive failures are counted.
@@ -135,7 +137,7 @@ export class CircuitBreaker {
 /**
  * Process-wide breaker shared by ALL Redis interactions (rate limiting, replay nonces,
  * refresh sessions). One shared instance means a single outage is observed consistently:
- * financial callers reject, non-financial callers degrade, and /api/health can report it.
+ * every protected caller fails closed (503) and /api/health can report it.
  */
 let redisBreaker: CircuitBreaker | null = null;
 
@@ -153,9 +155,4 @@ export function redisCircuitBreaker(): CircuitBreaker {
 /** Run a Redis operation under the shared Redis breaker. */
 export function withRedisBreaker<T>(fn: () => Promise<T>): Promise<T> {
   return redisCircuitBreaker().execute(fn);
-}
-
-/** Test seam: drop the shared breaker so each suite starts from a clean (closed) state. */
-export function __resetRedisCircuitBreaker(): void {
-  redisBreaker = null;
 }

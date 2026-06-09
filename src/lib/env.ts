@@ -14,12 +14,10 @@ const envSchema = z.object({
   JWT_ACCESS_TTL: z.string().default("15m"),
   // Opaque refresh token lifetime in seconds (default 7 days).
   JWT_REFRESH_TTL_SECONDS: z.coerce.number().int().positive().default(60 * 60 * 24 * 7),
-  // Redis-backed auth rate limiting (per IP, fixed window).
+  // Redis-backed auth rate limiting (per IP, fixed window). FAIL CLOSED: if Redis is down the
+  // auth path returns 503, never a process-local fallback (Phase 4).
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
   AUTH_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
-  // FALLBACK cap for the in-memory leaky bucket used when Redis is unavailable on the
-  // (non-financial) auth path. Deliberately tight so degraded mode never opens the door.
-  AUTH_DEGRADED_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(3),
 
   // ── Observability ─────────────────────────────────────────────────────────
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),

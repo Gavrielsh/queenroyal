@@ -15,14 +15,13 @@ vi.mock("@/lib/redis", async () => {
 });
 
 import { redisFake } from "./fakes/redis.fake";
-import { __resetRedisCircuitBreaker } from "@/lib/circuit-breaker";
 import { getEnv } from "@/lib/env";
 import { getRedis } from "@/lib/redis";
 import { requireAuth, UnauthorizedError } from "@/lib/auth-guard";
 import { enforceAuthRateLimit } from "@/lib/auth-http";
 import { signAccessToken, verifyAccessToken, type AuthClaims } from "@/lib/jwt";
 import { REDACTION_PATHS } from "@/lib/logger";
-import { __resetInMemoryBuckets, rateLimit, RateLimiterUnavailableError } from "@/lib/rate-limit";
+import { rateLimit, RateLimiterUnavailableError } from "@/lib/rate-limit";
 import { CLOCK_DRIFT_TOLERANCE_MS, setNonceStore, verifyProviderWebhook } from "@/lib/webhook-security";
 
 const USER_ID = "33333333-3333-4333-8333-333333333333";
@@ -36,8 +35,6 @@ function stubReq(headers: Record<string, string> = {}): Parameters<typeof requir
 
 beforeEach(() => {
   redisFake.flushall();
-  __resetRedisCircuitBreaker();
-  __resetInMemoryBuckets();
   vi.mocked(getRedis).mockReturnValue(redisFake as unknown as Redis);
 });
 
@@ -77,17 +74,15 @@ describe("Redis rate limiter (Phase 5.1)", () => {
     await expect(rateLimit("financial:spin", 5, 60)).rejects.toBeInstanceOf(RateLimiterUnavailableError);
   });
 
-  it("auth rate limiting GRACEFULLY DEGRADES to an in-memory bucket when Redis is down (Phase 2)", async () => {
+  it("auth rate limiting FAILS CLOSED with HTTP 503 when Redis is down (Phase 4)", async () => {
     vi.mocked(getRedis).mockReturnValue(null); // Redis outage
-    const fallbackMax = getEnv().AUTH_DEGRADED_RATE_LIMIT_MAX;
     const req = stubReq({ "x-forwarded-for": "198.51.100.9" });
 
-    // The gateway stays ALIVE (429 throttle, never a 503) using the strict local bucket.
-    for (let i = 0; i < fallbackMax; i++) {
-      expect(await enforceAuthRateLimit(req, "login")).toBeNull();
-    }
+    // No process-local fallback: the limiter cannot vouch for the request, so it is refused
+    // (503) rather than admitted against untracked state. There is no 429 "degraded" path.
     const blocked = await enforceAuthRateLimit(req, "login");
-    expect(blocked?.status).toBe(429);
+    expect(blocked).not.toBeNull();
+    expect(blocked?.status).toBe(503);
   });
 });
 
