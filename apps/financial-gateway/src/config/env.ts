@@ -30,6 +30,11 @@ const envSchema = z.object({
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
     .default("info"),
 
+  // Absolute upper bound (ms) on the graceful drain before server.ts force-exits non-zero.
+  // Env-driven (not hardcoded) so an orchestrator can align it with its own pod eviction grace
+  // period (e.g. Kubernetes terminationGracePeriodSeconds) without a rebuild.
+  SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+
   // ── Auth (JWT access tokens + Redis refresh sessions) ─────────────────────────────
   JWT_SECRET: z.string().min(16, "JWT_SECRET must be at least 16 characters"),
   // Short-lived access token lifetime (e.g. "15m", "900"). Keep this small.
@@ -76,9 +81,34 @@ const envSchema = z.object({
   /** Hard cap on request body size (bytes). Webhooks are small; a tight bound blunts abuse. */
   BODY_LIMIT_BYTES: z.coerce.number().int().positive().default(1_048_576), // 1 MiB
 
-  // ── Distributed state (Redis: webhook replay nonces; rate limiting in a later phase) ──
-  // REQUIRED for the webhook perimeter: replay protection fails CLOSED (HTTP 503) when it is
-  // unavailable. Optional only for local single-process dev that doesn't exercise webhooks.
+  // ── Distributed state (Redis: webhook replay nonces, rate limiting, circuit breaker) ──
+  // The topology is validated HERE, in the centralized contract, so src/lib/redis.ts consumes a
+  // VETTED routing config rather than reading raw process.env. Replay protection fails CLOSED
+  // (HTTP 503) when Redis is unavailable.
+  //
+  // HA path (preferred): `REDIS_SENTINELS` is a comma-separated `host:port` list (port optional
+  // → 26379). It is parsed + strictly validated into a typed node array; any malformed entry
+  // fails the boot (fail closed). Empty (the default) means "no Sentinel topology configured".
+  REDIS_SENTINELS: z
+    .string()
+    .default("")
+    .transform((raw, ctx): SentinelNode[] => {
+      const nodes = parseSentinelList(raw);
+      if (nodes === null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "REDIS_SENTINELS must be a comma-separated host:port list (port optional → 26379)",
+        });
+        return z.NEVER;
+      }
+      return nodes;
+    }),
+  // The monitored master's name as declared in the sentinel config (sentinel monitor <name> …).
+  REDIS_MASTER_NAME: z.string().min(1).default("qrmaster"),
+  // Auth to the data nodes (master/replicas) and, optionally, to the sentinels themselves.
+  REDIS_PASSWORD: z.string().min(1).optional(),
+  REDIS_SENTINEL_PASSWORD: z.string().min(1).optional(),
+  // Standalone fallback, used ONLY when no Sentinel topology is configured (single-node dev).
   REDIS_URL: z.string().url("REDIS_URL must be a valid URL").optional(),
   REDIS_CB_FAILURE_THRESHOLD: z.coerce.number().int().positive().default(5),
   REDIS_CB_COOLDOWN_MS: z.coerce.number().int().positive().default(10_000),
@@ -182,6 +212,44 @@ function parseSecretsMap(raw: string): Record<string, string> | null {
     out[code] = secret;
   }
   return out;
+}
+
+/** A single Redis Sentinel endpoint (parsed + validated from `REDIS_SENTINELS`). */
+export interface SentinelNode {
+  host: string;
+  port: number;
+}
+
+const DEFAULT_SENTINEL_PORT = 26379;
+
+/**
+ * Parse `REDIS_SENTINELS` ("host:port,host:port,…"; the port is optional and defaults to 26379)
+ * into a typed node list. Returns `null` on ANY malformed entry so getEnv() fails the boot
+ * closed (strict validation). An empty/blank value yields `[]` (no Sentinel topology).
+ */
+function parseSentinelList(raw: string): SentinelNode[] | null {
+  const trimmed = raw.trim();
+  if (trimmed === "") return [];
+
+  const nodes: SentinelNode[] = [];
+  for (const entry of trimmed.split(",")) {
+    const e = entry.trim();
+    if (e === "") continue;
+
+    // Split on the LAST colon so the common host:port case is robust.
+    const sep = e.lastIndexOf(":");
+    if (sep < 0) {
+      nodes.push({ host: e, port: DEFAULT_SENTINEL_PORT });
+      continue;
+    }
+    if (sep === 0) return null; // ":26379" — no host
+
+    const host = e.slice(0, sep).trim();
+    const port = Number.parseInt(e.slice(sep + 1).trim(), 10);
+    if (host === "" || !Number.isInteger(port) || port <= 0 || port > 65535) return null;
+    nodes.push({ host, port });
+  }
+  return nodes;
 }
 
 /** Test-support: drop the memoized env so a suite can re-parse with a fresh process.env. */

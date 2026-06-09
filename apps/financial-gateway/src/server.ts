@@ -14,17 +14,15 @@ import { disconnectRedis } from "./lib/redis";
  * healthy process is never killed for a downstream blip.
  */
 
-/**
- * Absolute upper bound on a graceful drain. If app/Redis/Prisma teardown has not finished by
- * now, we STOP WAITING and force-exit non-zero. Keep this comfortably under the orchestrator's
- * own termination grace period (e.g. Kubernetes `terminationGracePeriodSeconds`) so WE decide
- * how the process dies rather than eating a SIGKILL.
- */
-const HARD_SHUTDOWN_MS = 15_000;
-
 async function main(): Promise<void> {
   const env = getEnv();
   const app = await buildApp();
+
+  // Absolute upper bound on a graceful drain — ENV-DRIVEN (SHUTDOWN_TIMEOUT_MS, default 15s),
+  // not hardcoded, so an orchestrator can align it with its own pod eviction grace period (e.g.
+  // Kubernetes terminationGracePeriodSeconds). If app/Redis/Prisma teardown has not finished by
+  // then we STOP WAITING and force-exit non-zero so WE decide how the process dies, not SIGKILL.
+  const shutdownTimeoutMs = env.SHUTDOWN_TIMEOUT_MS;
 
   let shuttingDown = false;
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
@@ -35,9 +33,9 @@ async function main(): Promise<void> {
     // Arm the kill-switch FIRST so it covers the entire teardown. `unref()` keeps the timer
     // from holding the event loop open once the drain finishes (we also exit explicitly below).
     const killTimer = setTimeout(() => {
-      app.log.fatal({ timeoutMs: HARD_SHUTDOWN_MS }, "graceful shutdown timed out; forcing exit");
+      app.log.fatal({ timeoutMs: shutdownTimeoutMs }, "graceful shutdown timed out; forcing exit");
       process.exit(1);
-    }, HARD_SHUTDOWN_MS);
+    }, shutdownTimeoutMs);
     killTimer.unref();
 
     try {

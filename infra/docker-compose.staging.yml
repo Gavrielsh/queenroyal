@@ -24,19 +24,21 @@ name: queenroyal-zone2-staging
 x-redis-password: &redis_password "qr_redis_dev_pw"
 
 services:
-  # ── PostgreSQL — the only stateful node. Forced to md5 auth so the verifier in
-  #    infra/bouncer/userlist.txt matches the backend password. Migrations target this
-  #    directly on :5432 (never the transaction pooler).
+  # ── PostgreSQL — the only stateful node. SCRAM-SHA-256 auth (md5 rejected as broken). The
+  #    init script pins the role to the EXACT verifier infra/bouncer/userlist.txt stores, so
+  #    PgBouncer reaches the backend via SCRAM pass-through. Migrations target this directly on
+  #    :5432 (never the transaction pooler).
   postgres-db:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: queenroyal
       POSTGRES_PASSWORD: queenroyal_dev_pw
       POSTGRES_DB: queenroyal
-      POSTGRES_INITDB_ARGS: "--auth-host=md5"
-    command: ["postgres", "-c", "password_encryption=md5"]
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    command: ["postgres", "-c", "password_encryption=scram-sha-256"]
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./postgres/init/01-scram-role.sql:/docker-entrypoint-initdb.d/01-scram-role.sql:ro
     ports:
       - "5432:5432"
     healthcheck:
@@ -143,15 +145,36 @@ services:
       start_period: 5s
     networks: [zone2]
 
-  # ── The Fastify Financial Gateway. Points at PgBouncer (:6432) for runtime queries and at
-  #    the Sentinel node (:26379) for Redis HA discovery. `init: true` ensures SIGTERM reaches
-  #    node so server.ts can run its graceful drain.
+  # ── DB MIGRATION init container. Runs to COMPLETION before the API starts, applying the
+  #    schema straight to Postgres (:5432, session mode) — NEVER the transaction pooler.
+  #    Decoupling migrations from the API container prevents races when API replicas restart
+  #    concurrently (no two of them mutate the schema on boot). Reuses the gateway image, built
+  #    once below. No-history repo (prisma/MIGRATIONS.md) → `db push`; production with committed
+  #    history swaps this command for `prisma migrate deploy`.
+  db-migrate:
+    image: queenroyal-zone2/financial-gateway:staging
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://queenroyal:queenroyal_dev_pw@postgres-db:5432/queenroyal?schema=public"
+      DIRECT_DATABASE_URL: "postgresql://queenroyal:queenroyal_dev_pw@postgres-db:5432/queenroyal?schema=public"
+    command: ["npx", "prisma", "db", "push", "--skip-generate", "--accept-data-loss"]
+    restart: "no"
+    networks: [zone2]
+
+  # ── The Fastify Financial Gateway. Points at PgBouncer (:6432) for runtime queries and at the
+  #    Sentinel node (:26379) for Redis HA discovery. Starts ONLY after db-migrate exits 0.
+  #    `init: true` ensures SIGTERM reaches node so server.ts can run its graceful drain.
   financial-gateway-api:
     build:
       context: ../apps/financial-gateway
       dockerfile: Dockerfile
+    image: queenroyal-zone2/financial-gateway:staging
     init: true
     depends_on:
+      db-migrate:
+        condition: service_completed_successfully
       pgbouncer:
         condition: service_healthy
       redis-sentinel-1:
@@ -161,10 +184,14 @@ services:
       HOST: 0.0.0.0
       PORT: "8080"
       LOG_LEVEL: info
+      # Graceful-drain budget consumed by server.ts via getEnv(). Align with the orchestrator's
+      # pod eviction grace period (env-driven, not hardcoded).
+      SHUTDOWN_TIMEOUT_MS: "15000"
 
       # ── Database: RUNTIME via PgBouncer (:6432, transaction mode, ?pgbouncer=true) ──
       DATABASE_URL: "postgresql://queenroyal:queenroyal_dev_pw@pgbouncer:6432/queenroyal?pgbouncer=true&connection_limit=1"
-      # ── Database: MIGRATIONS via DIRECT Postgres (:5432, session mode) ──
+      # ── Database: DIRECT Postgres (:5432) — kept for parity/diagnostics; schema is applied by
+      #    the db-migrate init container above, NOT here. ──
       DIRECT_DATABASE_URL: "postgresql://queenroyal:queenroyal_dev_pw@postgres-db:5432/queenroyal?schema=public"
 
       # ── Redis HA via Sentinel (:26379). redis.ts sees REDIS_SENTINELS and builds a
@@ -178,12 +205,8 @@ services:
       ENGINE_BASE_URL: "http://true-engine.staging.internal:9090"
       ENGINE_OPERATOR_CODE: "QUEENROYAL_STAGING"
       ENGINE_SECRET_KEY: "staging_engine_secret_change_me_0123456789"
-    # Staging bootstraps the non-financial schema via `db push` (uses DIRECT_DATABASE_URL →
-    # bypasses the transaction pooler). Production replaces this with `prisma migrate deploy`.
-    command:
-      - sh
-      - -c
-      - "npx prisma db push --skip-generate --accept-data-loss && exec node dist/server.js"
+    # No inline migration here — the schema is applied by db-migrate. The image's default CMD
+    # (node dist/server.js) starts the server.
     ports:
       - "8080:8080"
     networks: [zone2]
