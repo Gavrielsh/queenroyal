@@ -5,9 +5,9 @@ A high-frequency US Social Sweepstakes Casino built on a **Zero-Trust** separati
 concerns. Three decoupled zones:
 
 1. **The Core Ledger ("True Engine" — Go)** — the single source of truth for all money.
-2. **The Gateway & Cashier (this repo — Next.js/TS)** — security perimeter, B2B adapter,
+2. **The Fastify Gateway & Cashier (Standalone Microservice)** — security perimeter, B2B adapter,
    and orchestrator. **Holds zero money.**
-3. **The Frontend (Next.js App Router)** — presentation only.
+3. **The Frontend (Next.js App Router)** — presentation and UI only.
 
 > This document is kept in lock-step with the **actual** True Engine source. Where it
 > describes the engine's contract, the engine code (`internal/api`, `internal/domain`,
@@ -55,10 +55,10 @@ sc_redeemable }, status:"PROCESSED"|"CACHED"|"GHOST_RECOVERED" } }` (money = str
 
 ---
 
-## 🛡️ Zone 2: The Gateway & Cashier (this repo)
-**Status: CURRENT FOCUS.**
+## 🛡️ Zone 2: The Gateway & Cashier (Standalone Microservice)
+**Status: CURRENT FOCUS (Migrating to Fastify).**
 
-* **Stack:** Next.js 15 API routes, TypeScript (strict), Prisma → Postgres (non-financial).
+* **Stack:** Fastify, TypeScript (strict), Prisma (Singleton via PgBouncer) → Postgres (non-financial). Next.js has been strictly removed from the API layer to eliminate latency and memory bloat.
 
 ### Rule #1 — Zero Financial State
 The local DB holds **identity, KYC, VIP, store catalog, the True `player_id` mapping,
@@ -77,32 +77,33 @@ Every engine call carries `X-Operator-Code`, `X-Signature` (HMAC of raw body wit
 `operator_transaction_id` is derived from a stable upstream reference (game provider
 txn id for spins, PSP `payment_ref` for purchases), generated once and reused on retry.
 
+### Rule #5 — Strict Fail-Closed (No Local State)
+The gateway relies exclusively on Redis for Rate Limiting, Replay Protection, and Circuit Breaking. There are no local memory (`Map` or `Set`) fallbacks. If Redis is unreachable, the gateway fails elegantly and returns `503 Service Unavailable` to prevent untracked traffic.
+
 ### Components
 1. **Auth Service** — registers users (bcrypt + JWT), and **provisions** each user in the
    engine via `/player/create`, persisting `trueEnginePlayerId`.
 2. **Cashier Service** — charges the PSP (Stripe; integer USD cents is correct *for the
    PSP only*), then instructs `/store/purchase` to issue GC + SC_UNPLAYED, journaling the
    intent for crash recovery.
-3. **B2B Game Adapter** — **webhook receiver** for external Game Aggregators under
-   `/api/webhooks/provider/*`. It verifies the provider's inbound HMAC + timestamp +
-   nonce, translates the proprietary payload into the engine DTO, signs it, and forwards
-   it. **Players do not call this route and cannot supply their own win amounts.**
+3. **B2B Game Adapter (Fastify Plugin)** — **webhook receiver** for external Game Aggregators. Uses Fastify `preHandler` hooks to verify the provider's inbound HMAC + timestamp + nonce directly on the **raw body** *before* JSON parsing occurs. Translates the proprietary payload into the engine DTO, signs it, and forwards it. **Players do not call this route and cannot supply their own win amounts.**
 
 ### Identity bridge
 Our `User.id` ≠ engine `player_id`. We register as the engine's `external_id` and store
 the engine-issued `player_id`. Every money call uses `trueEnginePlayerId`.
 
-### Resilience — the intent journal
-`EngineRequestLog` (append-only, no balances) records each money intent
-(`operator_transaction_id`, type, status, refs). Combined with deterministic keys it
-makes the PSP-capture → ledger-credit window and the bet → win saga recoverable.
+### Resilience — The Intent Journal & Distributed Locks
+`EngineRequestLog` (append-only, no balances) records each money intent (`operator_transaction_id`, type, status, refs). It uses 3 strict DB locking strategies to prevent double-spending:
+1. **Idempotency Setup:** `UNIQUE` constraint on `operator_transaction_id` + `ON CONFLICT DO NOTHING`.
+2. **State Transitions:** `SERIALIZABLE` isolation + `SELECT ... FOR UPDATE` to ensure late webhooks cannot overwrite settled intents.
+3. **Outbox Claiming:** `READ COMMITTED` + `FOR UPDATE SKIP LOCKED` for lightning-fast, collision-free event polling across multiple worker nodes.
 
 ---
 
 ## 💻 Zone 3: The Showroom (Frontend)
 **Status: PENDING.** Pure presentation. Never computes win/loss. Subscribes to a
 real-time channel; when the engine confirms a bet/win it renders the engine's
-authoritative balances. Balances are strings — render, don't arithmetic.
+authoritative balances. Balances are strings — render, don't arithmetic. All Next.js logic acts solely as UI (Zone 3), decoupled from the Fastify backend (Zone 2).
 
 ---
 
@@ -112,6 +113,5 @@ authoritative balances. Balances are strings — render, don't arithmetic.
    integer cents.
 3. **Deterministic idempotency.** Stable `operator_transaction_id` from an upstream ref;
    fresh `X-Nonce` per attempt.
-4. **Verify inbound, sign outbound.** B2B webhooks are HMAC-verified before any engine
-   call; engine calls carry all four security headers.
-5. **Graceful failures.** Map engine `4xx/5xx`/timeouts to clean JSON; never crash Node.
+4. **Verify inbound, sign outbound.** B2B webhooks are HMAC-verified via Fastify `preHandler` before any engine call; engine calls carry all four security headers.
+5. **Fail-Closed & Event-Driven.** Map engine `4xx/5xx`/timeouts to clean JSON. Never crash Node. Reconciler drops legacy `setInterval` DB polling in favor of Redis-backed Dead Letter Queues (DLQ) and distributed locks.
