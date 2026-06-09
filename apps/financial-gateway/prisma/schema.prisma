@@ -18,9 +18,14 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
-  // Direct, non-pooled (session-mode) connection for `prisma migrate`/introspect — a
-  // transaction-mode PgBouncer cannot run them. Unused at runtime (see src/lib/prisma.ts).
+  // RUNTIME (pooled) connection — points at PgBouncer in TRANSACTION pool mode. This URL MUST
+  // carry `?pgbouncer=true` so Prisma disables server-side prepared statements, which
+  // transaction-pooled backends cannot share (see src/lib/prisma.ts). e.g.
+  //   postgresql://user:pass@pgbouncer:6432/queenroyal?pgbouncer=true&connection_limit=1
+  url = env("DATABASE_URL")
+  // MIGRATIONS (direct, session-mode) — `prisma migrate`/`db push` connect STRAIGHT to Postgres
+  // on :5432, never the transaction pooler (which cannot run DDL / advisory locks). Unused at
+  // runtime by the app itself.
   directUrl = env("DIRECT_DATABASE_URL")
 }
 

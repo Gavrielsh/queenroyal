@@ -1,0 +1,196 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Zone 2 — Financial Gateway: STAGING orchestration.
+#
+# Brings up the full zero-trust data plane the gateway depends on:
+#
+#   postgres-db ──(direct :5432, migrations)──┐
+#       ▲                                      │
+#       │ service_healthy                      ▼
+#   pgbouncer (:6432, TRANSACTION mode) ── runtime queries (?pgbouncer=true)
+#
+#   redis-master ──replicates──► redis-slave
+#       ▲                            ▲
+#       └──── redis-sentinel-1 (:26379, monitors "qrmaster", quorum 2) ──► discovery
+#
+#   financial-gateway-api → DATABASE_URL=pgbouncer:6432 · REDIS_SENTINELS=redis-sentinel-1:26379
+#
+# Every credential below is a DUMMY staging value — do NOT reuse in production.
+# Run:  docker compose -f infra/docker-compose.staging.yml up --build
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: queenroyal-zone2-staging
+
+# Single shared secret for the Redis data nodes + sentinel (staging only).
+x-redis-password: &redis_password "qr_redis_dev_pw"
+
+services:
+  # ── PostgreSQL — the only stateful node. Forced to md5 auth so the verifier in
+  #    infra/bouncer/userlist.txt matches the backend password. Migrations target this
+  #    directly on :5432 (never the transaction pooler).
+  postgres-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: queenroyal
+      POSTGRES_PASSWORD: queenroyal_dev_pw
+      POSTGRES_DB: queenroyal
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
+    command: ["postgres", "-c", "password_encryption=md5"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [zone2]
+
+  # ── PgBouncer — TRANSACTION-mode pooler. HARD dependency on a HEALTHY Postgres.
+  #    Uses our hand-written config (no DB_* env set → the edoburu entrypoint serves the
+  #    mounted /etc/pgbouncer/*.* verbatim).
+  pgbouncer:
+    image: edoburu/pgbouncer:latest # pin to a digest in production
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+    volumes:
+      - ./bouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./bouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "6432:6432"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6432 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [zone2]
+
+  # ── Redis MASTER (primary data node).
+  redis-master:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --port
+      - "6379"
+      - --requirepass
+      - *redis_password
+      - --masterauth
+      - *redis_password
+    environment:
+      REDIS_PASSWORD: *redis_password
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks: [zone2]
+
+  # ── Redis REPLICA (follows the master; Sentinel promotes it on failover).
+  redis-slave:
+    image: redis:7-alpine
+    depends_on:
+      redis-master:
+        condition: service_healthy
+    command:
+      - redis-server
+      - --port
+      - "6379"
+      - --replicaof
+      - redis-master
+      - "6379"
+      - --requirepass
+      - *redis_password
+      - --masterauth
+      - *redis_password
+    environment:
+      REDIS_PASSWORD: *redis_password
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks: [zone2]
+
+  # ── Redis SENTINEL #1 — monitors "qrmaster" (quorum 2). The conf is copied to a writable
+  #    path first because Sentinel rewrites its own config (CONFIG REWRITE) at runtime.
+  redis-sentinel-1:
+    image: redis:7-alpine
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-slave:
+        condition: service_started
+    volumes:
+      - ./redis/sentinel-1.conf:/etc/redis/sentinel.conf:ro
+    command:
+      - sh
+      - -c
+      - "cp /etc/redis/sentinel.conf /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf"
+    ports:
+      - "26379:26379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 26379 ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks: [zone2]
+
+  # ── The Fastify Financial Gateway. Points at PgBouncer (:6432) for runtime queries and at
+  #    the Sentinel node (:26379) for Redis HA discovery. `init: true` ensures SIGTERM reaches
+  #    node so server.ts can run its graceful drain.
+  financial-gateway-api:
+    build:
+      context: ../apps/financial-gateway
+      dockerfile: Dockerfile
+    init: true
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "8080"
+      LOG_LEVEL: info
+
+      # ── Database: RUNTIME via PgBouncer (:6432, transaction mode, ?pgbouncer=true) ──
+      DATABASE_URL: "postgresql://queenroyal:queenroyal_dev_pw@pgbouncer:6432/queenroyal?pgbouncer=true&connection_limit=1"
+      # ── Database: MIGRATIONS via DIRECT Postgres (:5432, session mode) ──
+      DIRECT_DATABASE_URL: "postgresql://queenroyal:queenroyal_dev_pw@postgres-db:5432/queenroyal?schema=public"
+
+      # ── Redis HA via Sentinel (:26379). redis.ts sees REDIS_SENTINELS and builds a
+      #    Sentinel-aware client that discovers the master "qrmaster" and follows failover. ──
+      REDIS_SENTINELS: "redis-sentinel-1:26379"
+      REDIS_MASTER_NAME: "qrmaster"
+      REDIS_PASSWORD: *redis_password
+
+      # ── Required boot config (DUMMY staging values; the Zod env contract fails closed). ──
+      JWT_SECRET: "staging_jwt_secret_change_me_0123456789"
+      ENGINE_BASE_URL: "http://true-engine.staging.internal:9090"
+      ENGINE_OPERATOR_CODE: "QUEENROYAL_STAGING"
+      ENGINE_SECRET_KEY: "staging_engine_secret_change_me_0123456789"
+    # Staging bootstraps the non-financial schema via `db push` (uses DIRECT_DATABASE_URL →
+    # bypasses the transaction pooler). Production replaces this with `prisma migrate deploy`.
+    command:
+      - sh
+      - -c
+      - "npx prisma db push --skip-generate --accept-data-loss && exec node dist/server.js"
+    ports:
+      - "8080:8080"
+    networks: [zone2]
+
+volumes:
+  pgdata:
+
+networks:
+  zone2:
+    driver: bridge
