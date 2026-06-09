@@ -1,6 +1,7 @@
 import { buildApp } from "./app";
 import { getEnv } from "./config/env";
 import { disconnectPrisma } from "./lib/prisma";
+import { disconnectRedis } from "./lib/redis";
 
 /**
  * Process entrypoint for the standalone financial gateway.
@@ -23,6 +24,7 @@ async function main(): Promise<void> {
     try {
       await app.close();
       await disconnectPrisma();
+      await disconnectRedis();
       app.log.info("server closed cleanly");
       process.exit(0);
     } catch (err) {

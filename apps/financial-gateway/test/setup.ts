@@ -3,3 +3,10 @@
 // integration runs. Uses `??=` so an explicitly-set env (e.g. a real test DB) always wins.
 process.env.NODE_ENV ??= "test";
 process.env.DATABASE_URL ??= "postgresql://test:test@localhost:5432/test?schema=public";
+
+// Outbound True Engine + inbound webhook secrets (the gateway env fails closed without them).
+process.env.ENGINE_BASE_URL ??= "http://engine.test";
+process.env.ENGINE_SECRET_KEY ??= "test-engine-secret-key-0123456789";
+process.env.ENGINE_OPERATOR_CODE ??= "TEST_OP";
+process.env.PROVIDER_WEBHOOK_SECRETS ??= '{"PRAGMATIC":"test-provider-secret"}';
+process.env.PSP_WEBHOOK_SECRET ??= "test-psp-secret";

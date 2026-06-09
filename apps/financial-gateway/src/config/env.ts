@@ -47,6 +47,45 @@ const envSchema = z.object({
 
   /** Hard cap on request body size (bytes). Webhooks are small; a tight bound blunts abuse. */
   BODY_LIMIT_BYTES: z.coerce.number().int().positive().default(1_048_576), // 1 MiB
+
+  // ── Distributed state (Redis: webhook replay nonces; rate limiting in a later phase) ──
+  // REQUIRED for the webhook perimeter: replay protection fails CLOSED (HTTP 503) when it is
+  // unavailable. Optional only for local single-process dev that doesn't exercise webhooks.
+  REDIS_URL: z.string().url("REDIS_URL must be a valid URL").optional(),
+  REDIS_CB_FAILURE_THRESHOLD: z.coerce.number().int().positive().default(5),
+  REDIS_CB_COOLDOWN_MS: z.coerce.number().int().positive().default(10_000),
+
+  // ── Outbound — this gateway acting as an operator of the True Engine ──
+  ENGINE_BASE_URL: z.string().url("ENGINE_BASE_URL must be a valid URL"),
+  ENGINE_SECRET_KEY: z.string().min(16, "ENGINE_SECRET_KEY must be at least 16 characters"),
+  // Our operator code, sent as `X-Operator-Code`; selects our secret on the engine side.
+  ENGINE_OPERATOR_CODE: z.string().min(1, "ENGINE_OPERATOR_CODE is required"),
+  ENGINE_TIMEOUT_MS: z.coerce.number().int().positive().default(8_000),
+
+  // ── Inbound — per-provider HMAC secrets for B2B game-aggregator webhooks ──
+  // JSON object {"PRAGMATIC":"secret"} or CSV "PRAGMATIC:secret,HACKSAW:secret2".
+  PROVIDER_WEBHOOK_SECRETS: z
+    .string()
+    .default("{}")
+    .transform((raw, ctx): Record<string, string> => {
+      const map = parseSecretsMap(raw);
+      if (!map) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "PROVIDER_WEBHOOK_SECRETS must be JSON {code:secret} or CSV code:secret pairs",
+        });
+        return z.NEVER;
+      }
+      return map;
+    }),
+
+  // ── Payment Service Provider (PSP) ──
+  // Which provider backs the cashier. "mock" is dev/test only.
+  PAYMENT_PROVIDER: z.enum(["mock", "stripe"]).default("mock"),
+  STRIPE_SECRET_KEY: z.string().optional(),
+  STRIPE_WEBHOOK_SECRET: z.string().optional(),
+  // Generic PSP webhook signing secret (used by the mock provider's webhook verifier).
+  PSP_WEBHOOK_SECRET: z.string().optional(),
 });
 
 export type Env = Readonly<z.infer<typeof envSchema>>;
@@ -60,7 +99,13 @@ let cached: Env | null = null;
 export function getEnv(): Env {
   if (cached) return cached;
 
-  const parsed = envSchema.safeParse(process.env);
+  // Accept ENGINE_SECRET as an alias for the canonical ENGINE_SECRET_KEY.
+  const raw = {
+    ...process.env,
+    ENGINE_SECRET_KEY: process.env.ENGINE_SECRET_KEY ?? process.env.ENGINE_SECRET,
+  };
+
+  const parsed = envSchema.safeParse(raw);
   if (!parsed.success) {
     const issues = parsed.error.issues
       .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
@@ -70,6 +115,45 @@ export function getEnv(): Env {
 
   cached = Object.freeze(parsed.data);
   return cached;
+}
+
+/**
+ * Parse the provider-secret map from JSON (`{"CODE":"secret"}`) or CSV (`CODE:secret,...`).
+ * Returns `null` on a malformed value (the caller turns that into a Zod issue). An empty map
+ * is valid — it simply means no inbound providers are configured and every webhook is rejected
+ * as unknown.
+ */
+function parseSecretsMap(raw: string): Record<string, string> | null {
+  const trimmed = raw.trim();
+  if (trimmed === "" || trimmed === "{}") return {};
+
+  if (trimmed.startsWith("{")) {
+    try {
+      const obj: unknown = JSON.parse(trimmed);
+      if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return null;
+      const out: Record<string, string> = {};
+      for (const [code, secret] of Object.entries(obj)) {
+        if (typeof secret !== "string" || code.trim() === "" || secret === "") return null;
+        out[code] = secret;
+      }
+      return out;
+    } catch {
+      return null;
+    }
+  }
+
+  const out: Record<string, string> = {};
+  for (const pair of trimmed.split(",")) {
+    const p = pair.trim();
+    if (p === "") continue;
+    const idx = p.indexOf(":");
+    if (idx <= 0) return null;
+    const code = p.slice(0, idx).trim();
+    const secret = p.slice(idx + 1).trim();
+    if (code === "" || secret === "") return null;
+    out[code] = secret;
+  }
+  return out;
 }
 
 /** Test-support: drop the memoized env so a suite can re-parse with a fresh process.env. */

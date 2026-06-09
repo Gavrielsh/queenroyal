@@ -1,4 +1,4 @@
-import type { LoggerOptions } from "pino";
+import pino, { type Logger, type LoggerOptions } from "pino";
 
 import { getEnv } from "../config/env";
 
@@ -87,3 +87,22 @@ export function buildLoggerOptions(): LoggerOptions {
     },
   };
 }
+
+let instance: Logger | null = null;
+
+/**
+ * Process-wide structured logger for services and libs (same options Fastify builds its
+ * request logger from, so service logs and request logs are identically shaped & redacted).
+ */
+export function log(): Logger {
+  if (instance) return instance;
+  instance = pino(buildLoggerOptions());
+  return instance;
+}
+
+/** A logger pre-bound with contextual fields (e.g. a per-request trace_id). */
+export function childLogger(bindings: Record<string, unknown>): Logger {
+  return log().child(bindings);
+}
+
+export type { Logger };

@@ -4,7 +4,9 @@ import Fastify, { type FastifyInstance } from "fastify";
 
 import { getEnv } from "./config/env";
 import { buildLoggerOptions } from "./lib/logger";
+import { errBody } from "./lib/reply";
 import { healthRoutes } from "./routes/health";
+import { webhookRoutes } from "./routes/webhooks";
 
 /**
  * Build a fully-configured (but not-yet-listening) Fastify instance.
@@ -42,10 +44,11 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   // ── Routes ─────────────────────────────────────────────────────────────────────
   await app.register(healthRoutes);
+  await app.register(webhookRoutes);
 
   // ── Uniform JSON envelopes for not-found and errors ──────────────────────────────
   app.setNotFoundHandler((_req, reply) => {
-    reply.code(404).send({ error: { code: "NOT_FOUND", message: "Route not found" } });
+    reply.code(404).send(errBody("NOT_FOUND", "Route not found"));
   });
 
   app.setErrorHandler((err, req, reply) => {
@@ -55,12 +58,12 @@ export async function buildApp(): Promise<FastifyInstance> {
     if (status >= 500) {
       // Log the full (pino-redacted) error; return an opaque body so internals never leak.
       req.log.error({ err }, "unhandled error");
-      reply.code(status).send({ error: { code: "INTERNAL_ERROR", message: "Unexpected server error" } });
+      reply.code(status).send(errBody("INTERNAL_ERROR", "Unexpected server error"));
       return;
     }
 
     // 4xx (including Fastify schema-validation failures) — safe to surface the message.
-    reply.code(status).send({ error: { code, message } });
+    reply.code(status).send(errBody(code, message));
   });
 
   return app;
