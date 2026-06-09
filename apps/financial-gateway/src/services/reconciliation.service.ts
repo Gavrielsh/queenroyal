@@ -1,40 +1,41 @@
 import type { EngineRequestLog } from "@prisma/client";
 
-import { claimEngineRequest } from "@/lib/db/transaction";
-import { getEnv } from "@/lib/env";
-import { childLogger, type Logger } from "@/lib/logger";
-import { prisma } from "@/lib/prisma";
+import { getEnv } from "../config/env";
+import { claimEngineRequest } from "../lib/db/transaction";
+import { childLogger, type Logger } from "../lib/logger";
+import { getPrisma } from "../lib/prisma";
 import {
   getReconcileQueue,
   type ReconcileMessage,
   type ReconcileQueue,
-} from "@/lib/reconcile-queue";
-import { trueEngine } from "@/lib/true-engine";
+} from "../lib/reconcile-queue";
+import { trueEngine } from "../lib/true-engine";
 import {
   type DepositInstruction,
   parseEngineRequestPayload,
   type ReplayableEngineRequestType,
-} from "@/schemas/engine-payloads.schema";
-import { creditConfirmedDeposit, pollDepositIntent } from "@/services/deposit.service";
-import { beginEngineRequest, completeEngineRequest } from "@/services/engine-journal.service";
+} from "../schemas/engine-payloads.schema";
 import type {
   EngineTxResult,
   RollbackPayload,
   TrueEngineResult,
   WinPayload,
-} from "@/types/true-engine";
+} from "../types/true-engine";
+import { creditConfirmedDeposit, pollDepositIntent } from "./deposit.service";
+import { beginEngineRequest, completeEngineRequest } from "./engine-journal.service";
 
 /**
- * Saga compensation / reconciliation — EVENT-DRIVEN (Phase 5).
+ * Saga compensation / reconciliation — EVENT-DRIVEN (Phase 5). This now lives INSIDE the
+ * gateway workspace: the gateway owns both the producer (enqueue/schedule on the spin adapter,
+ * PSP webhook, cashier) and this consumer.
  *
- * There is NO database polling. A producer (spin adapter, PSP webhook, cashier) emits a
- * reconcile event the moment an intent needs attention; the long-lived consumer
- * ({@link runReconcileListener}) blocks on the Redis Stream and reacts immediately. Each
- * event names ONE journaled intent by its deterministic `operator_transaction_id`; the
- * consumer CLAIMS that single row with `FOR UPDATE SKIP LOCKED` (so peers never
- * double-process it) and drives it to a terminal state.
+ * There is NO database polling. A producer emits a reconcile event the moment an intent needs
+ * attention; the long-lived consumer ({@link runReconcileListener}) blocks on the Redis Stream
+ * and reacts immediately. Each event names ONE journaled intent by its deterministic
+ * `operatorTransactionId`; the consumer CLAIMS that single row with `FOR UPDATE SKIP LOCKED`
+ * (so peers never double-process it) and drives it to a terminal state.
  *
- * The failure modes (unchanged):
+ * The failure modes:
  *   - A BET succeeds but its WIN settlement fails → retry the win with the same key; if the
  *     win is terminally rejected, COMPENSATE by rolling back the bet's
  *     `ledger_transaction_id` so the player isn't left debited for an unpaid spin.
@@ -44,7 +45,7 @@ import type {
  *     poll the PSP directly: credit if it actually succeeded, abandon if it failed, else
  *     reschedule.
  *
- * Every replay reuses the STABLE operator_transaction_id, so the engine de-duplicates
+ * Every replay reuses the STABLE operatorTransactionId, so the engine de-duplicates
  * (CACHED / GHOST_RECOVERED) and funds are never moved twice. Every payload is STRICTLY
  * re-validated (Zod) before replay. Anything that terminally fails is parked in the DLQ for
  * admin review — never silently dropped (zero transaction loss).
@@ -230,9 +231,9 @@ async function dispatch(
     return "abandoned";
   }
 
-  // Phase 3: STRICT-validate the JSONB payload before ANY replay logic runs. A corrupted
-  // row is a runtime crash (or a malformed ledger call) waiting to happen → abandon it and
-  // raise a critical alert instead of trusting `Prisma.JsonValue`.
+  // STRICT-validate the JSONB payload before ANY replay logic runs. A corrupted row is a
+  // runtime crash (or a malformed ledger call) waiting to happen → abandon it and raise a
+  // critical alert instead of trusting `Prisma.JsonValue`.
   const parsed = parseEngineRequestPayload(row.type, row.requestPayload);
   if (!parsed.ok) {
     rowLog.fatal({ alert: "corrupt_engine_payload", reason: parsed.error }, "CRITICAL: journal payload failed schema validation; abandoning");
@@ -349,7 +350,7 @@ async function waitOrAbandon(
 ): Promise<Disposition> {
   if (attempts < maxAttempts) {
     // Touch the row (bumps updatedAt) so it leaves the stale window and is rescanned later.
-    await prisma.engineRequestLog.update({ where: { id: row.id }, data: { lastError: note } });
+    await getPrisma().engineRequestLog.update({ where: { id: row.id }, data: { lastError: note } });
     return "stillFailing";
   }
   await setStatus(row.id, "ABANDONED", `${note}; attempt budget exhausted`);
@@ -385,7 +386,7 @@ async function compensateWin(row: EngineRequestLog, attempts: number, maxAttempt
     return "abandoned";
   }
 
-  const bet = await prisma.engineRequestLog.findUnique({
+  const bet = await getPrisma().engineRequestLog.findUnique({
     where: { operatorTransactionId: `bet:${providerRef}` },
   });
 
@@ -447,11 +448,11 @@ async function setStatus(
   status: "COMPENSATED" | "ABANDONED",
   note: string,
 ): Promise<void> {
-  await prisma.engineRequestLog.update({ where: { id }, data: { status, lastError: note } });
+  await getPrisma().engineRequestLog.update({ where: { id }, data: { status, lastError: note } });
 }
 
 async function markFailed(id: string, retryable: boolean, note: string): Promise<void> {
-  await prisma.engineRequestLog.update({
+  await getPrisma().engineRequestLog.update({
     where: { id },
     data: { status: "FAILED", retryable, lastError: note },
   });

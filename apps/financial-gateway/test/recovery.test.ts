@@ -1,20 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Replace the Prisma singleton with the in-memory fake (shared instance with the helpers).
-vi.mock("@/lib/prisma", async () => {
+vi.mock("../src/lib/prisma", async () => {
   const mod = await import("./fakes/prisma.fake");
-  return { prisma: mod.prismaFake };
+  return { getPrisma: () => mod.prismaFake };
 });
 
+import { setPaymentProvider } from "../src/lib/payments";
+import { MockPaymentProvider } from "../src/lib/payments/mock";
+import { setReconcileQueue } from "../src/lib/reconcile-queue";
+import { processProviderSpin } from "../src/services/game-adapter.service";
+import { handlePspWebhookEvent } from "../src/services/psp-webhook.service";
+import { processReconcileBatch } from "../src/services/reconciliation.service";
+import { type Directive, type EngineCall, engineCalls, resetEngine, setEngineHandler } from "./fakes/engine.fake";
 import { getJournal, resetDb, seedJournalRow, seedUser } from "./fakes/prisma.fake";
 import { ReconcileQueueFake } from "./fakes/reconcile-queue.fake";
-import { type Directive, type EngineCall, engineCalls, resetEngine, setEngineHandler } from "./fakes/engine.fake";
-import { setPaymentProvider } from "@/lib/payments";
-import { MockPaymentProvider } from "@/lib/payments/mock";
-import { setReconcileQueue } from "@/lib/reconcile-queue";
-import { processProviderSpin } from "@/services/game-adapter.service";
-import { handlePspWebhookEvent } from "@/services/psp-webhook.service";
-import { processReconcileBatch } from "@/services/reconciliation.service";
 
 /** Drain the reconcile broker once (non-blocking) and return the per-message outcomes. */
 function drainReconciler(queue: ReconcileQueueFake) {
@@ -366,7 +366,7 @@ describe("crash & recovery", () => {
       win_amount: "0",
     });
     const bet = engineCalls.find((c) => c.path === "/api/v1/bet");
-    expect(bet?.headers["X-Operator-Code"]).toBe("QUEENROYAL");
+    expect(bet?.headers["X-Operator-Code"]).toBe("TEST_OP"); // gateway test ENGINE_OPERATOR_CODE
     expect(bet?.headers["X-Signature"]).toMatch(/^[0-9a-f]+$/);
     expect(bet?.headers["X-Timestamp"]).toMatch(/^\d+$/);
     expect(bet?.headers["X-Nonce"]).toBeTruthy();

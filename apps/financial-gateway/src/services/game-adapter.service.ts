@@ -2,6 +2,7 @@ import type { FlowContext } from "../lib/context";
 import { assertKycAllows, KycGateError } from "../lib/kyc-policy";
 import { childLogger } from "../lib/logger";
 import { isPositiveMoneyString } from "../lib/money";
+import { enqueueReconcile } from "../lib/reconcile-queue";
 import { trueEngine } from "../lib/true-engine";
 import type { ProviderSpinInput } from "../schemas/game.schema";
 import type {
@@ -107,6 +108,9 @@ export async function processProviderSpin(
       retryable: bet.retryable,
       lastError: `${bet.error.code}: ${bet.error.message}`,
     });
+    // A retryable failure (e.g. a ghost spin: committed but the 200 was lost) hands the
+    // intent to the event-driven reconciler for an idempotent replay under the same key.
+    if (bet.retryable) await enqueueReconcile({ operatorTransactionId: betOpTxId, reason: "bet_failed_retryable" });
     flowLog.warn(
       { operator_transaction_id: betOpTxId, engine_status: bet.status, err_code: bet.error.code, retryable: bet.retryable },
       "bet failed",
@@ -165,8 +169,9 @@ export async function processProviderSpin(
       },
       "win settlement failed after committed bet — handed to reconciler",
     );
-    // The bet was already debited. The win is journaled under winOpTxId and will be reconciled
-    // (retried, or the bet rolled back) by the reconciliation worker.
+    // The bet already committed. Hand the win to the reconciler, which retries it and — if
+    // it is terminally rejected — compensates by rolling the bet back.
+    await enqueueReconcile({ operatorTransactionId: winOpTxId, reason: "win_settlement_failed" });
     return {
       ok: false,
       status: win.status === 0 ? 502 : win.status,

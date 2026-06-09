@@ -1,19 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Replace the Prisma singleton with the in-memory fake (shared instance with the helpers).
-vi.mock("@/lib/prisma", async () => {
+vi.mock("../src/lib/prisma", async () => {
   const mod = await import("./fakes/prisma.fake");
-  return { prisma: mod.prismaFake };
+  return { getPrisma: () => mod.prismaFake };
 });
 
-import { getJournal, resetDb, seedJournalRow, seedUser } from "./fakes/prisma.fake";
+import type { AuthClaims } from "../src/lib/jwt";
+import { setPaymentProvider } from "../src/lib/payments";
+import { MockPaymentProvider } from "../src/lib/payments/mock";
+import { PspWebhookSignatureError } from "../src/lib/payments/types";
+import { handlePspWebhookEvent } from "../src/services/psp-webhook.service";
+import { purchasePackage } from "../src/services/store.service";
 import { type Directive, type EngineCall, engineCalls, resetEngine, setEngineHandler } from "./fakes/engine.fake";
-import type { AuthClaims } from "@/lib/jwt";
-import { setPaymentProvider } from "@/lib/payments";
-import { MockPaymentProvider } from "@/lib/payments/mock";
-import { PspWebhookSignatureError } from "@/lib/payments/types";
-import { handlePspWebhookEvent } from "@/services/psp-webhook.service";
-import { purchasePackage } from "@/services/store.service";
+import { getJournal, resetDb, seedJournalRow, seedUser } from "./fakes/prisma.fake";
 
 const USER_ID = "22222222-2222-4222-8222-222222222222";
 const ENGINE_PLAYER_ID = "engine-player-psp";
@@ -90,21 +90,21 @@ describe("asynchronous PSP settlement", () => {
   it("Phase 1 — purchase opens a PENDING intent and returns a client_secret WITHOUT capturing or crediting", async () => {
     setEngineHandler(() => unexpected); // the ledger must NOT be called synchronously
 
-    const outcome = await purchasePackage(user, { packageId: "pkg_value_20", idempotencyKey: "buy-1" });
+    const outcome = await purchasePackage(user, { packageId: "pkg_value_20", idempotencyKey: "buy-1xxx" });
 
     expect(outcome.ok).toBe(true);
     if (!outcome.ok) return;
     expect(outcome.data.status).toBe("requires_payment_confirmation");
     expect(outcome.data.clientSecret).toBeTruthy();
-    expect(outcome.data.operatorTransactionId).toBe("deposit:buy-1");
+    expect(outcome.data.operatorTransactionId).toBe("deposit:buy-1xxx");
 
     // The deposit is journaled PENDING; no engine credit has happened yet.
-    expect(getJournal("deposit:buy-1")?.status).toBe("PENDING");
+    expect(getJournal("deposit:buy-1xxx")?.status).toBe("PENDING");
     expect(engineCalls.filter((c) => c.path === "/api/v1/store/purchase")).toHaveLength(0);
   });
 
   it("Phase 5.3 — a verified payment_intent.succeeded webhook credits the ledger EXACTLY ONCE (idempotent)", async () => {
-    const { opTx, paymentIntentId } = await seedPendingDeposit("buy-2");
+    const { opTx, paymentIntentId } = await seedPendingDeposit("buy-2xxx");
     psp.markIntentSucceeded(paymentIntentId);
 
     setEngineHandler((call: EngineCall) =>
@@ -129,7 +129,7 @@ describe("asynchronous PSP settlement", () => {
   });
 
   it("rejects a webhook whose HMAC signature does not verify", async () => {
-    const { paymentIntentId } = await seedPendingDeposit("buy-3");
+    const { paymentIntentId } = await seedPendingDeposit("buy-3xxx");
     psp.markIntentSucceeded(paymentIntentId);
     const { rawBody } = psp.buildSignedWebhook(paymentIntentId, "payment_intent.succeeded");
 
@@ -142,7 +142,7 @@ describe("asynchronous PSP settlement", () => {
   });
 
   it("payment_intent.payment_failed marks the deposit terminal and never credits", async () => {
-    const { opTx, paymentIntentId } = await seedPendingDeposit("buy-4");
+    const { opTx, paymentIntentId } = await seedPendingDeposit("buy-4xxx");
     psp.markIntentFailed(paymentIntentId);
     setEngineHandler(() => unexpected); // no credit on a failed payment
 

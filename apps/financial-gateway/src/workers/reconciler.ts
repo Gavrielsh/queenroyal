@@ -1,17 +1,18 @@
-import { getRedis } from "@/lib/redis";
-import { childLogger } from "@/lib/logger";
-import { getReconcileQueue, ReconcileQueueUnavailableError } from "@/lib/reconcile-queue";
-import { runReconcileListener } from "@/services/reconciliation.service";
+import { childLogger } from "../lib/logger";
+import { getRedis } from "../lib/redis";
+import { getReconcileQueue, ReconcileQueueUnavailableError } from "../lib/reconcile-queue";
+import { runReconcileListener } from "../services/reconciliation.service";
 
 /**
- * Event-driven reconciliation consumer. Run as a long-lived process:
+ * Event-driven reconciliation consumer — now OWNED by the gateway workspace. Run as a
+ * long-lived process alongside the API server:
  *
- *   npm run worker:reconcile
+ *   npm run worker:reconcile        # from apps/financial-gateway
  *
  * It does NOT poll Postgres and runs no interval/cron. It BLOCKS on the Redis Stream
- * (`XREADGROUP … BLOCK`) and reacts the instant a producer emits a reconcile event,
- * reclaiming any in-flight work a crashed peer left behind and parking terminal failures in
- * the Dead Letter Queue.
+ * (`XREADGROUP … BLOCK`) and reacts the instant a producer (spin adapter, PSP webhook,
+ * cashier) emits a reconcile event, reclaiming any in-flight work a crashed peer left behind
+ * and parking terminal failures in the Dead Letter Queue.
  *
  * FAIL CLOSED: the broker requires Redis. With no `REDIS_URL` the consumer cannot run, so it
  * exits non-zero rather than pretending to reconcile against nothing.

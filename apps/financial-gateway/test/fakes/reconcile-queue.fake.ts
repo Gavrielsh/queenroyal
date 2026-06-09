@@ -2,7 +2,7 @@ import type {
   ReconcileEventInput,
   ReconcileMessage,
   ReconcileQueue,
-} from "@/lib/reconcile-queue";
+} from "../../src/lib/reconcile-queue";
 
 /**
  * In-memory {@link ReconcileQueue} for tests. Models the Redis-Streams broker's observable

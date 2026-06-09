@@ -1,9 +1,16 @@
 import { randomUUID } from "node:crypto";
 
 /**
- * In-memory Prisma fake implementing exactly the `user` and `engineRequestLog` operations
- * the services use. It lets the integration tests exercise the real service + reconciler
- * code against a controllable journal/outbox without a database.
+ * In-memory Prisma fake implementing exactly the `user` and `engineRequestLog` operations the
+ * gateway services + reconciler use. It lets the integration tests exercise the REAL service +
+ * reconciler code (which talk to the journal via `getPrisma()` and the repository's raw
+ * `FOR UPDATE [SKIP LOCKED]` queries) against a controllable journal/outbox without a database.
+ *
+ * Install it by mocking the prisma singleton in the test file:
+ *   vi.mock("../src/lib/prisma", async () => {
+ *     const mod = await import("./fakes/prisma.fake");
+ *     return { getPrisma: () => mod.prismaFake };
+ *   });
  */
 
 type AnyRow = Record<string, any>;
@@ -69,6 +76,40 @@ function journalByOpTx(opTx: string): AnyRow | undefined {
   return undefined;
 }
 
+function newJournalRow(d: AnyRow): AnyRow {
+  const now = new Date();
+  return {
+    id: d.id ?? randomUUID(),
+    operatorTransactionId: d.operatorTransactionId,
+    type: d.type,
+    status: d.status ?? "PENDING",
+    playerId: d.playerId ?? null,
+    providerRef: d.providerRef ?? null,
+    ledgerTransactionId: d.ledgerTransactionId ?? null,
+    requestPayload: d.requestPayload ?? null,
+    retryable: d.retryable ?? false,
+    attempts: d.attempts ?? 0,
+    lastError: d.lastError ?? null,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+/**
+ * Normalize a `$queryRaw` invocation to `{ text, values }`. Prisma accepts both a tagged
+ * template (`$queryRaw\`...\``) and a `Prisma.sql\`...\`` fragment object; the gateway's
+ * repository + claim use the latter.
+ */
+function readRawQuery(q: any, rest: unknown[]): { text: string; values: unknown[] } {
+  if (Array.isArray(q) && "raw" in q) {
+    return { text: (q as string[]).join(" "), values: rest };
+  }
+  if (q && Array.isArray(q.strings)) {
+    return { text: (q.strings as string[]).join(" "), values: (q.values as unknown[]) ?? [] };
+  }
+  return { text: String(q), values: rest };
+}
+
 export const prismaFake = {
   user: {
     findUnique: async ({ where }: any) => {
@@ -90,24 +131,22 @@ export const prismaFake = {
         existing.updatedAt = new Date();
         return { ...existing };
       }
-      const now = new Date();
-      const row: AnyRow = {
-        id: create.id ?? randomUUID(),
-        operatorTransactionId: create.operatorTransactionId,
-        type: create.type,
-        status: create.status ?? "PENDING",
-        playerId: create.playerId ?? null,
-        providerRef: create.providerRef ?? null,
-        ledgerTransactionId: create.ledgerTransactionId ?? null,
-        requestPayload: create.requestPayload ?? null,
-        retryable: create.retryable ?? false,
-        attempts: create.attempts ?? 0,
-        lastError: create.lastError ?? null,
-        createdAt: now,
-        updatedAt: now,
-      };
+      const row = newJournalRow(create);
       journal.set(row.id, row);
       return { ...row };
+    },
+    // Idempotent intent create (createIntentIfAbsent). `skipDuplicates` collapses a repeated
+    // deterministic key to the single existing row, mirroring `ON CONFLICT DO NOTHING`.
+    createMany: async ({ data, skipDuplicates }: any) => {
+      const rows: AnyRow[] = Array.isArray(data) ? data : [data];
+      let count = 0;
+      for (const d of rows) {
+        if (skipDuplicates && journalByOpTx(d.operatorTransactionId)) continue;
+        const row = newJournalRow(d);
+        journal.set(row.id, row);
+        count += 1;
+      }
+      return { count };
     },
     update: async ({ where, data }: any) => {
       const row = where.id ? journal.get(where.id) : journalByOpTx(where.operatorTransactionId);
@@ -131,24 +170,33 @@ export const prismaFake = {
   },
 
   // Interactive transaction: the fake has no real isolation, so it simply runs the callback
-  // against itself. `txClient()` is referenced (not `prismaFake` directly) to avoid a
-  // self-referential-initializer type cycle. That's enough to exercise the claim → update path.
-  $transaction: async (fn: (tx: unknown) => Promise<unknown>): Promise<unknown> => fn(txClient()),
+  // against itself (ignoring the isolation/timeout options). `txClient()` is referenced (not
+  // `prismaFake` directly) to avoid a self-referential-initializer type cycle.
+  $transaction: async (fn: (tx: unknown) => Promise<unknown>, _opts?: unknown): Promise<unknown> =>
+    fn(txClient()),
 
   /**
-   * Tagged-template raw query. The reconciler's CLAIM is the only raw SQL we run, so we
-   * recognize `… FOR UPDATE SKIP LOCKED` and resolve it against the in-memory journal:
-   * values = [operatorTransactionId, maxAttempts]. With no real lock contention, SKIP LOCKED
-   * always finds an eligible (PENDING/FAILED, under-budget) row.
+   * Raw query handler. The gateway runs exactly two raw statements against the journal:
+   *   - the reconciler CLAIM (`… FOR UPDATE SKIP LOCKED`) → resolve the single eligible
+   *     (PENDING/FAILED, under-budget) row by key; values = [operatorTransactionId, maxAttempts].
+   *   - the terminal-transition status read (`SELECT "status" … FOR UPDATE`) used by
+   *     markIntentTerminal; values = [operatorTransactionId].
+   * With no real lock contention, SKIP LOCKED always finds the eligible row.
    */
-  $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]): Promise<Array<{ id: string }>> => {
-    const sql = Array.isArray(strings) ? strings.join(" ") : String(strings);
-    if (sql.includes("FOR UPDATE SKIP LOCKED")) {
+  $queryRaw: async (q: any, ...rest: unknown[]): Promise<Array<Record<string, unknown>>> => {
+    const { text, values } = readRawQuery(q, rest);
+    if (text.includes("SKIP LOCKED")) {
       const [operatorTransactionId, maxAttempts] = values as [string, number];
       const row = journalByOpTx(operatorTransactionId);
       if (row && (row.status === "PENDING" || row.status === "FAILED") && row.attempts < maxAttempts) {
         return [{ id: row.id }];
       }
+      return [];
+    }
+    if (text.includes("FOR UPDATE")) {
+      const [operatorTransactionId] = values as [string];
+      const row = journalByOpTx(operatorTransactionId);
+      return row ? [{ status: row.status }] : [];
     }
     return [];
   },
@@ -180,21 +228,9 @@ export function seedUser(u: {
 }
 
 export function seedJournalRow(row: AnyRow): void {
-  const now = new Date();
-  const full: AnyRow = {
-    id: randomUUID(),
-    status: "PENDING",
-    playerId: null,
-    providerRef: null,
-    ledgerTransactionId: null,
-    requestPayload: null,
-    retryable: false,
-    attempts: 0,
-    lastError: null,
-    createdAt: now,
-    updatedAt: now,
-    ...row,
-  };
+  const full = { ...newJournalRow(row), ...row };
+  if (!full.createdAt) full.createdAt = new Date();
+  if (!full.updatedAt) full.updatedAt = new Date();
   journal.set(full.id, full);
 }
 

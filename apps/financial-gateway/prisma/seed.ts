@@ -1,6 +1,11 @@
 import { PrismaClient } from "@prisma/client";
+
 import { STORE_PACKAGES } from "../src/config/store-packages";
 
+/**
+ * Seed the store-package catalog (owned by the gateway, the sole writer of financial config).
+ * Idempotent: re-running upserts the same rows.
+ */
 const prisma = new PrismaClient();
 
 async function main(): Promise<void> {

@@ -41,9 +41,22 @@ const envSchema = z.object({
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
   AUTH_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
 
-  // ── Event-driven reconciler backstop (Phase 5) ────────────────────────────────────
-  // Delay before a freshly-opened deposit gets its lost-webhook backstop event scheduled.
+  // ── Event-driven reconciler / Redis-Streams broker (Phase 5) ──────────────────────
+  // The reconciler is a long-lived CONSUMER (no DB polling, no cron): it blocks on the
+  // Redis Stream and reacts to producer events. These tune the consume loop and the DLQ.
+  // Max messages claimed per consume cycle.
+  RECONCILE_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+  // How long XREADGROUP blocks for fresh events per cycle (ms).
+  RECONCILE_STREAM_BLOCK_MS: z.coerce.number().int().positive().default(5_000),
+  // Min idle time before an in-flight (PEL) message left by a crashed consumer is reclaimed.
+  RECONCILE_RECLAIM_IDLE_MS: z.coerce.number().int().positive().default(60_000),
+  // Backstop delay / still-failing retry delay (ms): a freshly-opened deposit's lost-webhook
+  // backstop, and the re-schedule gap for an intent that is still failing.
   RECONCILE_STALE_AFTER_MS: z.coerce.number().int().positive().default(60_000),
+  // Per-INTENT engine-attempt budget before it is ABANDONED → DLQ.
+  RECONCILE_MAX_ATTEMPTS: z.coerce.number().int().positive().default(10),
+  // Per-MESSAGE redelivery budget before a poison message is dead-lettered.
+  RECONCILE_MAX_DELIVERIES: z.coerce.number().int().positive().default(5),
 
   /**
    * Comma-separated allow-list of browser origins permitted by CORS. Empty (the default) =>

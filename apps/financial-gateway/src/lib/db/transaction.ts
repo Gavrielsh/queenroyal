@@ -1,4 +1,4 @@
-import { Prisma, type PrismaClient } from "@prisma/client";
+import { Prisma, type EngineRequestLog, type PrismaClient } from "@prisma/client";
 
 import { getPrisma } from "../prisma";
 
@@ -77,6 +77,53 @@ export function runSerializable<T>(
   db: PrismaClient = getPrisma(),
 ): Promise<T> {
   return runInTransaction(fn, { ...opts, isolationLevel: Prisma.TransactionIsolationLevel.Serializable }, db);
+}
+
+export interface ClaimedEngineRequest {
+  row: EngineRequestLog;
+  /** The attempt number this claim represents (post-increment). */
+  attempts: number;
+}
+
+/**
+ * Atomically CLAIM a single actionable journal row for reconciliation, named by its
+ * deterministic key.
+ *
+ * Uses READ COMMITTED + `FOR UPDATE SKIP LOCKED` so that, when several reconciler consumers
+ * race on the same `operatorTransactionId`, exactly one wins and the rest skip instead of
+ * blocking. Only rows that are still actionable (PENDING/FAILED) and under their attempt
+ * budget are eligible; everything else (already SUCCEEDED/COMPENSATED/ABANDONED, missing, or
+ * held by a peer) yields `null`. On a successful claim the attempt counter is incremented
+ * inside the same short transaction and the lock is released immediately — the slow engine
+ * call happens OUTSIDE any held lock (the lease is `updatedAt`/`attempts`, not a live lock).
+ */
+export async function claimEngineRequest(
+  operatorTransactionId: string,
+  maxAttempts: number,
+  db: PrismaClient = getPrisma(),
+): Promise<ClaimedEngineRequest | null> {
+  return runInTransaction(
+    async (tx) => {
+      const locked = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        SELECT "id"
+        FROM "engine_request_log"
+        WHERE "operatorTransactionId" = ${operatorTransactionId}
+          AND "status" IN ('PENDING'::"EngineRequestStatus", 'FAILED'::"EngineRequestStatus")
+          AND "attempts" < ${maxAttempts}
+        FOR UPDATE SKIP LOCKED
+      `);
+      const id = locked[0]?.id;
+      if (!id) return null;
+
+      const row = await tx.engineRequestLog.update({
+        where: { id },
+        data: { attempts: { increment: 1 } },
+      });
+      return { row, attempts: row.attempts };
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted },
+    db,
+  );
 }
 
 /**

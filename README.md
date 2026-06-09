@@ -16,9 +16,10 @@ Next.js route handlers; it lives in a standalone, long-running **Fastify microse
 | **Zone 2 — Financial Gateway** | **Fastify** (`apps/financial-gateway`) | ALL backend APIs: auth, cashier/store, B2B + PSP webhooks, and the event-driven reconciler worker. Stateless, fail-closed. |
 | **Zone 3 — Web UI** | **Next.js 15** (`src/app`) | **UI ONLY.** No backend API routes whatsoever — `src/app/api` has been deleted. The browser talks to the gateway. |
 
-> The legacy `src/lib`, `src/services`, and `src/schemas` modules remain as the source the
-> gateway was ported from and back the existing test suites; they are no longer reachable from
-> any Next.js HTTP route.
+> The gateway is now **100% self-contained**: every backend module (auth, sessions, cashier,
+> webhooks, the event-driven reconciler worker, and their tests) lives under
+> `apps/financial-gateway`. The Next.js `src/` tree holds only the UI (`src/app`) — the legacy
+> `src/lib`, `src/services`, `src/schemas`, and `src/workers` have been removed.
 
 ## Architectural guarantees
 
@@ -27,7 +28,7 @@ Next.js route handlers; it lives in a standalone, long-running **Fastify microse
 | **Zero financial state** | The `User` schema holds only `email`, `passwordHash`, `kycStatus`, `vipLevel` (+ the `trueEnginePlayerId` identity bridge). No `gc_balance`/`sc_balance` anywhere (`prisma/schema.prisma`). |
 | **Zero-trust / HMAC** | Every outbound engine call signs `HMAC-SHA256` over the exact serialized bytes; every inbound B2B/PSP webhook is HMAC-verified in a Fastify `preHandler` BEFORE the body is parsed. |
 | **Idempotency** | Every financial intent carries a deterministic `operator_transaction_id`, journaled in the `engine_request_log` outbox before the call so a crash mid-flight is recoverable. |
-| **Decimal money as strings** | Money is a validated decimal **string** (`NUMERIC(18,4)` wire format). JS `number` coercion is forbidden (`src/lib/money.ts`). |
+| **Decimal money as strings** | Money is a validated decimal **string** (`NUMERIC(18,4)` wire format). JS `number` coercion is forbidden (`apps/financial-gateway/src/lib/money.ts`). |
 | **Strict fail-closed (no local state)** | Rate limiting, refresh sessions, replay nonces, and the circuit breaker are Redis-backed. If Redis is down they return **503** — there is no in-memory fallback and no "degraded" mode. |
 | **No DB polling** | Reconciliation is **event-driven** (Redis Streams). There are no `setInterval`/cron loops scanning Postgres. |
 | **Graceful ledger failure** | The engine client returns a typed `TrueEngineResult` instead of throwing; transport faults map to clean JSON, never a process crash. |
@@ -44,10 +45,11 @@ Recovery is now driven entirely by events on Redis Streams:
 - **Lost-webhook backstop** — opening a deposit schedules a *delayed* event in a Redis ZSET
   (`reconcile:scheduled`) instead of polling Postgres for stale `PENDING` rows. If the
   `succeeded` webhook arrives first the event is a harmless no-op.
-- **Consumer** — `npm run worker:reconcile` runs a long-lived worker that BLOCKS on
-  `XREADGROUP`, claims each journal row with `READ COMMITTED` + `SELECT … FOR UPDATE SKIP
-  LOCKED`, re-drives it, and `XACK`s. A crashed consumer's in-flight messages are recovered via
-  `XAUTOCLAIM`.
+- **Consumer** — `npm run worker:reconcile` (from `apps/financial-gateway`) runs a long-lived
+  worker that BLOCKS on `XREADGROUP`, claims each journal row with `READ COMMITTED` + `SELECT …
+  FOR UPDATE SKIP LOCKED`, re-drives it, and `XACK`s. A crashed consumer's in-flight messages
+  are recovered via `XAUTOCLAIM`. The producer queue and this consumer are both owned by the
+  gateway package.
 - **Dead Letter Queue** — an intent that exhausts its attempt budget (or a poison message past
   its redelivery budget) is parked in `reconcile:dlq` for manual/admin review. **Zero
   transaction loss.**
@@ -73,19 +75,19 @@ cookie scoped to `/api/auth`.
 ## Layout
 
 ```
-apps/financial-gateway/        # Zone 2 — the standalone Fastify backend
+apps/financial-gateway/        # Zone 2 — the standalone, self-contained Fastify backend
 ├── src/
 │   ├── app.ts, server.ts      # app assembly + process bootstrap
 │   ├── routes/                # health · webhooks · auth · store
-│   ├── services/              # auth · session · store · deposit · psp-webhook · game-adapter · …
+│   ├── services/              # auth · session · store · deposit · psp-webhook · game-adapter · reconciliation
+│   ├── workers/reconciler.ts  # event-driven reconciliation consumer (npm run worker:reconcile)
 │   ├── lib/                   # jwt · auth · rate-limit · reconcile-queue · circuit-breaker · …
 │   └── schemas/, config/      # Zod boundaries + the store-package catalog
-└── prisma/schema.prisma       # identity + outbox only — never balances
+├── test/                      # gateway test suite (perimeter + crash/recovery + DLQ + psp)
+└── prisma/                    # schema (identity + outbox only) · seed · sql
 
-src/                           # Zone 3 — Next.js UI (no API routes)
-├── app/                       # UI pages only (src/app/api deleted)
-├── services/, lib/, schemas/  # ported source + reconciler worker (workers/reconciler.ts)
-└── workers/reconciler.ts      # event-driven reconciliation consumer (npm run worker:reconcile)
+src/                           # Zone 3 — Next.js UI (no API routes, no backend modules)
+└── app/                       # UI pages only (src/app/api and all backend src/ removed)
 ```
 
 ## Getting started
@@ -100,8 +102,9 @@ npm install
 npm run prisma:generate
 npm run dev                     # boots the gateway on $PORT (default 8080)
 
-# The event-driven reconciler worker (requires REDIS_URL) — run from the repo root:
-npm run worker:reconcile
+# The event-driven reconciler worker (requires REDIS_URL) — same gateway workspace:
+npm run worker:reconcile        # long-lived consumer; blocks on the Redis Stream
+npm run db:seed                 # (optional) seed the store-package catalog
 ```
 
 Required env (gateway fails closed without them): `DATABASE_URL`, `JWT_SECRET`,
