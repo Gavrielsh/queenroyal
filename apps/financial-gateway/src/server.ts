@@ -1,5 +1,6 @@
 import { buildApp } from "./app";
 import { getEnv } from "./config/env";
+import { disconnectPrisma } from "./lib/prisma";
 
 /**
  * Process entrypoint for the standalone financial gateway.
@@ -21,6 +22,7 @@ async function main(): Promise<void> {
     app.log.info({ signal }, "shutdown signal received; draining connections");
     try {
       await app.close();
+      await disconnectPrisma();
       app.log.info("server closed cleanly");
       process.exit(0);
     } catch (err) {

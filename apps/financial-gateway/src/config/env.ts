@@ -13,6 +13,15 @@ import { z } from "zod";
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 
+  // ── Database (Postgres via Prisma) ──────────────────────────────────────────────
+  // Runtime / pooled connection. In production this points at PgBouncer (transaction mode)
+  // and MUST carry `?pgbouncer=true` so Prisma disables server-side prepared statements
+  // (see src/lib/prisma.ts). Required — the gateway fails closed without it.
+  DATABASE_URL: z.string().min(1, "DATABASE_URL is required"),
+  // Direct, NON-pooled (session-mode) connection used ONLY by `prisma migrate`/introspect,
+  // which cannot run through a transaction-mode pooler. The app never reads this at runtime.
+  DIRECT_DATABASE_URL: z.string().min(1).optional(),
+
   /** Bind address. `0.0.0.0` inside a container; override to `127.0.0.1` for local-only. */
   HOST: z.string().min(1).default("0.0.0.0"),
   PORT: z.coerce.number().int().positive().max(65535).default(8080),
