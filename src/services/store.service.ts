@@ -3,10 +3,12 @@ import { randomUUID } from "node:crypto";
 import { getPackage } from "@/config/store-packages";
 import type { FlowContext } from "@/lib/context";
 import { assertKycAllows, KycGateError } from "@/lib/kyc-policy";
+import { getEnv } from "@/lib/env";
 import { childLogger } from "@/lib/logger";
 import { wholeCoinsToMoneyString } from "@/lib/money";
 import type { AuthClaims } from "@/lib/jwt";
 import { PaymentProviderError } from "@/lib/payments/types";
+import { scheduleReconcile } from "@/lib/reconcile-queue";
 import type { DepositInstruction } from "@/schemas/engine-payloads.schema";
 import type { PurchaseInput } from "@/schemas/store.schema";
 import { openDepositIntent } from "@/services/deposit.service";
@@ -146,6 +148,15 @@ export async function purchasePackage(
     providerRef: intent.paymentIntentId,
     requestPayload: instruction,
   });
+
+  // Lost-webhook backstop WITHOUT polling Postgres: schedule a delayed reconcile event. If
+  // the `succeeded` webhook arrives first it settles the intent and this event becomes a
+  // harmless no-op (the row is already terminal). If the webhook is lost, the event fires
+  // after the deadline and the reconciler polls the PSP directly.
+  await scheduleReconcile(
+    { operatorTransactionId, reason: "deposit_pending_deadline" },
+    getEnv().RECONCILE_STALE_AFTER_MS,
+  );
 
   flowLog.info(
     { operator_transaction_id: operatorTransactionId, payment_ref: intent.paymentIntentId },

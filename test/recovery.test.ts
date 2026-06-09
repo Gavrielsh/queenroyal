@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Replace the Prisma singleton with the in-memory fake (shared instance with the helpers).
 vi.mock("@/lib/prisma", async () => {
@@ -7,12 +7,19 @@ vi.mock("@/lib/prisma", async () => {
 });
 
 import { getJournal, resetDb, seedJournalRow, seedUser } from "./fakes/prisma.fake";
+import { ReconcileQueueFake } from "./fakes/reconcile-queue.fake";
 import { type Directive, type EngineCall, engineCalls, resetEngine, setEngineHandler } from "./fakes/engine.fake";
 import { setPaymentProvider } from "@/lib/payments";
 import { MockPaymentProvider } from "@/lib/payments/mock";
+import { setReconcileQueue } from "@/lib/reconcile-queue";
 import { processProviderSpin } from "@/services/game-adapter.service";
 import { handlePspWebhookEvent } from "@/services/psp-webhook.service";
-import { reconcileEngineRequests } from "@/services/reconciliation.service";
+import { processReconcileBatch } from "@/services/reconciliation.service";
+
+/** Drain the reconcile broker once (non-blocking) and return the per-message outcomes. */
+function drainReconciler(queue: ReconcileQueueFake) {
+  return processReconcileBatch({ queue, blockMs: 0, reclaimIdleMs: 60_000, maxAttempts: 5 });
+}
 
 const USER_ID = "11111111-1111-4111-8111-111111111111";
 const ENGINE_PLAYER_ID = "engine-player-1";
@@ -43,6 +50,7 @@ const unexpected: Directive = { ok: false, status: 500, body: { code: "UNEXPECTE
 
 const PSP_SECRET = "test_psp_secret";
 let psp: MockPaymentProvider;
+let queue: ReconcileQueueFake;
 
 /** The DEPOSIT credit instruction journaled for the $20 package. */
 function depositInstruction(opTx: string, paymentIntentId: string, attemptId: string) {
@@ -65,7 +73,13 @@ beforeEach(() => {
   resetEngine();
   psp = new MockPaymentProvider(PSP_SECRET);
   setPaymentProvider(psp);
+  queue = new ReconcileQueueFake();
+  setReconcileQueue(queue); // producers enqueue here; the reconciler consumes from here
   seedUser({ id: USER_ID, email: "player@test.io", kycStatus: "VERIFIED", trueEnginePlayerId: ENGINE_PLAYER_ID });
+});
+
+afterEach(() => {
+  setReconcileQueue(null);
 });
 
 describe("crash & recovery", () => {
@@ -94,10 +108,13 @@ describe("crash & recovery", () => {
     });
     expect(live.ok).toBe(false);
     expect(getJournal(`bet:${ref}`)?.status).toBe("FAILED");
+    // The adapter emitted a reconcile event for the failed bet (event-driven, not polled).
+    expect(queue.readyCount).toBe(1);
 
-    // Reconciler resolves it.
-    const summary = await reconcileEngineRequests({ staleAfterMs: 0, maxAttempts: 5 });
-    expect(summary.succeeded).toBe(1);
+    // The event-driven reconciler consumes the event and resolves the intent.
+    const outcomes = await drainReconciler(queue);
+    expect(outcomes).toEqual(["succeeded"]);
+    expect(queue.inFlightCount).toBe(0); // acked off the stream
 
     const betCalls = engineCalls.filter((c) => c.path === "/api/v1/bet");
     expect(betCalls).toHaveLength(2);
@@ -133,10 +150,11 @@ describe("crash & recovery", () => {
     expect(live.ok).toBe(false);
     expect(getJournal(`bet:${ref}`)?.status).toBe("SUCCEEDED");
     expect(getJournal(`win:${ref}`)?.status).toBe("FAILED");
+    expect(queue.readyCount).toBe(1); // a reconcile event for the orphaned win
 
-    // Reconciler compensates by rolling back the bet's ledger transaction.
-    const summary = await reconcileEngineRequests({ staleAfterMs: 0, maxAttempts: 5 });
-    expect(summary.compensated).toBe(1);
+    // The reconciler retries the win; it is terminally rejected → it compensates the bet.
+    const outcomes = await drainReconciler(queue);
+    expect(outcomes).toEqual(["compensated"]);
 
     const rollback = engineCalls.find((c) => c.path === "/api/v1/rollback");
     expect(rollback).toBeDefined();
@@ -175,9 +193,12 @@ describe("crash & recovery", () => {
       call.path === "/api/v1/store/purchase" ? okTx(call.body.operator_transaction_id, "ltx-dep-3") : unexpected,
     );
 
-    // The reconciler polls the PSP as a backstop, sees the capture, and credits once.
-    const summary = await reconcileEngineRequests({ staleAfterMs: 1000, maxAttempts: 5 });
-    expect(summary.succeeded).toBe(1);
+    // The lost-webhook backstop fires as a SCHEDULED event (no DB polling): once its deadline
+    // elapses it becomes deliverable, and the reconciler polls the PSP, sees the capture, and
+    // credits exactly once.
+    await queue.schedule({ operatorTransactionId: opTx, reason: "deposit_pending_deadline" }, 0);
+    const outcomes = await drainReconciler(queue);
+    expect(outcomes).toEqual(["succeeded"]);
 
     const purchase = engineCalls.find((c) => c.path === "/api/v1/store/purchase");
     expect(purchase).toBeDefined();
@@ -226,15 +247,109 @@ describe("crash & recovery", () => {
     const handled = await handlePspWebhookEvent(psp.parseWebhook(wh.rawBody, wh.signature));
     expect(handled.handled).toBe(false);
     expect(getJournal(opTx)?.status).toBe("FAILED");
+    expect(queue.readyCount).toBe(1); // webhook handler emitted a credit-retry event
 
     // The reconciler re-drives the CREDIT ONLY (never re-charges the card) → settled once.
-    const summary = await reconcileEngineRequests({ staleAfterMs: 0, maxAttempts: 5 });
-    expect(summary.succeeded).toBe(1);
+    const outcomes = await drainReconciler(queue);
+    expect(outcomes).toEqual(["succeeded"]);
     expect(getJournal(opTx)?.status).toBe("SUCCEEDED");
 
     const purchases = engineCalls.filter((c) => c.path === "/api/v1/store/purchase");
     expect(purchases).toHaveLength(2);
     expect(purchases.every((c) => c.body.operator_transaction_id === opTx)).toBe(true); // same key, no double credit
+  });
+
+  it("Scenario 4 — Dead Letter Queue: an intent that exhausts its attempt budget is parked for review", async () => {
+    const ref = "spin-poison-4";
+    const opTx = `bet:${ref}`;
+    // The engine keeps failing with a RETRYABLE error, so the replay never settles.
+    setEngineHandler((call: EngineCall) =>
+      call.path === "/api/v1/bet"
+        ? { ok: false, status: 503, body: { code: "ENGINE_UNREACHABLE", message: "down", trace_id: "t" } }
+        : unexpected,
+    );
+    seedJournalRow({
+      operatorTransactionId: opTx,
+      type: "BET",
+      status: "FAILED",
+      retryable: true,
+      playerId: ENGINE_PLAYER_ID,
+      providerRef: ref,
+      requestPayload: {
+        operator_transaction_id: opTx,
+        player_id: ENGINE_PLAYER_ID,
+        currency: "SC",
+        amount: "10.0000",
+        game_id: "slots",
+      },
+    });
+
+    await queue.publish({ operatorTransactionId: opTx, reason: "bet_failed_retryable" });
+    // maxAttempts:1 → the single attempt is consumed and the intent is ABANDONED.
+    const outcomes = await processReconcileBatch({ queue, blockMs: 0, reclaimIdleMs: 60_000, maxAttempts: 1 });
+
+    expect(outcomes).toEqual(["abandoned"]);
+    expect(getJournal(opTx)?.status).toBe("ABANDONED");
+    // Zero transaction loss: the abandoned intent is quarantined in the DLQ, not dropped.
+    expect(queue.dead).toHaveLength(1);
+    expect(queue.dead[0]?.message.operatorTransactionId).toBe(opTx);
+    expect(queue.inFlightCount).toBe(0);
+  });
+
+  it("idempotent consumption: an event for an already-settled intent is a harmless no-op (skipped)", async () => {
+    const opTx = "bet:already-done";
+    seedJournalRow({
+      operatorTransactionId: opTx,
+      type: "BET",
+      status: "SUCCEEDED",
+      ledgerTransactionId: "ltx-done",
+      playerId: ENGINE_PLAYER_ID,
+      providerRef: "already-done",
+    });
+    setEngineHandler(() => unexpected); // must never be called
+
+    await queue.publish({ operatorTransactionId: opTx, reason: "duplicate" });
+    const outcomes = await drainReconciler(queue);
+
+    expect(outcomes).toEqual(["skipped"]);
+    expect(engineCalls).toHaveLength(0); // SKIP LOCKED claim found nothing actionable
+    expect(queue.dead).toHaveLength(0);
+    expect(queue.inFlightCount).toBe(0); // acked, not requeued
+  });
+
+  it("crash recovery: an unacked in-flight message is reclaimed and re-driven", async () => {
+    const ref = "spin-reclaim-5";
+    const opTx = `bet:${ref}`;
+    seedJournalRow({
+      operatorTransactionId: opTx,
+      type: "BET",
+      status: "FAILED",
+      retryable: true,
+      playerId: ENGINE_PLAYER_ID,
+      providerRef: ref,
+      requestPayload: {
+        operator_transaction_id: opTx,
+        player_id: ENGINE_PLAYER_ID,
+        currency: "SC",
+        amount: "10.0000",
+        game_id: "slots",
+      },
+    });
+    setEngineHandler((call: EngineCall) =>
+      call.path === "/api/v1/bet" ? okTx(call.body.operator_transaction_id, "ltx-reclaim") : unexpected,
+    );
+
+    // Simulate a consumer that pulled the message but crashed before acking.
+    await queue.publish({ operatorTransactionId: opTx, reason: "bet_failed_retryable" });
+    const [stuck] = await queue.pull(10, 0);
+    expect(stuck).toBeDefined();
+    expect(queue.inFlightCount).toBe(1);
+
+    // A fresh cycle reclaims the idle in-flight message (minIdleMs:0) and completes it.
+    const outcomes = await processReconcileBatch({ queue, blockMs: 0, reclaimIdleMs: 0, maxAttempts: 5 });
+    expect(outcomes).toEqual(["succeeded"]);
+    expect(getJournal(opTx)?.status).toBe("SUCCEEDED");
+    expect(queue.inFlightCount).toBe(0);
   });
 
   it("outbound engine calls carry the four zero-trust headers", async () => {

@@ -1,6 +1,7 @@
 import { childLogger } from "@/lib/logger";
 import type { PspWebhookEvent } from "@/lib/payments/types";
 import { prisma } from "@/lib/prisma";
+import { enqueueReconcile } from "@/lib/reconcile-queue";
 import { depositInstructionSchema } from "@/schemas/engine-payloads.schema";
 import { creditConfirmedDeposit } from "@/services/deposit.service";
 import { completeEngineRequest } from "@/services/engine-journal.service";
@@ -101,6 +102,8 @@ export async function handlePspWebhookEvent(event: PspWebhookEvent, traceId?: st
       retryable: credit.retryable,
       lastError: `${credit.error.code}: ${credit.error.message}`,
     });
+    // Capture is confirmed; the reconciler must re-drive the (idempotent) credit promptly.
+    await enqueueReconcile({ operatorTransactionId: opTxId, reason: "deposit_credit_failed" });
     log.error({ err_code: credit.error.code, retryable: credit.retryable }, "ledger credit failed during psp webhook settle — handed to reconciler");
     return { handled: false, note: "ledger credit failed" };
   }

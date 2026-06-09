@@ -34,14 +34,19 @@ const envSchema = z.object({
   REDIS_CB_FAILURE_THRESHOLD: z.coerce.number().int().positive().default(5),
   REDIS_CB_COOLDOWN_MS: z.coerce.number().int().positive().default(10_000),
 
-  // Shared secret authenticating the internal reconciliation cron endpoint. When unset
-  // the endpoint is disabled (503) so it can never run unauthenticated.
-  CRON_SECRET: z.string().min(16, "CRON_SECRET must be at least 16 characters").optional(),
-
-  // ── Reconciliation worker / cron thresholds (operational overrides) ─────────
+  // ── Event-driven reconciler (Redis Streams consumer) ────────────────────────
+  // Max messages pulled per XREADGROUP cycle.
   RECONCILE_BATCH_SIZE: z.coerce.number().int().positive().default(50),
+  // How long XREADGROUP blocks waiting for new events (event wait, NOT a poll interval).
+  RECONCILE_STREAM_BLOCK_MS: z.coerce.number().int().positive().default(5_000),
+  // Min idle time before an unacked in-flight message is reclaimed from a crashed consumer.
+  RECONCILE_RECLAIM_IDLE_MS: z.coerce.number().int().positive().default(60_000),
+  // Delay before a freshly-opened deposit gets a backstop reconcile event (lost-webhook net).
   RECONCILE_STALE_AFTER_MS: z.coerce.number().int().positive().default(60_000),
+  // Per-intent engine attempt budget (DB-side); exhausting it ABANDONS → DLQ.
   RECONCILE_MAX_ATTEMPTS: z.coerce.number().int().positive().default(10),
+  // Per-message queue redelivery budget; a poison message past it is dead-lettered.
+  RECONCILE_MAX_DELIVERIES: z.coerce.number().int().positive().default(5),
 
   // ── Payment Service Provider (PSP) ──────────────────────────────────────────
   // Which provider implementation backs the cashier. "mock" is dev/test only.

@@ -1,8 +1,14 @@
 import type { EngineRequestLog } from "@prisma/client";
 
+import { claimEngineRequest } from "@/lib/db/transaction";
 import { getEnv } from "@/lib/env";
 import { childLogger, type Logger } from "@/lib/logger";
 import { prisma } from "@/lib/prisma";
+import {
+  getReconcileQueue,
+  type ReconcileMessage,
+  type ReconcileQueue,
+} from "@/lib/reconcile-queue";
 import { trueEngine } from "@/lib/true-engine";
 import {
   type DepositInstruction,
@@ -12,7 +18,6 @@ import {
 import { creditConfirmedDeposit, pollDepositIntent } from "@/services/deposit.service";
 import { beginEngineRequest, completeEngineRequest } from "@/services/engine-journal.service";
 import type {
-  BetPayload,
   EngineTxResult,
   RollbackPayload,
   TrueEngineResult,
@@ -20,84 +25,56 @@ import type {
 } from "@/types/true-engine";
 
 /**
- * Saga compensation / reconciliation. Consumes the EngineRequestLog outbox and drives
- * every orphaned intent to a terminal state.
+ * Saga compensation / reconciliation — EVENT-DRIVEN (Phase 5).
  *
- * The failure modes:
- *   - A BET succeeds but its WIN settlement fails → retry the win with the same key; if
- *     the win is terminally rejected, COMPENSATE by rolling back the bet's
+ * There is NO database polling. A producer (spin adapter, PSP webhook, cashier) emits a
+ * reconcile event the moment an intent needs attention; the long-lived consumer
+ * ({@link runReconcileListener}) blocks on the Redis Stream and reacts immediately. Each
+ * event names ONE journaled intent by its deterministic `operator_transaction_id`; the
+ * consumer CLAIMS that single row with `FOR UPDATE SKIP LOCKED` (so peers never
+ * double-process it) and drives it to a terminal state.
+ *
+ * The failure modes (unchanged):
+ *   - A BET succeeds but its WIN settlement fails → retry the win with the same key; if the
+ *     win is terminally rejected, COMPENSATE by rolling back the bet's
  *     `ledger_transaction_id` so the player isn't left debited for an unpaid spin.
- *   - A DEPOSIT whose PSP capture is confirmed (webhook `succeeded`) but whose ledger
- *     credit failed → retry the credit with the same key (idempotent; never re-charges).
- *   - A DEPOSIT still PENDING past the stale window → poll the PSP directly (lost-webhook
- *     backstop): credit if it actually succeeded, abandon if it failed, else wait.
+ *   - A DEPOSIT whose PSP capture is confirmed but whose ledger credit failed → retry the
+ *     credit with the same key (idempotent; never re-charges).
+ *   - A DEPOSIT still PENDING past its deadline → a SCHEDULED backstop event fires and we
+ *     poll the PSP directly: credit if it actually succeeded, abandon if it failed, else
+ *     reschedule.
  *
  * Every replay reuses the STABLE operator_transaction_id, so the engine de-duplicates
  * (CACHED / GHOST_RECOVERED) and funds are never moved twice. Every payload is STRICTLY
- * re-validated (Zod) before replay — a corrupted JSONB row is abandoned with a critical
- * alert, never blindly forwarded to the ledger.
+ * re-validated (Zod) before replay. Anything that terminally fails is parked in the DLQ for
+ * admin review — never silently dropped (zero transaction loss).
  */
 
 export interface ReconcileOptions {
-  /** Max rows processed per run. */
-  batchSize?: number;
-  /** A PENDING row not updated within this window is treated as crashed/stuck. */
-  staleAfterMs?: number;
-  /** Give up (ABANDONED) after this many reconciliation attempts. */
+  /** Give up (ABANDONED → DLQ) after this many engine attempts. */
   maxAttempts?: number;
 }
 
-export interface ReconcileSummary {
-  scanned: number;
-  succeeded: number;
-  compensated: number;
-  abandoned: number;
-  stillFailing: number;
-}
-
-type Disposition = "succeeded" | "compensated" | "abandoned" | "stillFailing";
+export type Disposition = "succeeded" | "compensated" | "abandoned" | "stillFailing";
+/** {@link reconcileByKey} also returns `skipped` when the row is absent/terminal/locked. */
+export type ReconcileOutcome = Disposition | "skipped";
 
 /**
- * Process one batch of actionable journal rows. Safe to call repeatedly. Thresholds
- * default to the Zod-validated env (RECONCILE_BATCH_SIZE / RECONCILE_STALE_AFTER_MS /
- * RECONCILE_MAX_ATTEMPTS) and can be overridden per call (e.g. in tests).
+ * Reconcile exactly ONE intent, named by its deterministic key. Claims the row under
+ * READ COMMITTED + `FOR UPDATE SKIP LOCKED` (incrementing its attempt counter atomically),
+ * then drives it through the saga. Returns `skipped` when there is nothing actionable to do
+ * (already terminal, missing, over budget, or currently held by a peer consumer).
  */
-export async function reconcileEngineRequests(opts: ReconcileOptions = {}): Promise<ReconcileSummary> {
-  const env = getEnv();
-  const batchSize = opts.batchSize ?? env.RECONCILE_BATCH_SIZE;
-  const staleAfterMs = opts.staleAfterMs ?? env.RECONCILE_STALE_AFTER_MS;
-  const maxAttempts = opts.maxAttempts ?? env.RECONCILE_MAX_ATTEMPTS;
-  const staleCutoff = new Date(Date.now() - staleAfterMs);
+export async function reconcileByKey(
+  operatorTransactionId: string,
+  opts: ReconcileOptions = {},
+): Promise<ReconcileOutcome> {
+  const maxAttempts = opts.maxAttempts ?? getEnv().RECONCILE_MAX_ATTEMPTS;
 
-  const rows = await prisma.engineRequestLog.findMany({
-    where: {
-      attempts: { lt: maxAttempts },
-      OR: [
-        { status: "FAILED" },
-        { status: "PENDING", updatedAt: { lt: staleCutoff } },
-      ],
-    },
-    orderBy: { updatedAt: "asc" },
-    take: batchSize,
-  });
+  const claim = await claimEngineRequest(operatorTransactionId, maxAttempts);
+  if (!claim) return "skipped";
+  const { row, attempts } = claim;
 
-  const summary: ReconcileSummary = {
-    scanned: rows.length,
-    succeeded: 0,
-    compensated: 0,
-    abandoned: 0,
-    stillFailing: 0,
-  };
-
-  for (const row of rows) {
-    const disposition = await reconcileOne(row, maxAttempts);
-    summary[disposition] += 1;
-  }
-  return summary;
-}
-
-async function reconcileOne(row: EngineRequestLog, maxAttempts: number): Promise<Disposition> {
-  const attempts = row.attempts + 1;
   const rowLog = childLogger({
     component: "reconciler",
     operator_transaction_id: row.operatorTransactionId,
@@ -106,10 +83,8 @@ async function reconcileOne(row: EngineRequestLog, maxAttempts: number): Promise
     provider_ref: row.providerRef ?? undefined,
     attempt: attempts,
   });
-  await prisma.engineRequestLog.update({ where: { id: row.id }, data: { attempts } });
 
   const disposition = await dispatch(row, attempts, maxAttempts, rowLog);
-
   if (disposition === "succeeded" || disposition === "compensated") {
     rowLog.info({ disposition }, "intent reconciled");
   } else if (disposition === "abandoned") {
@@ -118,6 +93,124 @@ async function reconcileOne(row: EngineRequestLog, maxAttempts: number): Promise
     rowLog.warn({ disposition }, "intent still failing; will retry");
   }
   return disposition;
+}
+
+export interface ListenerOptions extends ReconcileOptions {
+  /** Broker override (tests inject a fake). Defaults to the fail-closed Redis broker. */
+  queue?: ReconcileQueue;
+  /** Max messages pulled per cycle. */
+  batchSize?: number;
+  /** How long to block for new events per cycle (0 = non-blocking, useful in tests). */
+  blockMs?: number;
+  /** Min idle before an in-flight message left by a crashed consumer is reclaimed. */
+  reclaimIdleMs?: number;
+  /** Per-message redelivery budget before a poison message is dead-lettered. */
+  maxDeliveries?: number;
+  /** Backoff before a still-failing intent's next scheduled attempt. */
+  retryDelayMs?: number;
+  /** Cooperative stop flag for {@link runReconcileListener}. */
+  signal?: { aborted: boolean };
+}
+
+/**
+ * Handle ONE delivered message: reconcile its intent, then settle the message against the
+ * broker. The disposition decides the message's fate:
+ *   - succeeded / compensated / skipped → ACK (work is done).
+ *   - stillFailing                      → SCHEDULE a delayed re-attempt, then ACK this
+ *     delivery (no tight requeue loop).
+ *   - abandoned                         → DEAD-LETTER (terminal failure parked for review).
+ * A thrown (infra/poison) error leaves the message UNACKED so it is reclaimed and
+ * redelivered — unless it has blown its delivery budget, in which case it is dead-lettered
+ * so it can never wedge the consumer.
+ */
+export async function handleReconcileMessage(
+  queue: ReconcileQueue,
+  msg: ReconcileMessage,
+  opts: ListenerOptions = {},
+): Promise<ReconcileOutcome> {
+  const env = getEnv();
+  const maxDeliveries = opts.maxDeliveries ?? env.RECONCILE_MAX_DELIVERIES;
+  const retryDelayMs = opts.retryDelayMs ?? env.RECONCILE_STALE_AFTER_MS;
+  const msgLog = childLogger({
+    component: "reconciler",
+    operator_transaction_id: msg.operatorTransactionId,
+    delivery_id: msg.deliveryId,
+    delivery_count: msg.deliveryCount,
+  });
+
+  try {
+    const outcome = await reconcileByKey(msg.operatorTransactionId, opts);
+    switch (outcome) {
+      case "succeeded":
+      case "compensated":
+      case "skipped":
+        await queue.ack(msg);
+        break;
+      case "stillFailing":
+        await queue.schedule(
+          { operatorTransactionId: msg.operatorTransactionId, reason: `retry:${msg.reason}` },
+          retryDelayMs,
+        );
+        await queue.ack(msg);
+        break;
+      case "abandoned":
+        await queue.deadLetter(msg, `intent abandoned after reconciliation: ${msg.operatorTransactionId}`);
+        msgLog.error({ alert: "reconcile_dead_letter" }, "intent abandoned — parked in DLQ for admin review");
+        break;
+    }
+    return outcome;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : "handler error";
+    if (msg.deliveryCount >= maxDeliveries) {
+      await queue.deadLetter(msg, `poison message (${msg.deliveryCount} deliveries): ${reason}`);
+      msgLog.fatal({ alert: "reconcile_poison_dead_letter", err }, "CRITICAL: poison reconcile message parked in DLQ");
+      return "abandoned";
+    }
+    msgLog.error({ err }, "reconcile handler failed; leaving message unacked for redelivery");
+    return "stillFailing";
+  }
+}
+
+/**
+ * Run ONE consume cycle: reclaim crashed in-flight messages, then block for fresh events and
+ * handle them. Exposed for the worker loop and for tests (no infinite loop).
+ */
+export async function processReconcileBatch(opts: ListenerOptions = {}): Promise<ReconcileOutcome[]> {
+  const env = getEnv();
+  const queue = opts.queue ?? getReconcileQueue();
+  const batchSize = opts.batchSize ?? env.RECONCILE_BATCH_SIZE;
+  const blockMs = opts.blockMs ?? env.RECONCILE_STREAM_BLOCK_MS;
+  const reclaimIdleMs = opts.reclaimIdleMs ?? env.RECONCILE_RECLAIM_IDLE_MS;
+
+  const reclaimed = await queue.reclaim(reclaimIdleMs, batchSize);
+  const fresh = await queue.pull(batchSize, blockMs);
+
+  const outcomes: ReconcileOutcome[] = [];
+  for (const msg of [...reclaimed, ...fresh]) {
+    outcomes.push(await handleReconcileMessage(queue, msg, { ...opts, queue }));
+  }
+  return outcomes;
+}
+
+/**
+ * Long-lived event loop. Blocks on the broker via {@link processReconcileBatch} until
+ * `opts.signal.aborted` flips true. This is the ONLY reconciliation entry point in
+ * production — there is no interval and no DB scan.
+ */
+export async function runReconcileListener(opts: ListenerOptions = {}): Promise<void> {
+  const queue = opts.queue ?? getReconcileQueue();
+  const listenerLog = childLogger({ component: "reconciler" });
+  listenerLog.info("event-driven reconciler listening on the broker");
+
+  const isAborted = (): boolean => opts.signal?.aborted ?? false;
+  while (!isAborted()) {
+    try {
+      await processReconcileBatch({ ...opts, queue });
+    } catch (err) {
+      listenerLog.error({ err }, "reconcile batch failed; continuing");
+    }
+  }
+  listenerLog.info("reconciler listener stopped");
 }
 
 async function dispatch(

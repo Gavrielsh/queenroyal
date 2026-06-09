@@ -1,45 +1,48 @@
+import { getRedis } from "@/lib/redis";
 import { childLogger } from "@/lib/logger";
-import { reconcileEngineRequests, type ReconcileSummary } from "@/services/reconciliation.service";
+import { getReconcileQueue, ReconcileQueueUnavailableError } from "@/lib/reconcile-queue";
+import { runReconcileListener } from "@/services/reconciliation.service";
 
 /**
- * Background reconciliation worker. Runs the saga compensation / replay loop on an
- * interval. Run as a long-lived process:
+ * Event-driven reconciliation consumer. Run as a long-lived process:
  *
  *   npm run worker:reconcile
  *
- * (In a serverless deployment, call `reconcileEngineRequests()` from a scheduled
- * function / cron instead of running this loop — see /api/internal/cron/reconcile.)
+ * It does NOT poll Postgres and runs no interval/cron. It BLOCKS on the Redis Stream
+ * (`XREADGROUP … BLOCK`) and reacts the instant a producer emits a reconcile event,
+ * reclaiming any in-flight work a crashed peer left behind and parking terminal failures in
+ * the Dead Letter Queue.
+ *
+ * FAIL CLOSED: the broker requires Redis. With no `REDIS_URL` the consumer cannot run, so it
+ * exits non-zero rather than pretending to reconcile against nothing.
  */
 
-const INTERVAL_MS = Number(process.env.RECONCILER_INTERVAL_MS ?? "15000");
 const workerLog = childLogger({ component: "reconciler-worker" });
 
-let running = true;
-
-async function tick(): Promise<void> {
-  try {
-    const summary: ReconcileSummary = await reconcileEngineRequests();
-    if (summary.scanned > 0) {
-      workerLog.info({ summary }, "reconcile batch processed");
-    }
-  } catch (err) {
-    workerLog.error({ err }, "reconcile tick failed");
-  }
-}
-
 async function main(): Promise<void> {
-  workerLog.info({ interval_ms: INTERVAL_MS }, "reconciler worker starting");
-  const stop = (): void => {
-    running = false;
-  };
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
-
-  while (running) {
-    await tick();
-    await new Promise((resolve) => setTimeout(resolve, INTERVAL_MS));
+  if (!getRedis()) {
+    throw new ReconcileQueueUnavailableError(
+      "reconciler worker requires REDIS_URL (the event broker); refusing to start",
+    );
   }
-  workerLog.info("reconciler worker stopped");
+
+  // Surface a clear failure now if the broker can't be constructed.
+  const queue = getReconcileQueue();
+
+  const signal = { aborted: false };
+  const stop = (sig: string): void => {
+    workerLog.info({ signal: sig }, "stop requested; draining current cycle then exiting");
+    signal.aborted = true;
+  };
+  process.on("SIGINT", () => stop("SIGINT"));
+  process.on("SIGTERM", () => stop("SIGTERM"));
+
+  workerLog.info("reconciler worker starting (event-driven)");
+  await runReconcileListener({ queue, signal });
+  workerLog.info("reconciler worker stopped cleanly");
 }
 
-void main();
+main().catch((err: unknown) => {
+  workerLog.fatal({ err }, "reconciler worker crashed");
+  process.exitCode = 1;
+});

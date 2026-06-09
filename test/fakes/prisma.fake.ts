@@ -11,10 +11,29 @@ type AnyRow = Record<string, any>;
 const users = new Map<string, AnyRow>();
 const journal = new Map<string, AnyRow>(); // keyed by id
 
-function stripUndefined(obj: AnyRow): AnyRow {
-  const out: AnyRow = {};
-  for (const [k, v] of Object.entries(obj)) if (v !== undefined) out[k] = v;
-  return out;
+/**
+ * Apply a Prisma-style `data` patch onto a row, honoring atomic numeric ops
+ * (`{ increment }` / `{ decrement }` / `{ set }`) and skipping `undefined`.
+ */
+function applyData(row: AnyRow, data: AnyRow): void {
+  for (const [k, v] of Object.entries(data)) {
+    if (v === undefined) continue;
+    if (v !== null && typeof v === "object" && !(v instanceof Date)) {
+      if ("increment" in v) {
+        row[k] = (row[k] ?? 0) + (v as { increment: number }).increment;
+        continue;
+      }
+      if ("decrement" in v) {
+        row[k] = (row[k] ?? 0) - (v as { decrement: number }).decrement;
+        continue;
+      }
+      if ("set" in v) {
+        row[k] = (v as { set: unknown }).set;
+        continue;
+      }
+    }
+    row[k] = v;
+  }
 }
 
 /** Minimal Prisma-style where matcher: AND of keys, OR arrays, and {lt,lte,gt,gte,equals,in}. */
@@ -59,7 +78,7 @@ export const prismaFake = {
     update: async ({ where, data }: any) => {
       const u = users.get(where.id);
       if (!u) throw new Error(`user ${where.id} not found`);
-      Object.assign(u, stripUndefined(data));
+      applyData(u, data);
       return { ...u };
     },
   },
@@ -67,7 +86,7 @@ export const prismaFake = {
     upsert: async ({ where, update, create }: any) => {
       const existing = journalByOpTx(where.operatorTransactionId);
       if (existing) {
-        Object.assign(existing, stripUndefined(update));
+        applyData(existing, update);
         existing.updatedAt = new Date();
         return { ...existing };
       }
@@ -93,7 +112,7 @@ export const prismaFake = {
     update: async ({ where, data }: any) => {
       const row = where.id ? journal.get(where.id) : journalByOpTx(where.operatorTransactionId);
       if (!row) throw new Error("engineRequestLog row not found");
-      Object.assign(row, stripUndefined(data));
+      applyData(row, data);
       row.updatedAt = new Date();
       return { ...row };
     },
@@ -110,7 +129,35 @@ export const prismaFake = {
       return rows.map((r) => ({ ...r }));
     },
   },
+
+  // Interactive transaction: the fake has no real isolation, so it simply runs the callback
+  // against itself. `txClient()` is referenced (not `prismaFake` directly) to avoid a
+  // self-referential-initializer type cycle. That's enough to exercise the claim → update path.
+  $transaction: async (fn: (tx: unknown) => Promise<unknown>): Promise<unknown> => fn(txClient()),
+
+  /**
+   * Tagged-template raw query. The reconciler's CLAIM is the only raw SQL we run, so we
+   * recognize `… FOR UPDATE SKIP LOCKED` and resolve it against the in-memory journal:
+   * values = [operatorTransactionId, maxAttempts]. With no real lock contention, SKIP LOCKED
+   * always finds an eligible (PENDING/FAILED, under-budget) row.
+   */
+  $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]): Promise<Array<{ id: string }>> => {
+    const sql = Array.isArray(strings) ? strings.join(" ") : String(strings);
+    if (sql.includes("FOR UPDATE SKIP LOCKED")) {
+      const [operatorTransactionId, maxAttempts] = values as [string, number];
+      const row = journalByOpTx(operatorTransactionId);
+      if (row && (row.status === "PENDING" || row.status === "FAILED") && row.attempts < maxAttempts) {
+        return [{ id: row.id }];
+      }
+    }
+    return [];
+  },
 };
+
+/** Late-bound accessor so {@link prismaFake}'s `$transaction` doesn't self-reference its initializer. */
+function txClient(): unknown {
+  return prismaFake;
+}
 
 // ── Test helpers ───────────────────────────────────────────────────────────
 export function resetDb(): void {

@@ -23,5 +23,8 @@
     }
   },
   "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
-  "exclude": ["node_modules"]
+  // The standalone Fastify gateway (Zone 2) is a separate workspace with its OWN tsconfig,
+  // dependencies and build. The Next.js app (Zone 3) is decoupled from it and must never
+  // type-check or bundle it — keeping the boundary the migration enforces.
+  "exclude": ["node_modules", "apps"]
 }
