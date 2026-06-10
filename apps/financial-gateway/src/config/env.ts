@@ -55,10 +55,14 @@ const envSchema = z.object({
   RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
 
   // ── Admin / Day-2 ops API (DLQ management) ──────────────────────────────────────
-  // Shared bearer token for the internal admin API (sent as X-Admin-Token). PLACEHOLDER auth:
-  // when UNSET the admin surface is LOCKED (every request → 403). Keep the API on an
-  // internal-only network boundary regardless. TODO(security): replace with real RBAC/mTLS/SSO.
-  ADMIN_API_TOKEN: z.string().min(1).optional(),
+  // HS256 signing secret for ADMIN JWTs (Authorization: Bearer <jwt> with role:"admin").
+  // DELIBERATELY a separate secret from the player-facing JWT_SECRET: possession of the
+  // player token signing key must never be sufficient to mint admin access. When UNSET the
+  // admin surface is LOCKED (every request → 403) — fail closed. Keep the API on an
+  // internal-only network boundary regardless.
+  ADMIN_JWT_SECRET: z.string().min(16, "ADMIN_JWT_SECRET must be at least 16 characters").optional(),
+  // Admin access-token lifetime. Admin sessions are operator actions — keep them SHORT.
+  ADMIN_JWT_TTL: z.string().default("15m"),
 
   // ── Data retention — outbox sweeper (Day-2 ops) ─────────────────────────────────
   // The retention worker (src/workers/retention.worker.ts) periodically hard-deletes
