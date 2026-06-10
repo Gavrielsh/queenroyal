@@ -2,6 +2,7 @@ import { buildApp } from "./app";
 import { getEnv } from "./config/env";
 import { disconnectPrisma } from "./lib/prisma";
 import { disconnectRedis } from "./lib/redis";
+import { startRetentionWorker, stopRetentionWorker } from "./workers/retention.worker";
 
 /**
  * Process entrypoint for the standalone financial gateway.
@@ -40,10 +41,13 @@ async function main(): Promise<void> {
 
     try {
       // Strict, sequential teardown order:
-      //   1. app.close()          — stop accepting new sockets; let in-flight requests finish.
-      //   2. redis.quit()         — release replay / rate-limit / breaker state (drains replies).
-      //   3. prisma.$disconnect() — close the Postgres/PgBouncer pool LAST, once nothing needs it.
+      //   1. app.close()             — stop accepting new sockets; let in-flight requests finish.
+      //   2. stopRetentionWorker()   — stop the outbox sweeper and wait out any in-flight sweep,
+      //                                so the Prisma pool below never closes under a live query.
+      //   3. redis.quit()            — release replay / rate-limit / breaker state (drains replies).
+      //   4. prisma.$disconnect()    — close the Postgres/PgBouncer pool LAST, once nothing needs it.
       await app.close();
+      await stopRetentionWorker();
       await disconnectRedis();
       await disconnectPrisma();
 
@@ -74,6 +78,10 @@ async function main(): Promise<void> {
     app.log.fatal({ err }, "failed to start listening");
     process.exit(1);
   }
+
+  // Day-2 housekeeping: sweep aged-out SUCCEEDED outbox rows. Started only once the server is
+  // actually serving (a boot that fails to listen never opens a DB pool just to clean up).
+  startRetentionWorker();
 }
 
 void main();

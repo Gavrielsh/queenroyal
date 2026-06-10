@@ -167,6 +167,17 @@ export const prismaFake = {
       if (typeof take === "number") rows = rows.slice(0, take);
       return rows.map((r) => ({ ...r }));
     },
+    // Bulk delete (retention sweeper): remove every row matching `where`, return the count.
+    deleteMany: async ({ where }: any) => {
+      let count = 0;
+      for (const [id, row] of journal) {
+        if (!where || matchWhere(row, where)) {
+          journal.delete(id);
+          count += 1;
+        }
+      }
+      return { count };
+    },
   },
 
   // Interactive transaction: the fake has no real isolation, so it simply runs the callback

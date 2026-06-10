@@ -1,9 +1,8 @@
-import { createHash, timingSafeEqual } from "node:crypto";
-
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 
 import { getEnv } from "../config/env";
+import { AdminRoleError, verifyAdminToken } from "../lib/jwt";
 import { getPrisma } from "../lib/prisma";
 import { getReconcileQueue, type ReconcileQueue, ReconcileQueueUnavailableError } from "../lib/reconcile-queue";
 import { errBody, okBody } from "../lib/reply";
@@ -21,13 +20,12 @@ import { errBody, okBody } from "../lib/reply";
  * the broker is unavailable, rolling the row back so it stays a replayable `ABANDONED` rather than
  * a stuck `PENDING` with no event to drive it.
  *
- * AUTH IS A STRICT PLACEHOLDER: a single shared bearer token (X-Admin-Token === ADMIN_API_TOKEN),
- * constant-time compared. When ADMIN_API_TOKEN is unset the surface is LOCKED (403).
- * TODO(security): replace with real admin RBAC / mTLS / SSO and keep this router behind an
- * internal-only network boundary.
+ * AUTH: JWT-based admin authentication. Every request must carry `Authorization: Bearer <jwt>`
+ * where the token is HS256-signed with the DEDICATED ADMIN_JWT_SECRET (never the player
+ * JWT_SECRET) and asserts the `role: "admin"` claim. Fails CLOSED: when ADMIN_JWT_SECRET is
+ * unset the surface is LOCKED (403). Keep this router behind an internal-only network boundary
+ * regardless — auth is a layer, not the perimeter.
  */
-
-const ADMIN_TOKEN_HEADER = "x-admin-token";
 
 const listQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(100).default(50),
@@ -44,21 +42,41 @@ export const adminRoutes: FastifyPluginAsync = async (app) => {
 };
 
 /**
- * PLACEHOLDER admin auth — a constant-time shared-token check. Fails CLOSED: with no token
- * configured the whole surface is locked (403). TODO(security): replace with real RBAC/mTLS/SSO.
+ * JWT admin auth. Verifies the `Authorization: Bearer` token against ADMIN_JWT_SECRET (HS256
+ * only) and asserts the `role: "admin"` claim. Fails CLOSED: with no secret configured the
+ * whole surface is locked (403). A cryptographically-valid token WITHOUT the admin role is a
+ * distinct 403 (authenticated but not authorised), never a 401.
  */
 async function requireAdmin(req: FastifyRequest, reply: FastifyReply): Promise<void> {
-  const configured = getEnv().ADMIN_API_TOKEN;
-  if (!configured) {
-    req.log.error("admin API called but ADMIN_API_TOKEN is not configured — surface locked");
+  if (!getEnv().ADMIN_JWT_SECRET) {
+    req.log.error("admin API called but ADMIN_JWT_SECRET is not configured — surface locked");
     await reply.code(403).send(errBody("ADMIN_API_DISABLED", "Admin API is not configured"));
     return;
   }
-  const provided = req.headers[ADMIN_TOKEN_HEADER];
-  if (typeof provided !== "string" || !constantTimeEquals(provided, configured)) {
+
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith("Bearer ")) {
     await reply.code(401).send(errBody("ADMIN_UNAUTHORIZED", "Invalid or missing admin credentials"));
     return;
   }
+  const token = header.slice("Bearer ".length).trim();
+
+  let claims;
+  try {
+    claims = verifyAdminToken(token);
+  } catch (err) {
+    if (err instanceof AdminRoleError) {
+      await reply.code(403).send(errBody("ADMIN_FORBIDDEN", "Token does not grant admin access"));
+      return;
+    }
+    // Anything else (bad signature, expired, malformed) is an authentication failure. The
+    // verify error itself is never echoed to the caller.
+    await reply.code(401).send(errBody("ADMIN_UNAUTHORIZED", "Invalid or missing admin credentials"));
+    return;
+  }
+
+  // Bind the operator identity to the request log so every admin action is attributable.
+  req.log = req.log.child({ admin_sub: claims.sub });
 }
 
 /** GET /api/admin/dlq — page through intents currently parked as ABANDONED. */
@@ -161,14 +179,4 @@ async function replayHandler(req: FastifyRequest, reply: FastifyReply): Promise<
   await reply.code(200).send(
     okBody({ id, operatorTransactionId: row.operatorTransactionId, status: "PENDING", enqueued: true }),
   );
-}
-
-/**
- * Constant-time token comparison. Hash both sides to fixed-length digests first so timingSafeEqual
- * never throws on a length mismatch (and the comparison does not leak the token length).
- */
-function constantTimeEquals(a: string, b: string): boolean {
-  const ha = createHash("sha256").update(a).digest();
-  const hb = createHash("sha256").update(b).digest();
-  return timingSafeEqual(ha, hb);
 }
