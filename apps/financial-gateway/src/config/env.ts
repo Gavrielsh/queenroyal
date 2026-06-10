@@ -60,6 +60,15 @@ const envSchema = z.object({
   // internal-only network boundary regardless. TODO(security): replace with real RBAC/mTLS/SSO.
   ADMIN_API_TOKEN: z.string().min(1).optional(),
 
+  // ── Data retention — outbox sweeper (Day-2 ops) ─────────────────────────────────
+  // The retention worker (src/workers/retention.worker.ts) periodically hard-deletes
+  // SUCCEEDED EngineRequestLog rows once they are older than this, to stop unbounded
+  // outbox growth. ONLY terminally-successful rows are eligible — failures and DLQ rows
+  // (ABANDONED) are kept for operators. Age is measured against `updatedAt`.
+  RETENTION_MAX_AGE_DAYS: z.coerce.number().int().positive().default(30),
+  // Sweep cadence (ms). Env-driven (not hardcoded) like SHUTDOWN_TIMEOUT_MS. Default 24h.
+  RETENTION_SWEEP_INTERVAL_MS: z.coerce.number().int().positive().default(24 * 60 * 60 * 1000),
+
   // ── Event-driven reconciler / Redis-Streams broker (Phase 5) ──────────────────────
   // The reconciler is a long-lived CONSUMER (no DB polling, no cron): it blocks on the
   // Redis Stream and reacts to producer events. These tune the consume loop and the DLQ.
