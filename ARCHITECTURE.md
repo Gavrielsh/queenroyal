@@ -42,7 +42,7 @@ bypasses it.)*
 | `POST /api/v1/bet`            | Debit a wager (GC or SC family).                         |
 | `POST /api/v1/win`            | Credit a win (SC wins land in SC_REDEEMABLE).            |
 | `POST /api/v1/rollback`       | Reverse a committed BET by its `ledger_transaction_id`.  |
-| `GET  /api/v1/session`        | Read balances (`?player_id=`).                           |
+| `POST /api/v1/session`        | Read balances (`{"player_id"}` in the signed body — a GET's empty-body MAC would authenticate nothing). |
 | `POST /api/v1/player/create`  | Provision a player (idempotent on `external_id`).        |
 | `POST /api/v1/store/purchase` | Fiat purchase → issue GC (+ optional SC_UNPLAYED promo). |
 | `POST /api/v1/store/redeem`   | Fiat redemption from SC_REDEEMABLE only.                 |

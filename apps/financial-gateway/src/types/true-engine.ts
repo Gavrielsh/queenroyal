@@ -58,6 +58,22 @@ export interface RollbackPayload {
   metadata?: EngineMetadata;
 }
 
+/**
+ * POST /api/v1/session — non-locking balance snapshot. POST (not GET) because the engine's
+ * HMAC covers only the raw body: the player id must travel INSIDE the signed body to be
+ * authenticated at all.
+ */
+export interface SessionPayload {
+  player_id: string;
+}
+
+/** POST /api/v1/session 2xx body (flat — NOT wrapped in `result`). */
+export interface SessionBalancesResult {
+  code: string; // "OK"
+  player_id: string;
+  balances: EngineBalances;
+}
+
 /** POST /api/v1/player/create — provision a player (idempotent on external_id). */
 export interface CreatePlayerPayload {
   external_id: string; // our local user id

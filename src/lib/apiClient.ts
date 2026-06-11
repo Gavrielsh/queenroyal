@@ -96,3 +96,39 @@ export const apiClient = {
   put: <TResponse>(path: string, body: unknown) => request<TResponse>("PUT", path, body),
   delete: <TResponse>(path: string) => request<TResponse>("DELETE", path),
 } as const;
+
+// ── Wallet mirror ────────────────────────────────────────────────────────────
+
+/** Gateway envelope for GET /api/wallet. Balances are the engine's decimal STRINGS. */
+interface WalletEnvelope {
+  success: true;
+  data: {
+    player_id: string;
+    balances: {
+      gc: string;
+      sc_unplayed: string;
+      sc_redeemable: string;
+    };
+  };
+}
+
+export interface WalletBalancesDto {
+  gc: string;
+  scUnplayed: string;
+  scRedeemable: string;
+}
+
+/**
+ * Fetch the authoritative wallet snapshot from the gateway (which reads it from the Go
+ * ledger). The strings are renamed to camelCase but NEVER parsed into numbers — Zone 3
+ * renders money, it does not compute it.
+ */
+export async function fetchWalletBalances(): Promise<WalletBalancesDto> {
+  const res = await apiClient.get<WalletEnvelope>("/wallet");
+  const { balances } = res.data;
+  return {
+    gc: balances.gc,
+    scUnplayed: balances.sc_unplayed,
+    scRedeemable: balances.sc_redeemable,
+  };
+}

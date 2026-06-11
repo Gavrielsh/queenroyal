@@ -2,37 +2,22 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { apiClient, ApiError } from "@/lib/apiClient";
-import {
-  InsufficientFundsError,
-  useWalletStore,
-  type Currency,
-} from "@/store/useWalletStore";
-
-/** Wager every spin of the mock slot places against the gateway ledger. */
-const SPIN_COST = 10;
-const SPIN_CURRENCY: Currency = "GC";
-const GAME_ID = "mock-slot-1";
-
-interface BetRequest {
-  amount: number;
-  currency: Currency;
-  gameId: string;
-}
+import { ApiError, fetchWalletBalances } from "@/lib/apiClient";
+import { useWalletStore } from "@/store/useWalletStore";
 
 /**
- * Settled-bet response from the gateway. The ledger is the source of truth, so
- * the gateway echoes back the exact post-bet balances and we overwrite the
- * local mirror with them.
+ * Dev harness for the Zone 3 wallet mirror.
+ *
+ * ARCHITECTURE NOTE — why this component places no bets:
+ * Real wagers NEVER originate in the browser. A spin is settled provider-side: the game
+ * aggregator's server calls the gateway's HMAC-verified webhook (`POST
+ * /api/webhooks/provider/spin`), the gateway debits/credits the Go ledger, and the ledger's
+ * post-balances become the truth. The browser's only money operation is the read:
+ * `GET /api/wallet` → mirror → render. This window demonstrates exactly that loop — spin
+ * animation for feel, then a re-fetch of the authoritative balances. No optimistic
+ * deduction, no local win math, no client-supplied amounts.
  */
-interface BetResponse {
-  balances: {
-    gc: number;
-    scUnplayed: number;
-    scRedeemable: number;
-  };
-  winAmount?: number;
-}
+const GAME_ID = "mock-slot-1";
 
 interface Toast {
   kind: "error" | "success";
@@ -41,18 +26,20 @@ interface Toast {
 
 const REEL_SYMBOLS = ["🍒", "💎", "7️⃣", "🔔", "👑", "🍋"] as const;
 
-function formatBalance(value: number): string {
-  return value.toLocaleString("en-US", { maximumFractionDigits: 2 });
+/**
+ * Display-format an engine decimal string ("1234.5000") with thousands separators using
+ * pure string operations — money strings are never parsed into floats, even for rendering.
+ */
+function formatBalance(value: string): string {
+  const [whole = "0", fraction = ""] = value.split(".");
+  const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const trimmed = fraction.replace(/0+$/, "");
+  return trimmed ? `${grouped}.${trimmed}` : grouped;
 }
 
-/**
- * Mock slot machine used to exercise the end-to-end bet flow against the
- * financial gateway: optimistic deduct → POST /bet → sync-or-rollback.
- */
 export function MockGameWindow() {
-  const gcBalance = useWalletStore((s) => s.gcBalance);
-  const scUnplayed = useWalletStore((s) => s.scUnplayed);
-  const scRedeemable = useWalletStore((s) => s.scRedeemable);
+  const balances = useWalletStore((s) => s.balances);
+  const status = useWalletStore((s) => s.status);
 
   const [isSpinning, setIsSpinning] = useState(false);
   const [reels, setReels] = useState<readonly [string, string, string]>(["👑", "👑", "👑"]);
@@ -71,24 +58,36 @@ export function MockGameWindow() {
     toastTimer.current = setTimeout(() => setToast(null), 4_000);
   }, []);
 
+  /** Pull the authoritative snapshot from the gateway and overwrite the mirror. */
+  const syncWallet = useCallback(async (): Promise<boolean> => {
+    const { beginSync, setBalances, failSync } = useWalletStore.getState();
+    beginSync();
+    try {
+      setBalances(await fetchWalletBalances());
+      return true;
+    } catch (error) {
+      failSync();
+      showToast({
+        kind: "error",
+        message:
+          error instanceof ApiError && error.status === 401
+            ? "Log in to see your wallet."
+            : "Could not reach the cashier — balances may be stale.",
+      });
+      return false;
+    }
+  }, [showToast]);
+
+  // Hydrate the mirror on mount; production would refresh on a realtime channel instead.
+  useEffect(() => {
+    void syncWallet();
+  }, [syncWallet]);
+
   const handleSpin = useCallback(async () => {
     if (isSpinning) return;
-
-    const { optimisticDeduct, setBalances } = useWalletStore.getState();
-
-    // (a) Optimistic deduction — the UI drops the wager instantly.
-    let rollback: () => void;
-    try {
-      rollback = optimisticDeduct(SPIN_COST, SPIN_CURRENCY);
-    } catch (error) {
-      if (error instanceof InsufficientFundsError) {
-        showToast({ kind: "error", message: "Insufficient GC balance — visit the cashier." });
-        return;
-      }
-      throw error;
-    }
-
     setIsSpinning(true);
+
+    // Animation only — the round itself settles provider-side against the ledger.
     const spinAnimation = setInterval(() => {
       setReels([
         REEL_SYMBOLS[Math.floor(Math.random() * REEL_SYMBOLS.length)] ?? "👑",
@@ -98,34 +97,15 @@ export function MockGameWindow() {
     }, 80);
 
     try {
-      // (b) Settle the bet against the gateway ledger.
-      const result = await apiClient.post<BetResponse>("/bet", {
-        amount: SPIN_COST,
-        currency: SPIN_CURRENCY,
-        gameId: GAME_ID,
-      } satisfies BetRequest);
-
-      // (c) Success — the ledger's numbers win; overwrite the optimistic mirror.
-      setBalances(result.balances.gc, result.balances.scUnplayed, result.balances.scRedeemable);
-
-      if (result.winAmount && result.winAmount > 0) {
-        showToast({ kind: "success", message: `WINNER! +${formatBalance(result.winAmount)} GC` });
-      }
-    } catch (error) {
-      // (d) Rejection — undo the optimistic deduction and tell the player.
-      rollback();
-      const message =
-        error instanceof ApiError && error.code === "INSUFFICIENT_FUNDS"
-          ? "Insufficient funds — the ledger rejected this bet."
-          : error instanceof ApiError && error.status === 0
-            ? "Connection lost — your balance was not charged."
-            : "Spin failed — your balance was not charged.";
-      showToast({ kind: "error", message });
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      // After the (out-of-band) round settles, the ledger is the only truth: re-fetch it.
+      const ok = await syncWallet();
+      if (ok) showToast({ kind: "success", message: "Wallet mirror synced with the ledger." });
     } finally {
       clearInterval(spinAnimation);
       setIsSpinning(false);
     }
-  }, [isSpinning, showToast]);
+  }, [isSpinning, showToast, syncWallet]);
 
   return (
     <div className="relative w-full max-w-md rounded-3xl border border-amber-500/30 bg-gradient-to-b from-zinc-900 via-zinc-950 to-black p-6 shadow-[0_0_60px_-15px_rgba(245,158,11,0.4)]">
@@ -137,12 +117,26 @@ export function MockGameWindow() {
         <p className="mt-1 text-[10px] uppercase tracking-[0.3em] text-zinc-500">Mock Slot · {GAME_ID}</p>
       </div>
 
-      {/* Live balances (read straight from the wallet mirror) */}
-      <div className="mb-6 grid grid-cols-3 gap-2">
-        <BalanceChip label="GC" value={gcBalance} accent="text-amber-300" />
-        <BalanceChip label="SC Unplayed" value={scUnplayed} accent="text-emerald-300" />
-        <BalanceChip label="SC Redeemable" value={scRedeemable} accent="text-sky-300" />
+      {/* Live balances — a verbatim render of the ledger's strings, or honest placeholders. */}
+      <div className="mb-2 grid grid-cols-3 gap-2">
+        <BalanceChip label="GC" value={balances ? formatBalance(balances.gc) : "—"} accent="text-amber-300" />
+        <BalanceChip
+          label="SC Unplayed"
+          value={balances ? formatBalance(balances.scUnplayed) : "—"}
+          accent="text-emerald-300"
+        />
+        <BalanceChip
+          label="SC Redeemable"
+          value={balances ? formatBalance(balances.scRedeemable) : "—"}
+          accent="text-sky-300"
+        />
       </div>
+      <p className="mb-6 text-center text-[9px] uppercase tracking-wider text-zinc-600">
+        {status === "synced" && "ledger-synced"}
+        {status === "syncing" && "syncing…"}
+        {status === "error" && "stale — last sync failed"}
+        {status === "empty" && "not synced"}
+      </p>
 
       {/* Reels */}
       <div className="mb-6 flex justify-center gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/80 p-4">
@@ -165,7 +159,7 @@ export function MockGameWindow() {
         disabled={isSpinning}
         className="w-full rounded-2xl bg-gradient-to-r from-amber-500 via-yellow-400 to-amber-500 py-4 text-lg font-black tracking-widest text-zinc-950 shadow-lg shadow-amber-500/25 transition active:scale-[0.98] enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
       >
-        {isSpinning ? "SPINNING…" : `SPIN (Cost: ${SPIN_COST} ${SPIN_CURRENCY})`}
+        {isSpinning ? "SPINNING…" : "SPIN (settles provider-side)"}
       </button>
 
       {/* Toast */}
@@ -185,11 +179,11 @@ export function MockGameWindow() {
   );
 }
 
-function BalanceChip({ label, value, accent }: { label: string; value: number; accent: string }) {
+function BalanceChip({ label, value, accent }: { label: string; value: string; accent: string }) {
   return (
     <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 px-2 py-2 text-center">
       <p className="text-[9px] uppercase tracking-wider text-zinc-500">{label}</p>
-      <p className={`truncate text-sm font-bold tabular-nums ${accent}`}>{formatBalance(value)}</p>
+      <p className={`truncate text-sm font-bold tabular-nums ${accent}`}>{value}</p>
     </div>
   );
 }
