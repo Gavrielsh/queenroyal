@@ -3,92 +3,68 @@ import { create } from "zustand";
 /**
  * Client-side mirror of the player's wallet (Zone 3 ONLY).
  *
- * The single source of truth is the Go double-entry ledger behind the financial
- * gateway — this store never *computes* a balance, it only mirrors what the
- * gateway last reported, plus short-lived optimistic deductions for instant UI
- * feedback. Every settled response from the gateway must overwrite this mirror
- * via `setBalances`.
+ * NON-NEGOTIABLE: this store never computes money. The single source of truth is the Go
+ * double-entry ledger behind the financial gateway; balances arrive as 4-decimal-place
+ * decimal STRINGS (e.g. "1234.5000") and are stored and rendered VERBATIM. There is no
+ * arithmetic in this store — no optimistic deduction, no win crediting, no allocation
+ * logic. The only mutation is overwriting the whole mirror with what the gateway last
+ * reported, plus a sync-status flag so the UI can show staleness honestly.
  */
 
 /** Sweeps-model currencies: Gold Coins (play) and Sweeps Coins (promotional). */
 export type Currency = "GC" | "SC";
 
+/** Engine-authoritative balances, kept as the engine's decimal strings. */
 export interface WalletBalances {
-  /** Gold Coin balance (entertainment currency). */
-  gcBalance: number;
+  /** Gold Coin balance (entertainment currency), e.g. "1000.0000". */
+  gc: string;
   /** Sweeps Coins that still carry a playthrough requirement. */
-  scUnplayed: number;
+  scUnplayed: string;
   /** Sweeps Coins eligible for prize redemption. */
-  scRedeemable: number;
+  scRedeemable: string;
 }
 
-/**
- * Undo handle returned by `optimisticDeduct`. Calling it restores the exact
- * pre-deduction snapshot — used when the gateway rejects the bet.
- */
-export type RollbackFn = () => void;
+export type WalletSyncStatus =
+  /** Nothing fetched yet — render placeholders, never zeros (a zero is a claim). */
+  | "empty"
+  /** A fetch is in flight; the displayed values may be stale. */
+  | "syncing"
+  /** The mirror equals the gateway's last authoritative response. */
+  | "synced"
+  /** The last fetch failed — the mirror is stale and the UI must say so. */
+  | "error";
 
 export interface WalletActions {
-  /** Overwrite the mirror with authoritative balances from the gateway. */
-  setBalances: (gc: number, scUnplayed: number, scRedeemable: number) => void;
-  /**
-   * Instantly deduct a wager from the local mirror while the gateway settles
-   * the bet. GC comes out of `gcBalance`; SC drains `scUnplayed` first, then
-   * `scRedeemable` (standard sweeps playthrough order).
-   *
-   * Throws if the mirror shows insufficient funds — callers should not even
-   * send the bet in that case. Returns a rollback to undo on server rejection.
-   */
-  optimisticDeduct: (amount: number, currency: Currency) => RollbackFn;
+  /** Mark a fetch as started (UI shows the stale/loading state). */
+  beginSync: () => void;
+  /** Overwrite the mirror with authoritative balances from the gateway, verbatim. */
+  setBalances: (balances: WalletBalances) => void;
+  /** Mark the last fetch as failed; existing values are kept but flagged stale. */
+  failSync: () => void;
+  /** Drop everything (logout). */
+  reset: () => void;
 }
 
-export type WalletStore = WalletBalances & WalletActions;
-
-export class InsufficientFundsError extends Error {
-  constructor(public readonly currency: Currency, public readonly requested: number) {
-    super(`Insufficient ${currency} balance for wager of ${requested}`);
-    this.name = "InsufficientFundsError";
-  }
+export interface WalletState {
+  balances: WalletBalances | null;
+  status: WalletSyncStatus;
 }
 
-const initialBalances: WalletBalances = {
-  gcBalance: 0,
-  scUnplayed: 0,
-  scRedeemable: 0,
+export type WalletStore = WalletState & WalletActions;
+
+const initialState: WalletState = {
+  balances: null,
+  status: "empty",
 };
 
-export const useWalletStore = create<WalletStore>()((set, get) => ({
-  ...initialBalances,
+export const useWalletStore = create<WalletStore>()((set) => ({
+  ...initialState,
 
-  setBalances: (gc, scUnplayed, scRedeemable) =>
-    set({ gcBalance: gc, scUnplayed, scRedeemable }),
+  beginSync: () => set({ status: "syncing" }),
 
-  optimisticDeduct: (amount, currency) => {
-    if (!Number.isFinite(amount) || amount <= 0) {
-      throw new RangeError(`Wager must be a positive finite number, got ${amount}`);
-    }
+  setBalances: (balances) => set({ balances, status: "synced" }),
 
-    const snapshot: WalletBalances = {
-      gcBalance: get().gcBalance,
-      scUnplayed: get().scUnplayed,
-      scRedeemable: get().scRedeemable,
-    };
+  failSync: () => set({ status: "error" }),
 
-    if (currency === "GC") {
-      if (snapshot.gcBalance < amount) throw new InsufficientFundsError("GC", amount);
-      set({ gcBalance: snapshot.gcBalance - amount });
-    } else {
-      const totalSc = snapshot.scUnplayed + snapshot.scRedeemable;
-      if (totalSc < amount) throw new InsufficientFundsError("SC", amount);
-      const fromUnplayed = Math.min(snapshot.scUnplayed, amount);
-      set({
-        scUnplayed: snapshot.scUnplayed - fromUnplayed,
-        scRedeemable: snapshot.scRedeemable - (amount - fromUnplayed),
-      });
-    }
-
-    // Restores the pre-bet snapshot. Only call when the gateway REJECTED the
-    // bet — on success, sync with the server's balances instead.
-    return () => set(snapshot);
-  },
+  reset: () => set(initialState),
 }));

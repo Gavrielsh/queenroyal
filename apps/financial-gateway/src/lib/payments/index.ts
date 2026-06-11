@@ -23,6 +23,12 @@ export function getPaymentProvider(): PaymentProvider {
       webhookSecret: env.STRIPE_WEBHOOK_SECRET,
     });
   } else {
+    // The mock PSP auto-settles purchases — in production that would mint coins for free.
+    if (env.NODE_ENV === "production") {
+      throw new PaymentProviderNotConfiguredError(
+        "PAYMENT_PROVIDER=mock is forbidden in production — configure PAYMENT_PROVIDER=stripe",
+      );
+    }
     instance = new MockPaymentProvider(env.PSP_WEBHOOK_SECRET ?? "mock_psp_dev_secret");
   }
   return instance;

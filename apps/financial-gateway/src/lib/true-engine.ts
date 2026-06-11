@@ -9,6 +9,8 @@ import type {
   EngineTxResult,
   PurchasePayload,
   RollbackPayload,
+  SessionBalancesResult,
+  SessionPayload,
   TrueEngineErrorBody,
   TrueEngineResult,
   WinPayload,
@@ -37,6 +39,7 @@ const ENGINE_ENDPOINTS = {
   rollback: "/api/v1/rollback",
   purchase: "/api/v1/store/purchase",
   createPlayer: "/api/v1/player/create",
+  session: "/api/v1/session",
 } as const;
 
 export class TrueEngineClient {
@@ -81,6 +84,15 @@ export class TrueEngineClient {
    */
   async createPlayer(payload: CreatePlayerPayload): Promise<TrueEngineResult<CreatePlayerResult>> {
     return this.post<CreatePlayerResult>(ENGINE_ENDPOINTS.createPlayer, payload);
+  }
+
+  /**
+   * Non-locking balance snapshot, for mirroring the ledger to the frontend. Read-only and
+   * side-effect free, so it needs no idempotency anchor and is always safe to retry. The
+   * response is flat (not wrapped in `result`), like createPlayer.
+   */
+  getBalances(payload: SessionPayload): Promise<TrueEngineResult<SessionBalancesResult>> {
+    return this.post<SessionBalancesResult>(ENGINE_ENDPOINTS.session, payload);
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────────

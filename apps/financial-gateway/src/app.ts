@@ -13,6 +13,7 @@ import { adminRoutes } from "./routes/admin";
 import { authRoutes } from "./routes/auth";
 import { healthRoutes } from "./routes/health";
 import { storeRoutes } from "./routes/store";
+import { walletRoutes } from "./routes/wallet";
 import { webhookRoutes } from "./routes/webhooks";
 
 /**
@@ -114,6 +115,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(webhookRoutes);
   await app.register(authRoutes);
   await app.register(storeRoutes);
+  await app.register(walletRoutes);
   await app.register(adminRoutes);
 
   return app;
