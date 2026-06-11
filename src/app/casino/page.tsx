@@ -9,8 +9,7 @@ import { useWalletStore } from "@/store/useWalletStore";
  * login; the dev-only seed button below substitutes for that during E2E testing.
  */
 export default function CasinoPage() {
-  const setBalances = useWalletStore((s) => s.setBalances);
-
+  const setBalances = useWalletStore((s: any) => s.setBalances);
   return (
     <main className="flex min-h-screen flex-col items-center justify-center gap-10 bg-black px-4 py-16">
       <MockGameWindow />
