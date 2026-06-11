@@ -1,4 +1,14 @@
+import { resolve } from "node:path";
+
+import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
+
+/**
+ * Load `apps/financial-gateway/.env` before any Zod parsing. `override: true` ensures the
+ * gateway's own contract wins over a repo-root `.env` that an IDE or shell may have injected
+ * (common in monorepos). Path is anchored to this file, not `process.cwd()`.
+ */
+loadDotenv({ path: resolve(__dirname, "../../.env"), override: true });
 
 /**
  * Strict, fail-closed environment contract (guardrail: ZERO IMPLICIT ANY — every boundary is
@@ -181,13 +191,41 @@ let cached: Env | null = null;
  * Parse and cache `process.env` exactly once. Throws (fail closed) on any invalid/missing
  * variable, with a precise, secret-free message naming the offending keys.
  */
+/**
+ * Normalize a raw env string: trim, drop inline `#` comments (a common `.env` footgun when
+ * editors copy example lines like `LOG_LEVEL=info  # options…`), and unwrap surrounding quotes.
+ */
+function sanitizeEnvValue(value: string): string {
+  let v = value.trim();
+  // Inline comment — only when preceded by whitespace (so URLs like redis://host:6379#0 stay intact).
+  const commentAt = v.search(/\s+#/);
+  if (commentAt >= 0) v = v.slice(0, commentAt).trim();
+  if (
+    (v.startsWith('"') && v.endsWith('"')) ||
+    (v.startsWith("'") && v.endsWith("'"))
+  ) {
+    v = v.slice(1, -1);
+  }
+  return v.trim();
+}
+
+/** Build a sanitized view of `process.env` for strict Zod parsing. */
+function sanitizedProcessEnv(): NodeJS.ProcessEnv {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) out[key] = sanitizeEnvValue(value);
+  }
+  return out as NodeJS.ProcessEnv;
+}
+
 export function getEnv(): Env {
   if (cached) return cached;
 
+  const env = sanitizedProcessEnv();
   // Accept ENGINE_SECRET as an alias for the canonical ENGINE_SECRET_KEY.
   const raw = {
-    ...process.env,
-    ENGINE_SECRET_KEY: process.env.ENGINE_SECRET_KEY ?? process.env.ENGINE_SECRET,
+    ...env,
+    ENGINE_SECRET_KEY: env.ENGINE_SECRET_KEY ?? env.ENGINE_SECRET,
   };
 
   const parsed = envSchema.safeParse(raw);
