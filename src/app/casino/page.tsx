@@ -9,10 +9,6 @@ import { MockGameWindow } from "@/components/MockGameWindow";
  * mock, and the execution contract forbids those even in dev.
  */
 export default function CasinoPage() {
-<<<<<<< HEAD
-  const setBalances = useWalletStore((s: any) => s.setBalances);
-=======
->>>>>>> claude/zealous-einstein-inqsil
   return (
     <main className="flex min-h-screen flex-col items-center justify-center gap-10 bg-black px-4 py-16">
       <MockGameWindow />
