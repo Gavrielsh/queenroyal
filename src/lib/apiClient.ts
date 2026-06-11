@@ -132,3 +132,47 @@ export async function fetchWalletBalances(): Promise<WalletBalancesDto> {
     scRedeemable: balances.sc_redeemable,
   };
 }
+
+// ── Cashier (store) ──────────────────────────────────────────────────────────
+
+/** Gateway envelope for POST /api/store/purchase (async PSP flow: nothing is captured yet). */
+interface PurchaseEnvelope {
+  success: true;
+  data: {
+    status: "requires_payment_confirmation";
+    paymentIntentId: string;
+    clientSecret: string;
+    operatorTransactionId: string;
+  };
+}
+
+export interface PurchaseIntentDto {
+  paymentIntentId: string;
+  /** With a real PSP this is what Stripe.js confirms the card against (3DS/SCA included). */
+  clientSecret: string;
+}
+
+/**
+ * Open a deposit PaymentIntent for a catalog package. The gateway owns the catalog, the
+ * price, and the coin amounts — the browser sends only the package id plus a stable
+ * idempotency key so a double-click can never open (or settle) the deposit twice.
+ */
+export async function initiateStorePurchase(
+  packageId: string,
+  idempotencyKey: string,
+): Promise<PurchaseIntentDto> {
+  const res = await apiClient.post<PurchaseEnvelope>("/store/purchase", { packageId, idempotencyKey });
+  return { paymentIntentId: res.data.paymentIntentId, clientSecret: res.data.clientSecret };
+}
+
+/**
+ * DEV-ONLY stand-in for `stripe.confirmCardPayment(clientSecret)`: asks the gateway's mock
+ * PSP to mark the intent captured and run the same signed-webhook settlement the real Stripe
+ * flow uses. The response carries no balances — the wallet is re-read afterwards.
+ */
+export async function confirmMockStripeDeposit(paymentIntentId: string): Promise<void> {
+  await apiClient.post<{ success: true; data: { status: "settled" } }>(
+    "/store/purchase/mock-confirm",
+    { paymentIntentId },
+  );
+}

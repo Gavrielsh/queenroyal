@@ -115,4 +115,40 @@ describe("auth + store routes (Phase 6 extraction)", () => {
       expect(res.json()).toMatchObject({ success: false, error: { code: "VALIDATION_ERROR" } });
     });
   });
+
+  describe("POST /api/store/purchase/mock-confirm — dev-only settlement stand-in", () => {
+    it("→ 401 UNAUTHORIZED with no Authorization header", async () => {
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/store/purchase/mock-confirm",
+        payload: { paymentIntentId: "pi_whatever" },
+      });
+      expect(res.statusCode).toBe(401);
+      expect(res.json()).toMatchObject({ success: false, error: { code: "UNAUTHORIZED" } });
+    });
+
+    it("→ 422 VALIDATION_ERROR with a valid token but a malformed body", async () => {
+      const token = signAccessToken({ sub: "user-1", email: "p@q.io", kycStatus: "VERIFIED", vipLevel: 0 });
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/store/purchase/mock-confirm",
+        headers: { authorization: `Bearer ${token}` },
+        payload: { notAPaymentIntentId: true },
+      });
+      expect(res.statusCode).toBe(422);
+      expect(res.json()).toMatchObject({ success: false, error: { code: "VALIDATION_ERROR" } });
+    });
+
+    it("→ 404 INTENT_NOT_FOUND for an unknown intent id (mock provider holds no such intent)", async () => {
+      const token = signAccessToken({ sub: "user-1", email: "p@q.io", kycStatus: "VERIFIED", vipLevel: 0 });
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/store/purchase/mock-confirm",
+        headers: { authorization: `Bearer ${token}` },
+        payload: { paymentIntentId: "pi_does_not_exist" },
+      });
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toMatchObject({ success: false, error: { code: "INTENT_NOT_FOUND" } });
+    });
+  });
 });

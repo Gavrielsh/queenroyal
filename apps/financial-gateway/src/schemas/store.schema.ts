@@ -12,3 +12,10 @@ export const purchaseSchema = z.object({
   idempotencyKey: z.string().min(8).max(200).optional(),
 });
 export type PurchaseInput = z.infer<typeof purchaseSchema>;
+
+// Dev-only stand-in for the Stripe.js card confirmation: identifies which previously-opened
+// mock PaymentIntent to advance to `succeeded`. Never used with a real PSP.
+export const mockConfirmSchema = z.object({
+  paymentIntentId: z.string().min(1, "paymentIntentId is required"),
+});
+export type MockConfirmInput = z.infer<typeof mockConfirmSchema>;

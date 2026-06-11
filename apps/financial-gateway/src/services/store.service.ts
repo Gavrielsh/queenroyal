@@ -7,13 +7,17 @@ import type { AuthClaims } from "../lib/jwt";
 import { assertKycAllows, KycGateError } from "../lib/kyc-policy";
 import { childLogger } from "../lib/logger";
 import { wholeCoinsToMoneyString } from "../lib/money";
+import { getPaymentProvider } from "../lib/payments";
+import { MockPaymentProvider } from "../lib/payments/mock";
 import { PaymentProviderError } from "../lib/payments/types";
+import { getPrisma } from "../lib/prisma";
 import { scheduleReconcile } from "../lib/reconcile-queue";
 import type { DepositInstruction } from "../schemas/engine-payloads.schema";
-import type { PurchaseInput } from "../schemas/store.schema";
+import type { MockConfirmInput, PurchaseInput } from "../schemas/store.schema";
 import { openDepositIntent } from "./deposit.service";
 import { beginEngineRequest } from "./engine-journal.service";
 import { ProvisioningError, resolveTransactingPlayer } from "./player-provisioning.service";
+import { handlePspWebhookEvent } from "./psp-webhook.service";
 import type { PurchasePayload, TrueEngineErrorBody } from "../types/true-engine";
 
 export interface PurchaseInitiated {
@@ -178,5 +182,99 @@ export async function purchasePackage(
         priceUsdCents: pkg.priceUsdCents,
       },
     },
+  };
+}
+
+export interface MockDepositSettled {
+  status: "settled";
+  paymentIntentId: string;
+  operatorTransactionId: string;
+  note: string;
+}
+
+export type MockConfirmOutcome =
+  | { ok: true; data: MockDepositSettled }
+  | { ok: false; status: number; error: TrueEngineErrorBody };
+
+/**
+ * DEV-ONLY cashier helper: stands in for the customer confirming the card AND the PSP firing
+ * `payment_intent.succeeded`, in one authenticated call.
+ *
+ * With the real Stripe provider the frontend confirms via Stripe.js with the `client_secret`
+ * and Stripe delivers the webhook; the mock provider has no card UI, so this advances the
+ * mock intent and pushes the resulting SIGNED webhook through the exact same verification +
+ * settlement seam (`parseWebhook` → `handlePspWebhookEvent`). No alternative credit path is
+ * introduced — the ledger credit remains the single idempotent webhook settlement.
+ *
+ * Refuses to run against a real PSP (409). The mock provider is itself forbidden in
+ * production (see lib/payments), so this can never mint coins against real money.
+ */
+export async function confirmMockDeposit(
+  user: AuthClaims,
+  input: MockConfirmInput,
+  ctx: FlowContext = {},
+): Promise<MockConfirmOutcome> {
+  const flowLog = childLogger({ trace_id: ctx.traceId, user_id: user.sub, payment_intent_id: input.paymentIntentId });
+
+  const provider = getPaymentProvider();
+  if (!(provider instanceof MockPaymentProvider)) {
+    return {
+      ok: false,
+      status: 409,
+      error: { code: "MOCK_PSP_ONLY", message: "Mock confirmation is only available with the mock payment provider" },
+    };
+  }
+
+  const notFound: MockConfirmOutcome = {
+    ok: false,
+    status: 404,
+    error: { code: "INTENT_NOT_FOUND", message: "No such payment intent" },
+  };
+
+  const snapshot = await provider.retrievePaymentIntent(input.paymentIntentId);
+  if (!snapshot) return notFound;
+
+  const operatorTransactionId = snapshot.metadata.operator_transaction_id;
+  if (!operatorTransactionId) return notFound;
+
+  // Ownership gate: only the player who opened the deposit may settle it (mirrors Stripe,
+  // where only the holder of the client_secret can confirm the intent).
+  let player;
+  try {
+    player = await resolveTransactingPlayer(user.sub);
+  } catch (err) {
+    if (err instanceof ProvisioningError) {
+      return {
+        ok: false,
+        status: 404,
+        error: { code: "PLAYER_NOT_FOUND", message: "Player is not provisioned in the ledger", details: err.message },
+      };
+    }
+    throw err;
+  }
+  const row = await getPrisma().engineRequestLog.findUnique({ where: { operatorTransactionId } });
+  // A foreign intent id gets the same 404 as a missing one, so it leaks nothing.
+  if (!row || row.type !== "DEPOSIT" || row.playerId !== player.trueEnginePlayerId) return notFound;
+
+  provider.markIntentSucceeded(input.paymentIntentId);
+  const { rawBody, signature } = provider.buildSignedWebhook(input.paymentIntentId, "payment_intent.succeeded");
+  const event = provider.parseWebhook(rawBody, signature);
+
+  const outcome = await handlePspWebhookEvent(event, ctx.traceId);
+  if (!outcome.handled) {
+    // Capture is already "succeeded" at the mock PSP; the webhook handler has journaled the
+    // failure and handed the credit to the reconciler — surface that honestly.
+    flowLog.error({ note: outcome.note }, "mock deposit confirmed but settlement did not complete");
+    return {
+      ok: false,
+      status: 502,
+      error: { code: "SETTLEMENT_FAILED", message: "Capture succeeded but the ledger credit did not settle", details: outcome.note },
+    };
+  }
+
+  flowLog.info({ operator_transaction_id: operatorTransactionId, note: outcome.note }, "mock deposit settled");
+  return {
+    ok: true,
+    data: { status: "settled", paymentIntentId: input.paymentIntentId, operatorTransactionId, note: outcome.note },
   };
 }
