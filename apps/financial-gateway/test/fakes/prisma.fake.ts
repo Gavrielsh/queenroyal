@@ -113,8 +113,39 @@ function readRawQuery(q: any, rest: unknown[]): { text: string; values: unknown[
 export const prismaFake = {
   user: {
     findUnique: async ({ where }: any) => {
+      if (where.email !== undefined) {
+        for (const u of users.values()) if (u.email === where.email) return { ...u };
+        return null;
+      }
       const u = users.get(where.id);
       return u ? { ...u } : null;
+    },
+    // Upsert by unique email (mockLogin) or id, filling Prisma schema defaults on create.
+    upsert: async ({ where, create, update }: any) => {
+      let existing: AnyRow | undefined;
+      if (where.email !== undefined) {
+        existing = [...users.values()].find((u) => u.email === where.email);
+      } else {
+        existing = users.get(where.id);
+      }
+      if (existing) {
+        applyData(existing, update);
+        existing.updatedAt = new Date();
+        return { ...existing };
+      }
+      const now = new Date();
+      const row: AnyRow = {
+        id: create.id ?? randomUUID(),
+        email: create.email ?? null,
+        passwordHash: create.passwordHash ?? null,
+        kycStatus: create.kycStatus ?? "PENDING",
+        vipLevel: create.vipLevel ?? 0,
+        trueEnginePlayerId: create.trueEnginePlayerId ?? null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      users.set(row.id, row);
+      return { ...row };
     },
     update: async ({ where, data }: any) => {
       const u = users.get(where.id);

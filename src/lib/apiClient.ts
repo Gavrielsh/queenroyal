@@ -97,6 +97,51 @@ export const apiClient = {
   delete: <TResponse>(path: string) => request<TResponse>("DELETE", path),
 } as const;
 
+// ── Dev-only session bootstrap ───────────────────────────────────────────────
+
+/**
+ * Check the access token's `exp` with a plain base64url decode — NO signature verification
+ * (the gateway is the only verifier; this is purely a UX freshness probe so we know when to
+ * re-login). 30s of slack treats a token about to lapse mid-flow as already dead.
+ */
+function tokenIsLive(token: string): boolean {
+  const payload = token.split(".")[1];
+  if (!payload) return false;
+  try {
+    const decoded = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/"))) as {
+      exp?: number;
+    };
+    return typeof decoded.exp === "number" && decoded.exp * 1000 > Date.now() + 30_000;
+  } catch {
+    return false;
+  }
+}
+
+/** True when a non-expired gateway access token is present in the browser. */
+export function hasLiveSession(): boolean {
+  const token = readAccessToken();
+  return token !== null && tokenIsLive(token);
+}
+
+interface MockLoginEnvelope {
+  success: true;
+  data: {
+    user: { id: string; email: string; kycStatus: string };
+    accessToken: string;
+  };
+}
+
+/**
+ * DEV-ONLY: obtain a session from the gateway's mock-login route and store the access token
+ * where every other request reads it. The route does not exist in production builds of the
+ * gateway (404), so this can never become a production login path. Throws ApiError on
+ * failure — the caller (DevAutoLogin) owns the degraded-UX decision.
+ */
+export async function mockDevLogin(): Promise<void> {
+  const res = await apiClient.post<MockLoginEnvelope>("/auth/mock-login", {});
+  window.localStorage.setItem(ACCESS_TOKEN_KEY, res.data.accessToken);
+}
+
 // ── Wallet mirror ────────────────────────────────────────────────────────────
 
 /** Gateway envelope for GET /api/wallet. Balances are the engine's decimal STRINGS. */

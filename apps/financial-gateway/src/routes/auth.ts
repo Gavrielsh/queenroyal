@@ -1,9 +1,10 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 
+import { getEnv } from "../config/env";
 import { authRateLimit, clearRefreshCookie, REFRESH_COOKIE, setRefreshCookie } from "../lib/auth";
 import { errBody, okBody } from "../lib/reply";
 import { loginSchema, registerSchema } from "../schemas/auth.schema";
-import { AuthError, loadClaims, login, mintAccessToken, register } from "../services/auth.service";
+import { AuthError, loadClaims, login, mintAccessToken, mockLogin, register } from "../services/auth.service";
 import { rotateRefreshToken, revokeRefreshToken, SessionStoreUnavailableError } from "../services/session.service";
 
 /**
@@ -19,7 +20,26 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
   app.post("/api/auth/login", { preHandler: authRateLimit("login") }, loginHandler);
   app.post("/api/auth/refresh", refreshHandler);
   app.post("/api/auth/logout", logoutHandler);
+
+  // DEV-ONLY session bootstrap: NOT REGISTERED in production, so a production request gets a
+  // plain 404 (the service throws there too, as a second layer). Deliberately exempt from the
+  // fail-closed Redis rate limiter — it guards real credentials against brute force, and this
+  // route accepts none — so dev auto-login works with no Redis running. The global per-IP
+  // limiter still applies. No refresh cookie is issued; the client re-calls on token expiry.
+  if (getEnv().NODE_ENV !== "production") {
+    app.post("/api/auth/mock-login", mockLoginHandler);
+  }
 };
+
+async function mockLoginHandler(req: FastifyRequest, reply: FastifyReply): Promise<void> {
+  try {
+    const result = await mockLogin();
+    req.log.info({ user_id: result.user.id }, "mock dev login issued (non-production)");
+    await reply.code(200).send(okBody({ user: result.user, accessToken: result.accessToken }));
+  } catch (err) {
+    await handleAuthError(req, reply, err, "mock-login");
+  }
+}
 
 async function registerHandler(req: FastifyRequest, reply: FastifyReply): Promise<void> {
   const parsed = registerSchema.safeParse(req.body);
