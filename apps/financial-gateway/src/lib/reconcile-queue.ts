@@ -64,6 +64,13 @@ export interface ReconcileQueue {
   /** Enqueue to become visible only after `delayMs` (the lost-webhook deadline backstop). */
   schedule(evt: ReconcileEventInput, delayMs: number): Promise<void>;
   /**
+   * Cancel a not-yet-due scheduled backstop for `operatorTransactionId` (no-op if absent).
+   * Called the instant an intent settles on its own (e.g. the PSP webhook lands) so its
+   * 10-minute backstop never fires a redundant reconcile. Safe to over-call: a backstop that
+   * slips through anyway is a harmless no-op (the consumer claims nothing actionable and acks).
+   */
+  unschedule(operatorTransactionId: string): Promise<void>;
+  /**
    * Drain any now-due scheduled events into the stream, then block up to `blockMs` for up to
    * `count` messages. Returns freshly delivered messages (added to the group PEL until acked).
    */
@@ -126,12 +133,19 @@ export class RedisStreamReconcileQueue implements ReconcileQueue {
   }
 
   async schedule(evt: ReconcileEventInput, delayMs: number): Promise<void> {
+    // The member is the bare operatorTransactionId (NOT a JSON blob), so the backstop is
+    // cancellable by id via {@link unschedule} and a re-schedule for the same intent collapses
+    // (ZADD updates the score) instead of accumulating duplicate due events. The score is an
+    // ABSOLUTE UTC epoch-ms deadline — a strict UTC timestamp, immune to per-host wall-clock
+    // formatting — so producers and the draining consumer compare in one clock domain even on
+    // different instances (the task's clock-skew constraint). `reason` is diagnostic-only and is
+    // re-derived on drain.
     const visibleAt = Date.now() + Math.max(0, delayMs);
-    const member = JSON.stringify({
-      operatorTransactionId: evt.operatorTransactionId,
-      reason: evt.reason,
-    });
-    await this.cmd.zadd(SCHEDULE, visibleAt, member);
+    await this.cmd.zadd(SCHEDULE, visibleAt, evt.operatorTransactionId);
+  }
+
+  async unschedule(operatorTransactionId: string): Promise<void> {
+    await this.cmd.zrem(SCHEDULE, operatorTransactionId);
   }
 
   async pull(count: number, blockMs: number): Promise<ReconcileMessage[]> {
@@ -216,13 +230,12 @@ export class RedisStreamReconcileQueue implements ReconcileQueue {
   private async drainDueScheduled(count: number): Promise<void> {
     const now = Date.now();
     const due = await this.cmd.zrangebyscore(SCHEDULE, "-inf", now, "LIMIT", 0, count);
-    for (const member of due) {
+    for (const operatorTransactionId of due) {
       // ZREM gates the move: only the consumer that actually removes the member republishes
       // it, so concurrent consumers can't double-enqueue the same scheduled event.
-      const removed = await this.cmd.zrem(SCHEDULE, member);
+      const removed = await this.cmd.zrem(SCHEDULE, operatorTransactionId);
       if (removed !== 1) continue;
-      const parsed = JSON.parse(member) as { operatorTransactionId: string; reason: string };
-      await this.xadd(parsed);
+      await this.xadd({ operatorTransactionId, reason: "scheduled_backstop_due" });
     }
   }
 
@@ -303,6 +316,26 @@ export async function scheduleReconcile(evt: ReconcileEventInput, delayMs: numbe
     log().error(
       { err, operator_transaction_id: evt.operatorTransactionId },
       "failed to schedule reconcile backstop (journal row remains durable)",
+    );
+    return false;
+  }
+}
+
+/**
+ * BEST-EFFORT cancellation of a deposit's lost-webhook backstop once the intent settles on its
+ * own. This is a pure OPTIMIZATION (it suppresses a redundant ~10-min-later reconcile no-op for
+ * every successfully settled deposit), so a broker hiccup is swallowed: if the backstop slips
+ * through it costs one harmless skipped-then-acked event, never correctness. Returns whether the
+ * cancel stuck.
+ */
+export async function cancelScheduledReconcile(operatorTransactionId: string): Promise<boolean> {
+  try {
+    await getReconcileQueue().unschedule(operatorTransactionId);
+    return true;
+  } catch (err) {
+    log().error(
+      { err, operator_transaction_id: operatorTransactionId },
+      "failed to cancel reconcile backstop (stale event will harmlessly no-op)",
     );
     return false;
   }

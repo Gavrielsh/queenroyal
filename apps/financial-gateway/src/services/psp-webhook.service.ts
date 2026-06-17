@@ -1,7 +1,7 @@
 import { childLogger } from "../lib/logger";
 import type { PspWebhookEvent } from "../lib/payments/types";
 import { getPrisma } from "../lib/prisma";
-import { enqueueReconcile } from "../lib/reconcile-queue";
+import { cancelScheduledReconcile, enqueueReconcile } from "../lib/reconcile-queue";
 import { depositInstructionSchema } from "../schemas/engine-payloads.schema";
 import { creditConfirmedDeposit } from "./deposit.service";
 import { completeEngineRequest } from "./engine-journal.service";
@@ -63,6 +63,8 @@ export async function handlePspWebhookEvent(event: PspWebhookEvent, traceId?: st
         where: { id: row.id },
         data: { status: "ABANDONED", retryable: false, lastError: `psp ${event.type}` },
       });
+      // The intent is terminal — drop its lost-webhook backstop so it never fires a no-op.
+      await cancelScheduledReconcile(opTxId);
       log.info("deposit intent failed at PSP (no capture) — marked terminal");
       return { handled: true, note: "psp failure recorded" };
     }
@@ -72,6 +74,7 @@ export async function handlePspWebhookEvent(event: PspWebhookEvent, traceId?: st
 
   // ── Success: drive the idempotent ledger credit. ──
   if (row.status === "SUCCEEDED") {
+    await cancelScheduledReconcile(opTxId);
     return { handled: true, note: "already settled" };
   }
 
@@ -112,6 +115,9 @@ export async function handlePspWebhookEvent(event: PspWebhookEvent, traceId?: st
   await completeEngineRequest(opTxId, "SUCCEEDED", {
     ledgerTransactionId: credit.data.ledger_transaction_id,
   });
+  // Settled on the happy path — immediately drop the lost-webhook backstop (Task 2: ZREM
+  // reconcile:scheduled <operator_transaction_id>) so it never fires a redundant reconcile.
+  await cancelScheduledReconcile(opTxId);
   log.info({ ledger_transaction_id: credit.data.ledger_transaction_id }, "deposit settled via psp webhook");
   return { handled: true, note: "settled" };
 }
