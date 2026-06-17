@@ -88,6 +88,48 @@ describe("webhook routes (Fastify zero-trust perimeter)", () => {
     });
   });
 
+  describe("POST /api/webhooks/provider/rollback", () => {
+    it("rejects a bad HMAC signature with 401 — the controller never runs", async () => {
+      const body = JSON.stringify({
+        provider_transaction_id: "rb-1",
+        player_id: "11111111-1111-4111-8111-111111111111",
+        reference_transaction_id: "bet-1",
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/webhooks/provider/rollback",
+        headers: {
+          "content-type": "application/json",
+          "x-provider-code": "PRAGMATIC",
+          "x-signature": "deadbeef", // wrong
+          "x-timestamp": tsNow(),
+          "x-nonce": randomUUID(),
+        },
+        payload: body,
+      });
+      expect(res.statusCode).toBe(401);
+      expect(res.json()).toMatchObject({ success: false, error: { code: "AUTHENTICATION_FAILED" } });
+    });
+
+    it("passes the perimeter but 422s a malformed payload (valid signature)", async () => {
+      const body = JSON.stringify({ provider_transaction_id: "rb-1" }); // missing player_id + reference
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/webhooks/provider/rollback",
+        headers: {
+          "content-type": "application/json",
+          "x-provider-code": "PRAGMATIC",
+          "x-signature": hmacHex(body, PROVIDER_SECRET),
+          "x-timestamp": tsNow(),
+          "x-nonce": randomUUID(),
+        },
+        payload: body,
+      });
+      expect(res.statusCode).toBe(422);
+      expect(res.json()).toMatchObject({ success: false, error: { code: "VALIDATION_ERROR" } });
+    });
+  });
+
   describe("POST /api/webhooks/psp", () => {
     it("rejects a bad signature with 401", async () => {
       const body = JSON.stringify({ type: "payment_intent.succeeded", payment_intent_id: "pi_1", status: "succeeded" });
