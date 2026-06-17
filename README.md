@@ -43,8 +43,10 @@ Recovery is now driven entirely by events on Redis Streams:
   is best-effort: the durable `engine_request_log` row is the source of truth, so a broker
   hiccup only delays recovery — it never loses a transaction.
 - **Lost-webhook backstop** — opening a deposit schedules a *delayed* event in a Redis ZSET
-  (`reconcile:scheduled`) instead of polling Postgres for stale `PENDING` rows. If the
-  `succeeded` webhook arrives first the event is a harmless no-op.
+  (`reconcile:scheduled`) instead of polling Postgres for stale `PENDING` rows. When the
+  `succeeded` webhook settles the deposit it `ZREM`s the backstop (and any stray that slips
+  through is a harmless no-op); if the webhook is lost, the event fires after the deadline and
+  the reconciler polls the PSP directly.
 - **Consumer** — `npm run worker:reconcile` (from `apps/financial-gateway`) runs a long-lived
   worker that BLOCKS on `XREADGROUP`, claims each journal row with `READ COMMITTED` + `SELECT …
   FOR UPDATE SKIP LOCKED`, re-drives it, and `XACK`s. A crashed consumer's in-flight messages

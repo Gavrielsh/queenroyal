@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Replace the Prisma singleton with the in-memory fake (shared instance with the helpers).
 vi.mock("../src/lib/prisma", async () => {
@@ -10,16 +10,19 @@ import type { AuthClaims } from "../src/lib/jwt";
 import { setPaymentProvider } from "../src/lib/payments";
 import { MockPaymentProvider } from "../src/lib/payments/mock";
 import { PspWebhookSignatureError } from "../src/lib/payments/types";
+import { setReconcileQueue } from "../src/lib/reconcile-queue";
 import { handlePspWebhookEvent } from "../src/services/psp-webhook.service";
 import { purchasePackage } from "../src/services/store.service";
 import { type Directive, type EngineCall, engineCalls, resetEngine, setEngineHandler } from "./fakes/engine.fake";
 import { getJournal, resetDb, seedJournalRow, seedUser } from "./fakes/prisma.fake";
+import { ReconcileQueueFake } from "./fakes/reconcile-queue.fake";
 
 const USER_ID = "22222222-2222-4222-8222-222222222222";
 const ENGINE_PLAYER_ID = "engine-player-psp";
 const PSP_SECRET = "test_psp_secret";
 
 let psp: MockPaymentProvider;
+let queue: ReconcileQueueFake;
 
 function okPurchase(operatorTransactionId: string, ledgerTxId: string): Directive {
   return {
@@ -83,7 +86,13 @@ beforeEach(() => {
   resetEngine();
   psp = new MockPaymentProvider(PSP_SECRET);
   setPaymentProvider(psp);
+  queue = new ReconcileQueueFake();
+  setReconcileQueue(queue); // producers schedule the lost-webhook backstop here
   seedUser({ id: USER_ID, email: "buyer@test.io", kycStatus: "VERIFIED", trueEnginePlayerId: ENGINE_PLAYER_ID });
+});
+
+afterEach(() => {
+  setReconcileQueue(null);
 });
 
 describe("asynchronous PSP settlement", () => {
@@ -126,6 +135,28 @@ describe("asynchronous PSP settlement", () => {
 
     // Empirical proof of exactly-once: a single credit reached the ledger.
     expect(engineCalls.filter((c) => c.path === "/api/v1/store/purchase")).toHaveLength(1);
+  });
+
+  it("Task 2 — a settled deposit drops its lost-webhook backstop (ZREM reconcile:scheduled)", async () => {
+    // Opening the deposit ARMS the 10-minute backstop on the broker (the ZADD)...
+    const opened = await purchasePackage(user, { packageId: "pkg_value_20", idempotencyKey: "buy-zrem" });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    expect(queue.scheduledCount).toBe(1); // backstop armed
+
+    psp.markIntentSucceeded(opened.data.paymentIntentId);
+    setEngineHandler((call: EngineCall) =>
+      call.path === "/api/v1/store/purchase" ? okPurchase(call.body.operator_transaction_id, "ltx-zrem") : unexpected,
+    );
+
+    // ...and a verified `succeeded` webhook settles it AND cancels the now-moot backstop.
+    const { rawBody, signature } = psp.buildSignedWebhook(opened.data.paymentIntentId, "payment_intent.succeeded");
+    const outcome = await handlePspWebhookEvent(psp.parseWebhook(rawBody, signature));
+
+    expect(outcome.handled).toBe(true);
+    expect(getJournal(opened.data.operatorTransactionId)?.status).toBe("SUCCEEDED");
+    // Backstop dropped — no redundant reconcile event ~10 minutes after a deposit already settled.
+    expect(queue.scheduledCount).toBe(0);
   });
 
   it("rejects a webhook whose HMAC signature does not verify", async () => {

@@ -37,7 +37,14 @@ export class ReconcileQueueFake implements ReconcileQueue {
   }
 
   async schedule(evt: ReconcileEventInput, delayMs: number): Promise<void> {
+    // Model the real broker: the backstop is keyed by operatorTransactionId, so re-scheduling
+    // the same intent collapses to one due entry (latest deadline wins) rather than stacking.
+    this.scheduled = this.scheduled.filter((s) => s.evt.operatorTransactionId !== evt.operatorTransactionId);
     this.scheduled.push({ evt, visibleAt: Date.now() + Math.max(0, delayMs) });
+  }
+
+  async unschedule(operatorTransactionId: string): Promise<void> {
+    this.scheduled = this.scheduled.filter((s) => s.evt.operatorTransactionId !== operatorTransactionId);
   }
 
   async pull(count: number, _blockMs: number): Promise<ReconcileMessage[]> {
