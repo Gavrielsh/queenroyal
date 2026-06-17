@@ -8,8 +8,8 @@ import {
 } from "../lib/payments/types";
 import { errBody, okBody } from "../lib/reply";
 import { type HeaderGetter, verifyProviderWebhook, WebhookVerificationError } from "../lib/webhook-security";
-import { providerSpinSchema } from "../schemas/game.schema";
-import { processProviderSpin } from "../services/game-adapter.service";
+import { providerRollbackSchema, providerSpinSchema } from "../schemas/game.schema";
+import { processProviderRollback, processProviderSpin } from "../services/game-adapter.service";
 import { handlePspWebhookEvent } from "../services/psp-webhook.service";
 
 /** Per-request verification context, populated by the preHandler BEFORE the controller runs. */
@@ -60,6 +60,11 @@ export const webhookRoutes: FastifyPluginAsync = async (app) => {
 
   // ── B2B game-aggregator spin webhook ──────────────────────────────────────────
   app.post("/api/webhooks/provider/spin", { preHandler: verifyProviderSpinPerimeter }, providerSpinHandler);
+
+  // ── B2B game-aggregator rollback webhook (void/cancel a stuck bet) ─────────────
+  // Reuses the same raw-body HMAC perimeter as the spin webhook (the verifier is generic to
+  // provider webhooks; the name is historical).
+  app.post("/api/webhooks/provider/rollback", { preHandler: verifyProviderSpinPerimeter }, providerRollbackHandler);
 
   // ── PSP settlement webhook ────────────────────────────────────────────────────
   app.post("/api/webhooks/psp", { preHandler: verifyPspPerimeter }, pspHandler);
@@ -130,6 +135,40 @@ async function providerSpinHandler(req: FastifyRequest, reply: FastifyReply) {
     return reply.code(200).send(okBody(outcome.data));
   } catch (err) {
     req.log.error({ err, provider_transaction_id: parsed.data.provider_transaction_id }, "unexpected error processing spin");
+    return reply.code(500).send(errBody("INTERNAL_ERROR", "Unexpected server error"));
+  }
+}
+
+async function providerRollbackHandler(req: FastifyRequest, reply: FastifyReply) {
+  const providerCode = req.webhookCtx?.providerCode;
+  if (!providerCode) {
+    return reply.code(500).send(errBody("INTERNAL_ERROR", "verification context missing"));
+  }
+
+  // Parse the verified raw body (HMAC already passed in the preHandler).
+  let body: unknown;
+  try {
+    body = JSON.parse(rawBodyOf(req));
+  } catch {
+    return reply.code(400).send(errBody("INVALID_JSON", "Request body must be valid JSON"));
+  }
+
+  const parsed = providerRollbackSchema.safeParse(body);
+  if (!parsed.success) {
+    return reply.code(422).send(errBody("VALIDATION_ERROR", "Invalid rollback webhook payload", parsed.error.flatten()));
+  }
+
+  try {
+    const outcome = await processProviderRollback(providerCode, parsed.data, { traceId: req.id });
+    if (!outcome.ok) {
+      return reply.code(outcome.status).send(errBody(outcome.error.code, outcome.error.message, outcome.error.details));
+    }
+    return reply.code(200).send(okBody(outcome.data));
+  } catch (err) {
+    req.log.error(
+      { err, provider_transaction_id: parsed.data.provider_transaction_id },
+      "unexpected error processing rollback",
+    );
     return reply.code(500).send(errBody("INTERNAL_ERROR", "Unexpected server error"));
   }
 }

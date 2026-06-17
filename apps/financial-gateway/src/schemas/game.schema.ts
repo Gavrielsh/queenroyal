@@ -22,3 +22,26 @@ export const providerSpinSchema = z.object({
   win_amount: moneyString.default("0"),
 });
 export type ProviderSpinInput = z.infer<typeof providerSpinSchema>;
+
+/**
+ * Inbound B2B ROLLBACK webhook from a Game Aggregator: void/cancel a previously-placed BET
+ * after the provider's game state crashes or a player disconnects catastrophically. Like the
+ * spin webhook this is the provider's translated payload (already HMAC/timestamp/nonce verified
+ * at the perimeter) — NOT a player request.
+ *
+ * NOTE on the two ids:
+ *   - `provider_transaction_id` is THIS rollback's own upstream reference (distinct from the
+ *     bet's). It is diagnostic/audit only — the engine idempotency anchor is derived from the
+ *     ORIGINAL bet so a provider rollback and an internal win-compensation of the same bet
+ *     collapse to one reversal (see processProviderRollback).
+ *   - `reference_transaction_id` is the ORIGINAL bet's `provider_transaction_id`. The gateway
+ *     resolves it to that bet's engine `ledger_transaction_id` (via the intent journal) before
+ *     calling the engine, which reverses strictly by ledger id.
+ */
+export const providerRollbackSchema = z.object({
+  provider_transaction_id: z.string().min(1, "provider_transaction_id is required"),
+  // The player identifier WE issued to the provider — our local User.id (== engine external_id).
+  player_id: z.string().uuid("player_id must be the user UUID we issued to the provider"),
+  reference_transaction_id: z.string().min(1, "reference_transaction_id is required"),
+});
+export type ProviderRollbackInput = z.infer<typeof providerRollbackSchema>;

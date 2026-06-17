@@ -39,7 +39,7 @@ src/
 ├── server.ts          # process entrypoint: bootstrap + graceful shutdown (+ Prisma disconnect)
 ├── app.ts             # buildApp(): Fastify instance + perimeter + routes (injectable in tests)
 ├── config/env.ts      # strict, fail-closed Zod env contract
-├── routes/            # health · webhooks (provider/spin, psp) · auth · store
+├── routes/            # health · webhooks (provider/spin, provider/rollback, psp) · auth · store
 ├── services/          # auth · session · store · deposit · psp-webhook · game-adapter · reconciliation
 ├── workers/
 │   └── reconciler.ts  # event-driven reconciliation consumer (npm run worker:reconcile)
@@ -53,9 +53,10 @@ test/
 ├── health.test.ts           # inject()-based smoke tests (no socket / DB / Redis)
 ├── transaction.test.ts      # serialization-retry + error-classifier unit tests
 ├── webhook-security.test.ts # HMAC/replay perimeter
-├── webhooks.route.test.ts   # provider/spin + psp route perimeter
+├── webhooks.route.test.ts   # provider/spin + provider/rollback + psp route perimeter
 ├── auth-store.route.test.ts # auth/store fail-closed perimeter (503/401/422)
 ├── psp-webhook.test.ts      # async PSP settlement (idempotent credit, signature, failure)
+├── provider-rollback.test.ts # aggregator rollback adapter (reverse/idempotent-void/defer/compensate)
 └── recovery.test.ts         # crash/recovery saga: ghost spin, compensation, DLQ, reclaim
 ```
 
