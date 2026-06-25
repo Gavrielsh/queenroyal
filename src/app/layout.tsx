@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import type { ReactNode } from "react";
 
 import "./globals.css";
+import { Providers } from "./providers";
 
 export const metadata: Metadata = {
   title: "QueenRoyal",
@@ -16,7 +17,13 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        {/*
+          React Query cache provider. Mounted here in the root layout — ABOVE the page-level
+          DevAutoLogin auth gate — so the gate and every query it gates share one client.
+        */}
+        <Providers>{children}</Providers>
+      </body>
     </html>
   );
 }
