@@ -31,7 +31,7 @@ interface Toast {
 const REEL_SYMBOLS = ["🍒", "💎", "7️⃣", "🔔", "👑", "🍋"] as const;
 
 export function MockGameWindow() {
-  const { balances, phase, errorStatus, refetch } = useWalletQuery();
+  const { balances, phase, errorStatus, invalidate } = useWalletQuery();
 
   const [isSpinning, setIsSpinning] = useState(false);
   const [reels, setReels] = useState<readonly [string, string, string]>(["👑", "👑", "👑"]);
@@ -65,8 +65,9 @@ export function MockGameWindow() {
 
     try {
       await new Promise((resolve) => setTimeout(resolve, 900));
-      // After the (out-of-band) round settles, the ledger is the only truth: re-read it.
-      const result = await refetch();
+      // After the (out-of-band) round settles, the ledger may have changed: invalidate the
+      // shared cache entry so EVERY window re-reads the authoritative snapshot at once.
+      const result = await invalidate("spin");
       showToast(
         result.ok
           ? { kind: "success", message: "Wallet mirror synced with the ledger." }
@@ -82,7 +83,7 @@ export function MockGameWindow() {
       clearInterval(spinAnimation);
       setIsSpinning(false);
     }
-  }, [isSpinning, refetch, showToast]);
+  }, [isSpinning, invalidate, showToast]);
 
   return (
     <div className="relative w-full max-w-md rounded-3xl border border-amber-500/30 bg-gradient-to-b from-zinc-900 via-zinc-950 to-black p-6 shadow-[0_0_60px_-15px_rgba(245,158,11,0.4)]">

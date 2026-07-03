@@ -45,7 +45,7 @@ interface Toast {
 }
 
 export function StoreWindow() {
-  const { balances, phase, errorStatus, refetch } = useWalletQuery();
+  const { balances, phase, errorStatus, invalidate } = useWalletQuery();
 
   /** Package id with a purchase in flight, or null. One purchase at a time. */
   const [buyingId, setBuyingId] = useState<string | null>(null);
@@ -77,8 +77,9 @@ export function StoreWindow() {
         // the POC asks the gateway's mock PSP to capture + settle through the same webhook path.
         await confirmMockStripeDeposit(intent.paymentIntentId);
 
-        // The ledger has credited the coins — its answer is the only one we display.
-        const synced = await refetch();
+        // The ledger has credited the coins — invalidate the shared cache entry so EVERY
+        // window re-reads the authoritative snapshot at once.
+        const synced = await invalidate("purchase");
         showToast(
           synced.ok
             ? { kind: "success", message: `${pkg.name} pack purchased — balances updated from the ledger.` }
@@ -98,7 +99,7 @@ export function StoreWindow() {
         setBuyingId(null);
       }
     },
-    [buyingId, refetch, showToast],
+    [buyingId, invalidate, showToast],
   );
 
   return (

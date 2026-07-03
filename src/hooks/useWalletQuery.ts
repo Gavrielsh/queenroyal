@@ -1,10 +1,11 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback } from "react";
 
 import { ApiError, type WalletBalancesDto } from "@/lib/apiClient";
 import { walletKeys } from "@/lib/queryKeys";
+import { logEvent } from "@/lib/telemetry";
 import { walletBalancesQueryFn } from "@/lib/walletQueryFn";
 
 /**
@@ -19,8 +20,9 @@ import { walletBalancesQueryFn } from "@/lib/walletQueryFn";
  * The hook is a pure adapter: it maps React Query's `status`/`fetchStatus`/`dataUpdatedAt`
  * onto the UI's existing four-phase vocabulary and NEVER computes money — balances stay the
  * engine's validated decimal strings, verbatim (validation happens in the queryFn boundary,
- * M1-T3). It emits no telemetry of its own: query errors are reported once, centrally, by the
- * QueryCache.onError choke point (M1-T2).
+ * M1-T3). Read/error telemetry stays central (the QueryCache.onError choke point, M1-T2);
+ * the only event the hook emits is `wallet.invalidated { trigger }` — exactly once per
+ * user-initiated re-sync, from `invalidate()`.
  */
 
 /** The UI's sync-state vocabulary (unchanged from the pre-React-Query mirror). */
@@ -34,8 +36,14 @@ export type WalletPhase =
   /** The last fetch failed — values (if any) are stale and the UI must say so. */
   | "error";
 
-/** Outcome of a caller-initiated re-read, with just enough detail to pick honest copy. */
-export type WalletRefetchResult =
+/**
+ * What initiated a ledger re-sync. Every money event that can change the wallet out-of-band
+ * must invalidate through this typed vocabulary so telemetry can attribute each re-sync.
+ */
+export type WalletInvalidateTrigger = "spin" | "purchase";
+
+/** Outcome of a caller-initiated re-sync, with just enough detail to pick honest copy. */
+export type WalletSyncOutcome =
   | { ok: true }
   | { ok: false; errorStatus: number | null; errorCode: string | null };
 
@@ -49,8 +57,13 @@ export interface WalletQueryView {
   errorCode: string | null;
   /** Epoch ms of the last authoritative snapshot, or null if none yet (drives staleness UI). */
   lastSyncedAt: number | null;
-  /** Re-read the authoritative snapshot now. Never throws; concurrent calls are deduped. */
-  refetch: () => Promise<WalletRefetchResult>;
+  /**
+   * Signal that a money event has (or may have) changed the ledger: marks the shared cache
+   * entry stale via `queryClient.invalidateQueries` and awaits the resulting refetch — every
+   * active observer (all windows) converges on the fresh snapshot from ONE deduped read.
+   * Emits `wallet.invalidated { trigger }` exactly once per call. Never throws.
+   */
+  invalidate: (trigger: WalletInvalidateTrigger) => Promise<WalletSyncOutcome>;
 }
 
 function toErrorParts(error: unknown): { errorStatus: number | null; errorCode: string | null } {
@@ -61,17 +74,25 @@ function toErrorParts(error: unknown): { errorStatus: number | null; errorCode: 
 }
 
 export function useWalletQuery(): WalletQueryView {
+  const queryClient = useQueryClient();
   const query = useQuery({
     queryKey: walletKeys.balances(),
     queryFn: walletBalancesQueryFn,
   });
 
-  const { refetch: rqRefetch } = query;
-  const refetch = useCallback(async (): Promise<WalletRefetchResult> => {
-    const result = await rqRefetch();
-    if (result.status === "success") return { ok: true };
-    return { ok: false, ...toErrorParts(result.error) };
-  }, [rqRefetch]);
+  const invalidate = useCallback(
+    async (trigger: WalletInvalidateTrigger): Promise<WalletSyncOutcome> => {
+      // Emitted here — the single choke point — so each user action logs exactly one
+      // invalidation regardless of how many components observe the wallet.
+      logEvent("wallet.invalidated", { trigger });
+      await queryClient.invalidateQueries({ queryKey: walletKeys.balances() });
+      // invalidateQueries resolves once the refetch settles; the cache state is the outcome.
+      const state = queryClient.getQueryState(walletKeys.balances());
+      if (state?.status === "success") return { ok: true };
+      return { ok: false, ...toErrorParts(state?.error) };
+    },
+    [queryClient],
+  );
 
   // Precedence mirrors the old mirror's semantics exactly: any in-flight fetch shows
   // "syncing" (even over stale data or a failed previous attempt); a genuine query error
@@ -96,6 +117,6 @@ export function useWalletQuery(): WalletQueryView {
     errorStatus,
     errorCode,
     lastSyncedAt: query.dataUpdatedAt > 0 ? query.dataUpdatedAt : null,
-    refetch,
+    invalidate,
   };
 }
