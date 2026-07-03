@@ -2,9 +2,11 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { usePurchaseMutation } from "@/hooks/usePurchaseMutation";
 import { useWalletQuery } from "@/hooks/useWalletQuery";
-import { ApiError, confirmMockStripeDeposit, initiateStorePurchase } from "@/lib/apiClient";
 import { formatBalance } from "@/lib/format";
+import { onPeerActivity } from "@/lib/purchaseIntent";
+import { logEvent } from "@/lib/telemetry";
 
 /**
  * Cashier window (Zone 3) — a DUMB client by contract.
@@ -12,10 +14,9 @@ import { formatBalance } from "@/lib/format";
  * ARCHITECTURE NOTE — why this component never touches money:
  * The catalog below is DISPLAY COPY only (preformatted strings keyed by package id). The
  * gateway's own catalog decides what each id costs and grants, and the Go ledger decides the
- * resulting balances. A purchase is: open the PaymentIntent (`POST /api/store/purchase`),
- * confirm the payment (here the dev mock-confirm route stands in for Stripe.js +
- * `payment_intent.succeeded`), then RE-READ the wallet and let the server's strings overwrite
- * the shared React Query cache verbatim. No optimistic crediting, no price math, no float ever.
+ * resulting balances. The purchase itself lives in usePurchaseMutation: retained attempt
+ * token → PaymentIntent → confirm → settle → shared-cache invalidation. This component only
+ * renders outcomes and enforces the click discipline (one purchase at a time, across tabs).
  *
  * Balance state lives ONLY in the shared query cache (`walletKeys.balances()`) observed via
  * useWalletQuery, which hydrates itself on mount — the same entry the game window renders,
@@ -45,10 +46,14 @@ interface Toast {
 }
 
 export function StoreWindow() {
-  const { balances, phase, errorStatus, invalidate } = useWalletQuery();
+  const { balances, phase, errorStatus } = useWalletQuery();
+  const { purchase, isPending, pendingPackageId } = usePurchaseMutation();
 
-  /** Package id with a purchase in flight, or null. One purchase at a time. */
-  const [buyingId, setBuyingId] = useState<string | null>(null);
+  /** Package id a PEER TAB is actively purchasing, or null — locks Buy here too. */
+  const [peerLockedBy, setPeerLockedBy] = useState<string | null>(null);
+  /** Synchronous re-entry guard: two clicks in one tick both see isPending === false. */
+  const attemptGate = useRef(false);
+
   const [toast, setToast] = useState<Toast | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -56,6 +61,15 @@ export function StoreWindow() {
     return () => {
       if (toastTimer.current) clearTimeout(toastTimer.current);
     };
+  }, []);
+
+  useEffect(() => {
+    return onPeerActivity((event) => {
+      setPeerLockedBy((previous) => {
+        if (event.state === "in_flight") return event.packageId;
+        return previous === event.packageId ? null : previous;
+      });
+    });
   }, []);
 
   const showToast = useCallback((next: Toast) => {
@@ -66,41 +80,54 @@ export function StoreWindow() {
 
   const handleBuy = useCallback(
     async (pkg: DisplayPackage) => {
-      if (buyingId) return;
-      setBuyingId(pkg.id);
+      if (attemptGate.current || isPending) {
+        logEvent("purchase.attempt.blocked", { packageId: pkg.id, reason: "in_flight" });
+        return;
+      }
+      if (peerLockedBy !== null) {
+        logEvent("purchase.attempt.blocked", { packageId: pkg.id, reason: "peer_tab" });
+        return;
+      }
+
+      attemptGate.current = true;
       try {
-        // One key per attempt: it anchors both the PSP intent and the ledger credit, so a
-        // network retry can never double-charge or double-credit.
-        const intent = await initiateStorePurchase(pkg.id, crypto.randomUUID());
+        const outcome = await purchase(pkg.id);
 
-        // With the real PSP this step is `stripe.confirmCardPayment(intent.clientSecret)`;
-        // the POC asks the gateway's mock PSP to capture + settle through the same webhook path.
-        await confirmMockStripeDeposit(intent.paymentIntentId);
+        if (outcome.status === "settled") {
+          showToast(
+            outcome.walletSynced
+              ? { kind: "success", message: `${pkg.name} pack purchased — balances updated from the ledger.` }
+              : { kind: "error", message: "Purchase settled, but the wallet re-read failed — balances may be stale." },
+          );
+          return;
+        }
 
-        // The ledger has credited the coins — invalidate the shared cache entry so EVERY
-        // window re-reads the authoritative snapshot at once.
-        const synced = await invalidate("purchase");
-        showToast(
-          synced.ok
-            ? { kind: "success", message: `${pkg.name} pack purchased — balances updated from the ledger.` }
-            : { kind: "error", message: "Purchase settled, but the wallet re-read failed — balances may be stale." },
-        );
-      } catch (error) {
-        showToast({
-          kind: "error",
-          message:
-            error instanceof ApiError && error.status === 401
-              ? "Log in to make a purchase."
-              : error instanceof ApiError
-                ? `Purchase failed: ${error.message}`
-                : "Purchase failed: could not reach the cashier.",
-        });
+        const { failure } = outcome;
+        switch (failure.kind) {
+          case "unauthorized":
+            showToast({ kind: "error", message: "Log in to make a purchase." });
+            break;
+          case "declined":
+            showToast({ kind: "error", message: `Purchase failed: ${failure.message}` });
+            break;
+          case "retryable":
+            showToast({
+              kind: "error",
+              message:
+                failure.errorCode === "NETWORK_ERROR" || failure.errorCode === null
+                  ? "Purchase failed: could not reach the cashier."
+                  : `Purchase failed: ${failure.message}`,
+            });
+            break;
+        }
       } finally {
-        setBuyingId(null);
+        attemptGate.current = false;
       }
     },
-    [buyingId, invalidate, showToast],
+    [isPending, peerLockedBy, purchase, showToast],
   );
+
+  const buyLocked = isPending || peerLockedBy !== null;
 
   return (
     <div className="relative w-full max-w-md rounded-3xl border border-emerald-500/30 bg-gradient-to-b from-zinc-900 via-zinc-950 to-black p-6 shadow-[0_0_60px_-15px_rgba(16,185,129,0.4)]">
@@ -131,7 +158,7 @@ export function StoreWindow() {
       {/* Packages */}
       <ul className="space-y-3">
         {PACKAGES.map((pkg) => {
-          const isBuying = buyingId === pkg.id;
+          const isBuying = pendingPackageId === pkg.id;
           return (
             <li
               key={pkg.id}
@@ -156,7 +183,7 @@ export function StoreWindow() {
               <button
                 type="button"
                 onClick={() => void handleBuy(pkg)}
-                disabled={buyingId !== null}
+                disabled={buyLocked}
                 className="min-w-24 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-400 px-4 py-3 text-sm font-black tracking-wide text-zinc-950 shadow-lg shadow-emerald-500/25 transition active:scale-[0.97] enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {isBuying ? "BUYING…" : `BUY ${pkg.price}`}
@@ -167,7 +194,9 @@ export function StoreWindow() {
       </ul>
 
       <p className="mt-4 text-center text-[9px] uppercase tracking-wider text-zinc-600">
-        Mock checkout — payments settle server-side via the gateway
+        {peerLockedBy !== null
+          ? "purchase in progress in another tab"
+          : "Mock checkout — payments settle server-side via the gateway"}
       </p>
 
       {/* Toast */}

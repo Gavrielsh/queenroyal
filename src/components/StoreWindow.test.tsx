@@ -35,15 +35,39 @@ const mockConfirmEnvelope = { success: true, data: { status: "settled" } };
 
 const fetchMock = vi.fn<typeof fetch>();
 
+/** Deterministic BroadcastChannel double — lets tests inject peer-tab purchase activity. */
+class FakeBroadcastChannel {
+  static instances: FakeBroadcastChannel[] = [];
+  onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+  readonly posted: unknown[] = [];
+  constructor(readonly name: string) {
+    FakeBroadcastChannel.instances.push(this);
+  }
+  postMessage(data: unknown): void {
+    this.posted.push(data);
+  }
+  close(): void {}
+  emitPeer(data: unknown): void {
+    this.onmessage?.({ data } as MessageEvent<unknown>);
+  }
+}
+vi.stubGlobal("BroadcastChannel", FakeBroadcastChannel);
+
 beforeEach(() => {
+  vi.stubGlobal("BroadcastChannel", FakeBroadcastChannel);
   vi.stubGlobal("fetch", fetchMock);
+  window.localStorage.clear();
 });
 
 afterEach(() => {
-  vi.unstubAllGlobals();
   fetchMock.mockReset();
   vi.restoreAllMocks();
 });
+
+/** The channel the purchaseIntent module wired to (created on first component mount). */
+function wiredChannel(): FakeBroadcastChannel | undefined {
+  return FakeBroadcastChannel.instances[0];
+}
 
 interface PurchaseRoute {
   purchase?: () => Response;
@@ -215,5 +239,61 @@ describe("StoreWindow — purchase flow (invalidate-after-action)", () => {
     });
 
     await waitFor(() => expect(screen.getByRole("button", { name: "BUY $5" })).toBeEnabled());
+  });
+
+  it("a same-tick double-click fires ONE purchase and one blocked event (sync gate)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    routeGateway({
+      purchase: () => jsonResponse(purchaseIntentEnvelope),
+      confirm: () => jsonResponse(mockConfirmEnvelope),
+      walletReads: [
+        () => jsonResponse(walletEnvelope("1000.0000")),
+        () => jsonResponse(walletEnvelope("6000.0000")),
+      ],
+    });
+
+    renderWithClient(<StoreWindow />);
+    await mountSynced();
+
+    const buy = screen.getByRole("button", { name: "BUY $5" });
+    // Both clicks land before any re-render can disable the button — the ref gate must hold.
+    fireEvent.click(buy);
+    fireEvent.click(buy);
+
+    await screen.findByText("6,000");
+
+    const initiateCalls = fetchMock.mock.calls.filter(
+      ([url, init]) => init?.method === "POST" && String(url).endsWith("/store/purchase"),
+    );
+    expect(initiateCalls).toHaveLength(1);
+    const blocked = warn.mock.calls.filter(
+      (call) => (call[1] as Record<string, unknown> | undefined)?.evt === "purchase.attempt.blocked",
+    );
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]?.[1]).toMatchObject({ packageId: "pkg_starter_5", reason: "in_flight" });
+  });
+
+  it("a peer tab's in-flight purchase locks every BUY button until it releases", async () => {
+    routeGateway({ walletReads: [() => jsonResponse(walletEnvelope("1000.0000"))] });
+
+    renderWithClient(<StoreWindow />);
+    await mountSynced();
+    expect(screen.getByRole("button", { name: "BUY $5" })).toBeEnabled();
+
+    act(() => {
+      wiredChannel()?.emitPeer({ packageId: "pkg_value_20", state: "in_flight" });
+    });
+
+    expect(screen.getByRole("button", { name: "BUY $5" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "BUY $20" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "BUY $50" })).toBeDisabled();
+    expect(screen.getByText("purchase in progress in another tab")).toBeInTheDocument();
+
+    act(() => {
+      wiredChannel()?.emitPeer({ packageId: "pkg_value_20", state: "released" });
+    });
+
+    expect(screen.getByRole("button", { name: "BUY $5" })).toBeEnabled();
+    expect(screen.queryByText("purchase in progress in another tab")).not.toBeInTheDocument();
   });
 });

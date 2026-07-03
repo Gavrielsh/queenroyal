@@ -3,10 +3,17 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback } from "react";
 
-import { ApiError, type WalletBalancesDto } from "@/lib/apiClient";
+import { type WalletBalancesDto } from "@/lib/apiClient";
 import { walletKeys } from "@/lib/queryKeys";
-import { logEvent } from "@/lib/telemetry";
+import {
+  invalidateWalletBalances,
+  toErrorParts,
+  type WalletInvalidateTrigger,
+  type WalletSyncOutcome,
+} from "@/lib/walletInvalidate";
 import { walletBalancesQueryFn } from "@/lib/walletQueryFn";
+
+export type { WalletInvalidateTrigger, WalletSyncOutcome } from "@/lib/walletInvalidate";
 
 /**
  * THE read surface for wallet balances in Zone 3.
@@ -21,9 +28,9 @@ import { walletBalancesQueryFn } from "@/lib/walletQueryFn";
  * onto the UI's four-phase vocabulary and NEVER computes money — balances stay the engine's
  * validated decimal strings, verbatim (validated at the queryFn boundary:
  * walletQueryFn → parseWalletEnvelope). Read/error telemetry stays central (the
- * QueryCache.onError choke point in queryClient); the only event the hook emits is
- * `wallet.invalidated { trigger }` — exactly once per user-initiated re-sync, from
- * `invalidate()`.
+ * QueryCache.onError choke point in queryClient); `invalidate()` delegates to the shared
+ * invalidation choke point (walletInvalidate), which emits `wallet.invalidated { trigger }`
+ * exactly once per user-initiated re-sync.
  */
 
 /** The UI's sync-state vocabulary. */
@@ -36,17 +43,6 @@ export type WalletPhase =
   | "synced"
   /** The last fetch failed — values (if any) are stale and the UI must say so. */
   | "error";
-
-/**
- * What initiated a ledger re-sync. Every money event that can change the wallet out-of-band
- * must invalidate through this typed vocabulary so telemetry can attribute each re-sync.
- */
-export type WalletInvalidateTrigger = "spin" | "purchase";
-
-/** Outcome of a caller-initiated re-sync, with just enough detail to pick honest copy. */
-export type WalletSyncOutcome =
-  | { ok: true }
-  | { ok: false; errorStatus: number | null; errorCode: string | null };
 
 export interface WalletQueryView {
   /** Validated, verbatim engine strings — or null before the first successful read. */
@@ -67,13 +63,6 @@ export interface WalletQueryView {
   invalidate: (trigger: WalletInvalidateTrigger) => Promise<WalletSyncOutcome>;
 }
 
-function toErrorParts(error: unknown): { errorStatus: number | null; errorCode: string | null } {
-  if (error instanceof ApiError) {
-    return { errorStatus: error.status, errorCode: error.code ?? null };
-  }
-  return { errorStatus: null, errorCode: null };
-}
-
 export function useWalletQuery(): WalletQueryView {
   const queryClient = useQueryClient();
   const query = useQuery({
@@ -82,16 +71,8 @@ export function useWalletQuery(): WalletQueryView {
   });
 
   const invalidate = useCallback(
-    async (trigger: WalletInvalidateTrigger): Promise<WalletSyncOutcome> => {
-      // Emitted here — the single choke point — so each user action logs exactly one
-      // invalidation regardless of how many components observe the wallet.
-      logEvent("wallet.invalidated", { trigger });
-      await queryClient.invalidateQueries({ queryKey: walletKeys.balances() });
-      // invalidateQueries resolves once the refetch settles; the cache state is the outcome.
-      const state = queryClient.getQueryState(walletKeys.balances());
-      if (state?.status === "success") return { ok: true };
-      return { ok: false, ...toErrorParts(state?.error) };
-    },
+    (trigger: WalletInvalidateTrigger): Promise<WalletSyncOutcome> =>
+      invalidateWalletBalances(queryClient, trigger),
     [queryClient],
   );
 

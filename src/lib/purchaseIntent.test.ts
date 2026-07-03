@@ -389,6 +389,31 @@ describe("peer protocol — BroadcastChannel + storage-event fallback", () => {
   });
 });
 
+describe("attempt lifecycle broadcasts (in_flight / released)", () => {
+  it("markAttemptStarted and markAttemptReleased broadcast without touching token retention", async () => {
+    const mod = await loadModule();
+    const token = mod.getOrCreateAttemptToken(PKG);
+
+    mod.markAttemptStarted(PKG);
+    mod.markAttemptReleased(PKG);
+
+    const posted = FakeBroadcastChannel.instances[0]?.posted ?? [];
+    expect(posted).toContainEqual({ packageId: PKG, state: "in_flight" });
+    expect(posted).toContainEqual({ packageId: PKG, state: "released" });
+    expect(mod.peekAttemptToken(PKG)).toBe(token); // pure signals — retention untouched
+  });
+
+  it("lifecycle broadcasts are safe with no channel available", async () => {
+    vi.stubGlobal("BroadcastChannel", undefined);
+    const mod = await loadModule();
+
+    expect(() => {
+      mod.markAttemptStarted(PKG);
+      mod.markAttemptReleased(PKG);
+    }).not.toThrow();
+  });
+});
+
 describe("FinTech logging discipline", () => {
   it("the token value NEVER appears in any telemetry record", async () => {
     const mod = await loadModule();

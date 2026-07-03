@@ -22,8 +22,9 @@ import { logEvent } from "@/lib/telemetry";
  *
  * Peer protocol: tabs post `{ packageId, state }`. Terminal states (`settled`/`abandoned`,
  * or the fallback-only `cleared`) drop every tab's copy so the next purchase mints fresh.
- * The `in_flight`/`released` states are typed here but posted by the purchase flow (M2-T2)
- * to drive cross-tab Buy-button locking.
+ * The purchase flow posts `in_flight`/`released` via `markAttemptStarted`/
+ * `markAttemptReleased` to drive cross-tab Buy-button locking; those states never touch
+ * token retention.
  *
  * FinTech logging rule: the token VALUE is opaque and never appears in telemetry, errors, or
  * broadcasts' logs — events carry the `packageId` only.
@@ -269,9 +270,26 @@ export function markAbandoned(packageId: string): void {
 }
 
 /**
- * Subscribe to peer-tab purchase activity (terminal outcomes now; `in_flight`/`released`
- * arrive with the M2-T2 purchase flow). Returns an unsubscribe function. Listener faults are
- * swallowed — a UI bug cannot break the retention protocol.
+ * Broadcast that an attempt for this package is actively on the wire, so peer tabs lock
+ * their Buy affordance. Pure signal: token retention is untouched.
+ */
+export function markAttemptStarted(packageId: string): void {
+  ensureWired();
+  broadcast({ packageId, state: "in_flight" });
+}
+
+/**
+ * Broadcast that a non-terminal attempt ended (retryable failure): peer tabs unlock, and the
+ * token is RETAINED so whichever tab retries reuses it. Pure signal.
+ */
+export function markAttemptReleased(packageId: string): void {
+  ensureWired();
+  broadcast({ packageId, state: "released" });
+}
+
+/**
+ * Subscribe to peer-tab purchase activity. Returns an unsubscribe function. Listener faults
+ * are swallowed — a UI bug cannot break the retention protocol.
  */
 export function onPeerActivity(listener: (event: PeerPurchaseEvent) => void): () => void {
   ensureWired();
