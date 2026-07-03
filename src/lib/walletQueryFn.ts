@@ -9,7 +9,7 @@ type WalletBalancesKey = ReturnType<(typeof walletKeys)["balances"]>;
  * The React Query queryFn for the wallet balances query (`walletKeys.balances()`).
  *
  * Threads React Query's own AbortSignal into the gateway fetch, so a superseded refetch or an
- * unmounting consumer CANCELS the in-flight HTTP request instead of racing it — the M1
+ * unmounting consumer CANCELS the in-flight HTTP request instead of racing it — the
  * race-mitigation contract. Validation lives in `fetchWalletBalances`/`parseWalletEnvelope`:
  * a malformed payload throws (→ query error), so no unvalidated value can enter the cache
  * through this path.

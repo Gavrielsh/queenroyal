@@ -18,8 +18,8 @@ import { formatBalance } from "@/lib/format";
  * the shared React Query cache verbatim. No optimistic crediting, no price math, no float ever.
  *
  * Balance state lives ONLY in the shared query cache (`walletKeys.balances()`) observed via
- * useWalletQuery — the same entry the game window renders, so a settled purchase shows up in
- * both, by construction. The hook auto-hydrates on mount; there is no manual fetch effect.
+ * useWalletQuery, which hydrates itself on mount — the same entry the game window renders,
+ * so a settled purchase shows up in both, by construction.
  */
 
 interface DisplayPackage {

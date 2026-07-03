@@ -14,18 +14,19 @@ import { walletBalancesQueryFn } from "@/lib/walletQueryFn";
  * Server state lives in exactly one place: the React Query cache entry under
  * `walletKeys.balances()`. Every consumer of this hook observes that single entry, so all
  * components converge on the same authoritative snapshot by construction — there is no local
- * balance state anywhere in the frontend (the old Zustand mirror is gone), and therefore no
- * second copy to race, drift, or clobber.
+ * balance state anywhere in the frontend, and therefore no second copy to race, drift, or
+ * clobber.
  *
  * The hook is a pure adapter: it maps React Query's `status`/`fetchStatus`/`dataUpdatedAt`
- * onto the UI's existing four-phase vocabulary and NEVER computes money — balances stay the
- * engine's validated decimal strings, verbatim (validation happens in the queryFn boundary,
- * M1-T3). Read/error telemetry stays central (the QueryCache.onError choke point, M1-T2);
- * the only event the hook emits is `wallet.invalidated { trigger }` — exactly once per
- * user-initiated re-sync, from `invalidate()`.
+ * onto the UI's four-phase vocabulary and NEVER computes money — balances stay the engine's
+ * validated decimal strings, verbatim (validated at the queryFn boundary:
+ * walletQueryFn → parseWalletEnvelope). Read/error telemetry stays central (the
+ * QueryCache.onError choke point in queryClient); the only event the hook emits is
+ * `wallet.invalidated { trigger }` — exactly once per user-initiated re-sync, from
+ * `invalidate()`.
  */
 
-/** The UI's sync-state vocabulary (unchanged from the pre-React-Query mirror). */
+/** The UI's sync-state vocabulary. */
 export type WalletPhase =
   /** Nothing fetched yet — render placeholders, never zeros (a zero is a claim). */
   | "empty"
@@ -94,11 +95,10 @@ export function useWalletQuery(): WalletQueryView {
     [queryClient],
   );
 
-  // Precedence mirrors the old mirror's semantics exactly: any in-flight fetch shows
-  // "syncing" (even over stale data or a failed previous attempt); a genuine query error
-  // shows "error" (aborts never reach error state — React Query reverts cancellations, and
-  // the M1-T3 boundary classifies them ABORTED, not as transport faults); data means
-  // "synced"; otherwise nothing has been fetched yet.
+  // Phase precedence: any in-flight fetch shows "syncing" (even over stale data or a failed
+  // previous attempt); a genuine query error shows "error" (aborts never reach error state —
+  // React Query reverts cancellations, and the transport boundary classifies them ABORTED,
+  // not as transport faults); data means "synced"; otherwise nothing has been fetched yet.
   const phase: WalletPhase =
     query.fetchStatus === "fetching"
       ? "syncing"

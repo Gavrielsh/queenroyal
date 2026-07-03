@@ -18,8 +18,8 @@ import { formatBalance } from "@/lib/format";
  * optimistic deduction, no local win math, no client-supplied amounts.
  *
  * The wallet "mirror" IS the shared React Query cache entry (`walletKeys.balances()`),
- * observed through useWalletQuery. This component holds no balance state of its own, and the
- * hook auto-hydrates on mount — there is no manual fetch effect to race.
+ * observed through useWalletQuery, which hydrates itself on mount. This component holds no
+ * balance state of its own.
  */
 const GAME_ID = "mock-slot-1";
 

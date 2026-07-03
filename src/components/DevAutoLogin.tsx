@@ -19,7 +19,7 @@ import { hasLiveSession, mockDevLogin } from "@/lib/apiClient";
  *   - It stores ONLY the gateway-issued token. No user state, and absolutely no balances —
  *     the wallet mirror still hydrates itself exclusively from the gateway's answer.
  *   - If login fails (gateway down), children render anyway under a warning banner: every
- *     wallet consumer already degrades honestly via the store's "error"/stale status.
+ *     wallet consumer already degrades honestly via the wallet query's "error"/stale phase.
  */
 export function DevAutoLogin({ children }: { children: ReactNode }) {
   const [phase, setPhase] = useState<"pending" | "ready" | "failed">(
