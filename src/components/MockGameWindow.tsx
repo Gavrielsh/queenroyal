@@ -2,9 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { ApiError, fetchWalletBalances } from "@/lib/apiClient";
+import { useWalletQuery } from "@/hooks/useWalletQuery";
 import { formatBalance } from "@/lib/format";
-import { useWalletStore } from "@/store/useWalletStore";
 
 /**
  * Dev harness for the Zone 3 wallet mirror.
@@ -14,9 +13,13 @@ import { useWalletStore } from "@/store/useWalletStore";
  * aggregator's server calls the gateway's HMAC-verified webhook (`POST
  * /api/webhooks/provider/spin`), the gateway debits/credits the Go ledger, and the ledger's
  * post-balances become the truth. The browser's only money operation is the read:
- * `GET /api/wallet` → mirror → render. This window demonstrates exactly that loop — spin
- * animation for feel, then a re-fetch of the authoritative balances. No optimistic
- * deduction, no local win math, no client-supplied amounts.
+ * `GET /api/wallet` → shared React Query cache → render. This window demonstrates exactly
+ * that loop — spin animation for feel, then a re-read of the authoritative balances. No
+ * optimistic deduction, no local win math, no client-supplied amounts.
+ *
+ * The wallet "mirror" IS the shared React Query cache entry (`walletKeys.balances()`),
+ * observed through useWalletQuery. This component holds no balance state of its own, and the
+ * hook auto-hydrates on mount — there is no manual fetch effect to race.
  */
 const GAME_ID = "mock-slot-1";
 
@@ -28,8 +31,7 @@ interface Toast {
 const REEL_SYMBOLS = ["🍒", "💎", "7️⃣", "🔔", "👑", "🍋"] as const;
 
 export function MockGameWindow() {
-  const balances = useWalletStore((s) => s.balances);
-  const status = useWalletStore((s) => s.status);
+  const { balances, phase, errorStatus, refetch } = useWalletQuery();
 
   const [isSpinning, setIsSpinning] = useState(false);
   const [reels, setReels] = useState<readonly [string, string, string]>(["👑", "👑", "👑"]);
@@ -48,31 +50,6 @@ export function MockGameWindow() {
     toastTimer.current = setTimeout(() => setToast(null), 4_000);
   }, []);
 
-  /** Pull the authoritative snapshot from the gateway and overwrite the mirror. */
-  const syncWallet = useCallback(async (): Promise<boolean> => {
-    const { beginSync, setBalances, failSync } = useWalletStore.getState();
-    beginSync();
-    try {
-      setBalances(await fetchWalletBalances());
-      return true;
-    } catch (error) {
-      failSync();
-      showToast({
-        kind: "error",
-        message:
-          error instanceof ApiError && error.status === 401
-            ? "Log in to see your wallet."
-            : "Could not reach the cashier — balances may be stale.",
-      });
-      return false;
-    }
-  }, [showToast]);
-
-  // Hydrate the mirror on mount; production would refresh on a realtime channel instead.
-  useEffect(() => {
-    void syncWallet();
-  }, [syncWallet]);
-
   const handleSpin = useCallback(async () => {
     if (isSpinning) return;
     setIsSpinning(true);
@@ -88,14 +65,24 @@ export function MockGameWindow() {
 
     try {
       await new Promise((resolve) => setTimeout(resolve, 900));
-      // After the (out-of-band) round settles, the ledger is the only truth: re-fetch it.
-      const ok = await syncWallet();
-      if (ok) showToast({ kind: "success", message: "Wallet mirror synced with the ledger." });
+      // After the (out-of-band) round settles, the ledger is the only truth: re-read it.
+      const result = await refetch();
+      showToast(
+        result.ok
+          ? { kind: "success", message: "Wallet mirror synced with the ledger." }
+          : {
+              kind: "error",
+              message:
+                result.errorStatus === 401
+                  ? "Log in to see your wallet."
+                  : "Could not reach the cashier — balances may be stale.",
+            },
+      );
     } finally {
       clearInterval(spinAnimation);
       setIsSpinning(false);
     }
-  }, [isSpinning, showToast, syncWallet]);
+  }, [isSpinning, refetch, showToast]);
 
   return (
     <div className="relative w-full max-w-md rounded-3xl border border-amber-500/30 bg-gradient-to-b from-zinc-900 via-zinc-950 to-black p-6 shadow-[0_0_60px_-15px_rgba(245,158,11,0.4)]">
@@ -122,10 +109,10 @@ export function MockGameWindow() {
         />
       </div>
       <p className="mb-6 text-center text-[9px] uppercase tracking-wider text-zinc-600">
-        {status === "synced" && "ledger-synced"}
-        {status === "syncing" && "syncing…"}
-        {status === "error" && "stale — last sync failed"}
-        {status === "empty" && "not synced"}
+        {phase === "synced" && "ledger-synced"}
+        {phase === "syncing" && "syncing…"}
+        {phase === "error" && (errorStatus === 401 ? "log in to see your wallet" : "stale — last sync failed")}
+        {phase === "empty" && "not synced"}
       </p>
 
       {/* Reels */}

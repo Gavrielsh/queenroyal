@@ -2,9 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { ApiError, confirmMockStripeDeposit, fetchWalletBalances, initiateStorePurchase } from "@/lib/apiClient";
+import { useWalletQuery } from "@/hooks/useWalletQuery";
+import { ApiError, confirmMockStripeDeposit, initiateStorePurchase } from "@/lib/apiClient";
 import { formatBalance } from "@/lib/format";
-import { useWalletStore } from "@/store/useWalletStore";
 
 /**
  * Cashier window (Zone 3) — a DUMB client by contract.
@@ -14,8 +14,12 @@ import { useWalletStore } from "@/store/useWalletStore";
  * gateway's own catalog decides what each id costs and grants, and the Go ledger decides the
  * resulting balances. A purchase is: open the PaymentIntent (`POST /api/store/purchase`),
  * confirm the payment (here the dev mock-confirm route stands in for Stripe.js +
- * `payment_intent.succeeded`), then RE-FETCH `/api/wallet` and overwrite the mirror with the
- * server's strings verbatim. No optimistic crediting, no price math, no float ever.
+ * `payment_intent.succeeded`), then RE-READ the wallet and let the server's strings overwrite
+ * the shared React Query cache verbatim. No optimistic crediting, no price math, no float ever.
+ *
+ * Balance state lives ONLY in the shared query cache (`walletKeys.balances()`) observed via
+ * useWalletQuery — the same entry the game window renders, so a settled purchase shows up in
+ * both, by construction. The hook auto-hydrates on mount; there is no manual fetch effect.
  */
 
 interface DisplayPackage {
@@ -41,8 +45,7 @@ interface Toast {
 }
 
 export function StoreWindow() {
-  const balances = useWalletStore((s) => s.balances);
-  const status = useWalletStore((s) => s.status);
+  const { balances, phase, errorStatus, refetch } = useWalletQuery();
 
   /** Package id with a purchase in flight, or null. One purchase at a time. */
   const [buyingId, setBuyingId] = useState<string | null>(null);
@@ -61,19 +64,6 @@ export function StoreWindow() {
     toastTimer.current = setTimeout(() => setToast(null), 4_000);
   }, []);
 
-  /** Pull the authoritative snapshot from the gateway and overwrite the mirror. */
-  const syncWallet = useCallback(async (): Promise<boolean> => {
-    const { beginSync, setBalances, failSync } = useWalletStore.getState();
-    beginSync();
-    try {
-      setBalances(await fetchWalletBalances());
-      return true;
-    } catch {
-      failSync();
-      return false;
-    }
-  }, []);
-
   const handleBuy = useCallback(
     async (pkg: DisplayPackage) => {
       if (buyingId) return;
@@ -88,9 +78,9 @@ export function StoreWindow() {
         await confirmMockStripeDeposit(intent.paymentIntentId);
 
         // The ledger has credited the coins — its answer is the only one we display.
-        const synced = await syncWallet();
+        const synced = await refetch();
         showToast(
-          synced
+          synced.ok
             ? { kind: "success", message: `${pkg.name} pack purchased — balances updated from the ledger.` }
             : { kind: "error", message: "Purchase settled, but the wallet re-read failed — balances may be stale." },
         );
@@ -108,7 +98,7 @@ export function StoreWindow() {
         setBuyingId(null);
       }
     },
-    [buyingId, showToast, syncWallet],
+    [buyingId, refetch, showToast],
   );
 
   return (
@@ -131,10 +121,10 @@ export function StoreWindow() {
         />
       </div>
       <p className="mb-6 text-center text-[9px] uppercase tracking-wider text-zinc-600">
-        {status === "synced" && "ledger-synced"}
-        {status === "syncing" && "syncing…"}
-        {status === "error" && "stale — last sync failed"}
-        {status === "empty" && "not synced"}
+        {phase === "synced" && "ledger-synced"}
+        {phase === "syncing" && "syncing…"}
+        {phase === "error" && (errorStatus === 401 ? "log in to see your wallet" : "stale — last sync failed")}
+        {phase === "empty" && "not synced"}
       </p>
 
       {/* Packages */}
