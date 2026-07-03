@@ -27,11 +27,53 @@ export class ApiError extends Error {
   }
 }
 
-/** Error body shape the gateway returns on failures. */
-interface GatewayErrorBody {
-  code?: string;
-  error?: string;
-  message?: string;
+/**
+ * Extract `{ code, message }` from a gateway failure body. The canonical envelope nests them —
+ * `{ success: false, error: { code, message } }` (apps/financial-gateway/src/lib/reply.ts) —
+ * while flat `{ code, message }` is kept as a defensive fallback for non-canonical origins
+ * (intermediary proxies, legacy handlers). Unrecognized shapes yield `{}`.
+ */
+function extractGatewayError(body: unknown): { code?: string; message?: string } {
+  if (typeof body !== "object" || body === null) return {};
+  const record = body as Record<string, unknown>;
+
+  const nested = record.error;
+  if (typeof nested === "object" && nested !== null) {
+    const err = nested as Record<string, unknown>;
+    return {
+      code: typeof err.code === "string" ? err.code : undefined,
+      message: typeof err.message === "string" ? err.message : undefined,
+    };
+  }
+
+  return {
+    code: typeof record.code === "string" ? record.code : undefined,
+    message:
+      typeof record.message === "string"
+        ? record.message
+        : typeof nested === "string"
+          ? nested
+          : undefined,
+  };
+}
+
+/** True for the AbortError exception raised when an AbortSignal cancels a fetch. */
+function isAbortException(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+/**
+ * True when a thrown error is this client's normalized abort (`ApiError` code "ABORTED").
+ * Aborts are deliberate cancellations (unmount/supersede) — callers keep them silent; they
+ * must never surface as a transport fault or an error toast.
+ */
+export function isAbortError(error: unknown): boolean {
+  return error instanceof ApiError && error.code === "ABORTED";
+}
+
+/** Options accepted by every request; `signal` lets React Query cancel superseded reads. */
+export interface RequestOptions {
+  signal?: AbortSignal;
 }
 
 function readAccessToken(): string | null {
@@ -51,6 +93,7 @@ async function request<TResponse>(
   method: "GET" | "POST" | "PUT" | "DELETE",
   path: string,
   body?: unknown,
+  opts?: RequestOptions,
 ): Promise<TResponse> {
   const headers = new Headers({ Accept: "application/json" });
   if (body !== undefined) headers.set("Content-Type", "application/json");
@@ -66,35 +109,54 @@ async function request<TResponse>(
       body: body !== undefined ? JSON.stringify(body) : undefined,
       // The gateway authenticates via the bearer header; cookies stay out of it.
       credentials: "omit",
+      signal: opts?.signal,
     });
   } catch (cause) {
+    // An abort is a deliberate cancellation, NEVER a transport fault — classify it first so
+    // it can stay silent instead of surfacing as "cashier unreachable".
+    if (opts?.signal?.aborted || isAbortException(cause)) {
+      throw new ApiError(0, "ABORTED", "Request aborted", { cause });
+    }
     throw new ApiError(0, "NETWORK_ERROR", "Could not reach the gateway", { cause });
   }
 
   if (!response.ok) {
-    let errorBody: GatewayErrorBody = {};
+    let parsed: unknown;
     try {
-      errorBody = (await response.json()) as GatewayErrorBody;
+      parsed = await response.json();
     } catch {
-      // Non-JSON error body — fall back to the status text.
+      parsed = undefined; // Non-JSON error body — fall back to the status text.
     }
-    throw new ApiError(
-      response.status,
-      errorBody.code,
-      errorBody.message ?? errorBody.error ?? response.statusText,
-    );
+    const { code, message } = extractGatewayError(parsed);
+    throw new ApiError(response.status, code, message ?? response.statusText);
   }
 
   // 204-style responses settle to undefined; callers type that explicitly.
   if (response.status === 204) return undefined as TResponse;
-  return (await response.json()) as TResponse;
+
+  try {
+    return (await response.json()) as TResponse;
+  } catch (cause) {
+    // The signal can fire between the response resolving and the body finishing.
+    if (opts?.signal?.aborted || isAbortException(cause)) {
+      throw new ApiError(0, "ABORTED", "Request aborted", { cause });
+    }
+    // A 2xx whose body isn't parseable JSON breaks the client contract; normalize it instead
+    // of leaking a raw SyntaxError into feature code.
+    throw new ApiError(response.status, "MALFORMED_RESPONSE", "Gateway returned an unparseable body", {
+      cause,
+    });
+  }
 }
 
 export const apiClient = {
-  get: <TResponse>(path: string) => request<TResponse>("GET", path),
-  post: <TResponse>(path: string, body: unknown) => request<TResponse>("POST", path, body),
-  put: <TResponse>(path: string, body: unknown) => request<TResponse>("PUT", path, body),
-  delete: <TResponse>(path: string) => request<TResponse>("DELETE", path),
+  get: <TResponse>(path: string, opts?: RequestOptions) => request<TResponse>("GET", path, undefined, opts),
+  post: <TResponse>(path: string, body: unknown, opts?: RequestOptions) =>
+    request<TResponse>("POST", path, body, opts),
+  put: <TResponse>(path: string, body: unknown, opts?: RequestOptions) =>
+    request<TResponse>("PUT", path, body, opts),
+  delete: <TResponse>(path: string, opts?: RequestOptions) =>
+    request<TResponse>("DELETE", path, undefined, opts),
 } as const;
 
 // ── Dev-only session bootstrap ───────────────────────────────────────────────
@@ -144,19 +206,21 @@ export async function mockDevLogin(): Promise<void> {
 
 // ── Wallet mirror ────────────────────────────────────────────────────────────
 
-/** Gateway envelope for GET /api/wallet. Balances are the engine's decimal STRINGS. */
-interface WalletEnvelope {
-  success: true;
-  data: {
-    player_id: string;
-    balances: {
-      gc: string;
-      sc_unplayed: string;
-      sc_redeemable: string;
-    };
-  };
+/**
+ * Engine wire format for money: an unsigned decimal STRING with an integer part and at most
+ * 4 fractional digits (`"12.3400"`, `"0"`, `"20000"`). No sign, no exponent, no bare or
+ * dangling dot. Mirrors the authoritative gateway contract
+ * (apps/financial-gateway/src/lib/money.ts `MONEY_REGEX`), which itself mirrors the engine's
+ * `NUMERIC(18,4)` JSON-string serialization.
+ */
+export const MONEY_STRING_REGEX = /^\d+(\.\d{1,4})?$/;
+
+/** True iff `value` is a money string in the engine wire format above. */
+export function isMoneyString(value: unknown): value is string {
+  return typeof value === "string" && MONEY_STRING_REGEX.test(value);
 }
 
+/** Camel-cased, runtime-validated wallet snapshot. Values are the engine's strings, verbatim. */
 export interface WalletBalancesDto {
   gc: string;
   scUnplayed: string;
@@ -164,18 +228,52 @@ export interface WalletBalancesDto {
 }
 
 /**
- * Fetch the authoritative wallet snapshot from the gateway (which reads it from the Go
- * ledger). The strings are renamed to camelCase but NEVER parsed into numbers — Zone 3
- * renders money, it does not compute it.
+ * Validate the `GET /api/wallet` envelope — `{ success: true, data: { player_id, balances:
+ * { gc, sc_unplayed, sc_redeemable } } }` — BEFORE any value can reach the query cache. A
+ * payload that fails shape or money-format validation becomes an `ApiError` with code
+ * "MALFORMED_WALLET" (a query ERROR, never cached data). `player_id` is not consumed by
+ * Zone 3 and is deliberately not validated.
+ *
+ * Security note: failure messages name the offending FIELD but never echo its value — a
+ * payload the validator rejected is untrusted by definition and stays out of logs/telemetry.
+ *
+ * Exported for reuse: the M4 realtime path must pass every push through this same gate
+ * before `setQueryData` ("realtime is a faster source, never a looser gate").
  */
-export async function fetchWalletBalances(): Promise<WalletBalancesDto> {
-  const res = await apiClient.get<WalletEnvelope>("/wallet");
-  const { balances } = res.data;
-  return {
-    gc: balances.gc,
-    scUnplayed: balances.sc_unplayed,
-    scRedeemable: balances.sc_redeemable,
-  };
+export function parseWalletEnvelope(payload: unknown): WalletBalancesDto {
+  const malformed = (field: string): ApiError =>
+    new ApiError(0, "MALFORMED_WALLET", `Wallet envelope failed validation at ${field}`);
+
+  if (typeof payload !== "object" || payload === null) throw malformed("(root)");
+  const envelope = payload as Record<string, unknown>;
+  if (envelope.success !== true) throw malformed("success");
+
+  const data = envelope.data;
+  if (typeof data !== "object" || data === null) throw malformed("data");
+  const balances = (data as Record<string, unknown>).balances;
+  if (typeof balances !== "object" || balances === null) throw malformed("data.balances");
+
+  const record = balances as Record<string, unknown>;
+  const gc = record.gc;
+  if (!isMoneyString(gc)) throw malformed("data.balances.gc");
+  const scUnplayed = record.sc_unplayed;
+  if (!isMoneyString(scUnplayed)) throw malformed("data.balances.sc_unplayed");
+  const scRedeemable = record.sc_redeemable;
+  if (!isMoneyString(scRedeemable)) throw malformed("data.balances.sc_redeemable");
+
+  return { gc, scUnplayed, scRedeemable };
+}
+
+/**
+ * Fetch the authoritative wallet snapshot from the gateway (which reads it from the Go
+ * ledger). The response is runtime-validated (envelope shape + money-string format), and the
+ * strings are renamed to camelCase but NEVER parsed into numbers — Zone 3 renders money, it
+ * does not compute it. Pass React Query's `signal` so a superseded or unmounted read is
+ * genuinely cancelled rather than left to race.
+ */
+export async function fetchWalletBalances(opts?: RequestOptions): Promise<WalletBalancesDto> {
+  const payload = await apiClient.get<unknown>("/wallet", opts);
+  return parseWalletEnvelope(payload);
 }
 
 // ── Cashier (store) ──────────────────────────────────────────────────────────
