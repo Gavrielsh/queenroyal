@@ -6,6 +6,8 @@
  * error normalization so feature code never touches raw `fetch`.
  */
 
+import { type AttemptToken, peekAttemptToken } from "@/lib/purchaseIntent";
+
 const GATEWAY_BASE_URL = (
   process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:4000/api"
 ).replace(/\/+$/, "");
@@ -278,6 +280,23 @@ export async function fetchWalletBalances(opts?: RequestOptions): Promise<Wallet
 
 // ── Cashier (store) ──────────────────────────────────────────────────────────
 
+/**
+ * SERVER-ANCHORED IDEMPOTENCY CONTRACT (verified read-only against the gateway source):
+ *
+ * The attempt token this client sends as `idempotencyKey` is the gateway's attempt anchor
+ * (store.service.ts): the PSP PaymentIntent is GET-OR-CREATE on it (payments/mock.ts keys
+ * intents by idempotencyKey and returns the same intent + client_secret on a replay; real
+ * Stripe's Idempotency-Key behaves identically), the intent journal collapses duplicates via
+ * a UNIQUE constraint + ON CONFLICT DO NOTHING (engine-journal.repository.ts), and the
+ * ledger credit's `operator_transaction_id` is `deposit:<token>`, which the Go engine
+ * de-duplicates (23505 ghost recovery). A retry with the SAME token therefore converges on
+ * one charge and one credit across tabs, reloads, and devices — which is exactly why the
+ * token parameter below is the branded AttemptToken: only a value retained by the
+ * purchaseIntent lifecycle can reach the wire. The gateway treats the key as OPTIONAL and
+ * mints a per-call UUID when absent — so sending the retained token is load-bearing, not
+ * advisory.
+ */
+
 /** Gateway envelope for POST /api/store/purchase (async PSP flow: nothing is captured yet). */
 interface PurchaseEnvelope {
   success: true;
@@ -293,29 +312,55 @@ export interface PurchaseIntentDto {
   paymentIntentId: string;
   /** With a real PSP this is what Stripe.js confirms the card against (3DS/SCA included). */
   clientSecret: string;
+  /** The logical purchase this intent belongs to — binds the confirm step to its attempt. */
+  packageId: string;
+  /** The attempt token the intent was opened under (the server's idempotency anchor). */
+  token: AttemptToken;
 }
 
 /**
  * Open a deposit PaymentIntent for a catalog package. The gateway owns the catalog, the
- * price, and the coin amounts — the browser sends only the package id plus a stable
- * idempotency key so a double-click can never open (or settle) the deposit twice.
+ * price, and the coin amounts — the browser sends only the package id plus the RETAINED
+ * attempt token (compile-enforced: a raw string/UUID is a type error), so a retry can never
+ * open (or settle) the deposit twice.
  */
 export async function initiateStorePurchase(
   packageId: string,
-  idempotencyKey: string,
+  attemptToken: AttemptToken,
 ): Promise<PurchaseIntentDto> {
-  const res = await apiClient.post<PurchaseEnvelope>("/store/purchase", { packageId, idempotencyKey });
-  return { paymentIntentId: res.data.paymentIntentId, clientSecret: res.data.clientSecret };
+  const res = await apiClient.post<PurchaseEnvelope>("/store/purchase", {
+    packageId,
+    idempotencyKey: attemptToken,
+  });
+  return {
+    paymentIntentId: res.data.paymentIntentId,
+    clientSecret: res.data.clientSecret,
+    packageId,
+    token: attemptToken,
+  };
 }
+
+/** Outcome of a confirm request; `already_settled` means the guard skipped the wire call. */
+export type DepositConfirmOutcome = { status: "settled" } | { status: "already_settled" };
 
 /**
  * DEV-ONLY stand-in for `stripe.confirmCardPayment(clientSecret)`: asks the gateway's mock
  * PSP to mark the intent captured and run the same signed-webhook settlement the real Stripe
  * flow uses. The response carries no balances — the wallet is re-read afterwards.
+ *
+ * Confirm-after-settle guard: if the intent's attempt token is no longer the LIVE token for
+ * its package (cleared by a settle/abandon here or in a peer tab, or superseded by a newer
+ * attempt), the money question is already answered — the confirm is a local no-op and never
+ * touches the wire. (The server side is idempotent too: the journal never regresses a final
+ * intent — this guard just avoids asking a question whose answer is known.)
  */
-export async function confirmMockStripeDeposit(paymentIntentId: string): Promise<void> {
+export async function confirmMockStripeDeposit(intent: PurchaseIntentDto): Promise<DepositConfirmOutcome> {
+  if (peekAttemptToken(intent.packageId) !== intent.token) {
+    return { status: "already_settled" };
+  }
   await apiClient.post<{ success: true; data: { status: "settled" } }>(
     "/store/purchase/mock-confirm",
-    { paymentIntentId },
+    { paymentIntentId: intent.paymentIntentId },
   );
+  return { status: "settled" };
 }

@@ -98,7 +98,9 @@ export function usePurchaseMutation(): PurchaseMutationView {
       const token = getOrCreateAttemptToken(packageId);
       markAttemptStarted(packageId);
       const intent = await initiateStorePurchase(packageId, token);
-      await confirmMockStripeDeposit(intent.paymentIntentId);
+      // `already_settled` (the confirm-after-settle guard fired) means the money question is
+      // already answered — proceed to the same settle path; markSettled is a quiet no-op.
+      await confirmMockStripeDeposit(intent);
       // Terminal success: rotate the token BEFORE the re-read — the money is settled
       // regardless of whether the balance read that follows succeeds.
       markSettled(packageId);

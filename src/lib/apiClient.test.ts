@@ -2,12 +2,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ApiError,
+  confirmMockStripeDeposit,
   fetchWalletBalances,
+  initiateStorePurchase,
   isAbortError,
   isMoneyString,
   parseWalletEnvelope,
 } from "@/lib/apiClient";
+import { getOrCreateAttemptToken, markSettled } from "@/lib/purchaseIntent";
 import { walletBalancesQueryFn } from "@/lib/walletQueryFn";
+
+/** Minimal BroadcastChannel double so the purchaseIntent module wires deterministically. */
+class QuietBroadcastChannel {
+  onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+  constructor(readonly name: string) {}
+  postMessage(): void {}
+  close(): void {}
+}
 
 /** Build a real Response carrying a JSON body. */
 function jsonResponse(payload: unknown, status = 200): Response {
@@ -51,7 +62,9 @@ function walletEnvelope(overrides: Record<string, unknown> = {}): unknown {
 const fetchMock = vi.fn<typeof fetch>();
 
 beforeEach(() => {
+  vi.stubGlobal("BroadcastChannel", QuietBroadcastChannel);
   vi.stubGlobal("fetch", fetchMock);
+  window.localStorage.clear();
 });
 
 afterEach(() => {
@@ -246,6 +259,80 @@ describe("walletBalancesQueryFn", () => {
 
     expect(dto.gc).toBe("1000.0000");
     expect(fetchMock.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
+  });
+});
+
+describe("purchase boundary — server-anchored idempotency (brand + confirm guard)", () => {
+  const intentEnvelope = {
+    success: true,
+    data: {
+      status: "requires_payment_confirmation",
+      paymentIntentId: "pi_brand_1",
+      clientSecret: "cs_brand_1",
+      operatorTransactionId: "op_brand_1",
+    },
+  };
+
+  it("REJECTS a raw string/UUID at compile time — only a retained AttemptToken reaches the wire", () => {
+    // The brand is the enforcement mechanism: this must not type-check.
+    // @ts-expect-error — a raw string is not an AttemptToken
+    const call = () => initiateStorePurchase("pkg_brand", crypto.randomUUID());
+    expect(typeof call).toBe("function"); // never invoked; the assertion is the compile error
+  });
+
+  it("sends the retained token as idempotencyKey and binds it into the returned intent", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(intentEnvelope));
+    const token = getOrCreateAttemptToken("pkg_brand_wire");
+
+    const intent = await initiateStorePurchase("pkg_brand_wire", token);
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+    expect(body).toEqual({ packageId: "pkg_brand_wire", idempotencyKey: token });
+    expect(intent).toEqual({
+      paymentIntentId: "pi_brand_1",
+      clientSecret: "cs_brand_1",
+      packageId: "pkg_brand_wire",
+      token,
+    });
+  });
+
+  it("confirms a LIVE attempt over the wire", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(intentEnvelope));
+    const token = getOrCreateAttemptToken("pkg_confirm_live");
+    const intent = await initiateStorePurchase("pkg_confirm_live", token);
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ success: true, data: { status: "settled" } }));
+    const outcome = await confirmMockStripeDeposit(intent);
+
+    expect(outcome).toEqual({ status: "settled" });
+    expect(fetchMock).toHaveBeenCalledTimes(2); // initiate + confirm
+  });
+
+  it("confirm-after-settle NO-OPS locally: the wire is never touched", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(intentEnvelope));
+    const token = getOrCreateAttemptToken("pkg_confirm_settled");
+    const intent = await initiateStorePurchase("pkg_confirm_settled", token);
+
+    markSettled("pkg_confirm_settled"); // the attempt reached its terminal outcome elsewhere
+
+    const outcome = await confirmMockStripeDeposit(intent);
+
+    expect(outcome).toEqual({ status: "already_settled" });
+    expect(fetchMock).toHaveBeenCalledTimes(1); // initiate only — no confirm POST
+  });
+
+  it("confirm for a SUPERSEDED attempt (newer token minted) also no-ops", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(intentEnvelope));
+    const staleToken = getOrCreateAttemptToken("pkg_confirm_superseded");
+    const staleIntent = await initiateStorePurchase("pkg_confirm_superseded", staleToken);
+
+    markSettled("pkg_confirm_superseded");
+    getOrCreateAttemptToken("pkg_confirm_superseded"); // a NEW logical purchase begins
+
+    const outcome = await confirmMockStripeDeposit(staleIntent);
+
+    expect(outcome).toEqual({ status: "already_settled" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

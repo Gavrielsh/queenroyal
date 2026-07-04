@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { classifyPurchaseError, usePurchaseMutation } from "@/hooks/usePurchaseMutation";
 import { useWalletQuery } from "@/hooks/useWalletQuery";
 import { ApiError } from "@/lib/apiClient";
-import { peekAttemptToken } from "@/lib/purchaseIntent";
+import { markSettled, peekAttemptToken } from "@/lib/purchaseIntent";
 import { makeQueryClient } from "@/lib/queryClient";
 
 /** Deterministic BroadcastChannel double (the module wires to it on first use). */
@@ -291,6 +291,34 @@ describe("usePurchaseMutation — token lifecycle on the wire", () => {
 
     expect(outcome).toEqual({ status: "settled", walletSynced: false });
     expect(peekAttemptToken(pkg)).toBeNull();
+  });
+
+  it("a peer settling MID-FLIGHT makes confirm a local no-op — the purchase still resolves settled", async () => {
+    const pkg = "pkg_m2t3_peer_settle";
+    scriptGateway({
+      initiate: [
+        () => {
+          // The attempt settles elsewhere WHILE the initiate response is in flight — after
+          // the mutation captured its token, before the confirm guard runs.
+          markSettled(pkg);
+          return jsonResponse(intentEnvelope);
+        },
+      ],
+      confirm: [
+        () => {
+          throw new Error("confirm must never reach the wire when the attempt is already settled");
+        },
+      ],
+    });
+    const { result } = mountPurchase();
+
+    const outcome = await result.current.mutation.purchase(pkg);
+
+    expect(outcome.status).toBe("settled");
+    const confirmCalls = fetchMock.mock.calls.filter(([url]) =>
+      String(url).endsWith("/store/purchase/mock-confirm"),
+    );
+    expect(confirmCalls).toHaveLength(0);
   });
 
   it("exposes isPending + pendingPackageId across the whole money window", async () => {
