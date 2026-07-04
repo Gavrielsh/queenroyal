@@ -37,7 +37,7 @@ test("02 — casino floor: first-load syncing (wallet read in flight)", async ({
 
   await page.goto("/casino");
   await expect(page.getByText("syncing…")).toHaveCount(2);
-  await expect(page.getByText("—").first()).toBeVisible(); // honest placeholders, never zeros
+  await expect(page.getByTestId("balance-skeleton")).toHaveCount(5); // honest skeletons, never zeros
 
   await capture(page, testInfo, "02-casino-syncing");
   // The hanging wallet read is still pending by design — it is stubbed, not escaped.

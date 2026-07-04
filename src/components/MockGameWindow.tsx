@@ -2,8 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { BalanceChip } from "@/components/wallet/BalanceChip";
+import { WalletStatusBanner } from "@/components/wallet/WalletStatusBanner";
 import { useWalletQuery } from "@/hooks/useWalletQuery";
-import { formatBalance } from "@/lib/format";
 
 /**
  * Dev harness for the Zone 3 wallet mirror.
@@ -31,7 +32,7 @@ interface Toast {
 const REEL_SYMBOLS = ["🍒", "💎", "7️⃣", "🔔", "👑", "🍋"] as const;
 
 export function MockGameWindow() {
-  const { balances, phase, errorStatus, invalidate } = useWalletQuery();
+  const { balances, phase, errorStatus, lastSyncedAt, invalidate } = useWalletQuery();
 
   const [isSpinning, setIsSpinning] = useState(false);
   const [reels, setReels] = useState<readonly [string, string, string]>(["👑", "👑", "👑"]);
@@ -95,26 +96,13 @@ export function MockGameWindow() {
         <p className="mt-1 text-[10px] uppercase tracking-[0.3em] text-zinc-500">Mock Slot · {GAME_ID}</p>
       </div>
 
-      {/* Live balances — a verbatim render of the ledger's strings, or honest placeholders. */}
+      {/* Live balances — verbatim ledger strings via the shared chip (skeletons while loading). */}
       <div className="mb-2 grid grid-cols-3 gap-2">
-        <BalanceChip label="GC" value={balances ? formatBalance(balances.gc) : "—"} accent="text-amber-300" />
-        <BalanceChip
-          label="SC Unplayed"
-          value={balances ? formatBalance(balances.scUnplayed) : "—"}
-          accent="text-emerald-300"
-        />
-        <BalanceChip
-          label="SC Redeemable"
-          value={balances ? formatBalance(balances.scRedeemable) : "—"}
-          accent="text-sky-300"
-        />
+        <BalanceChip family="gc" value={balances?.gc ?? null} stale={phase === "error"} />
+        <BalanceChip family="scUnplayed" value={balances?.scUnplayed ?? null} stale={phase === "error"} />
+        <BalanceChip family="scRedeemable" value={balances?.scRedeemable ?? null} stale={phase === "error"} />
       </div>
-      <p className="mb-6 text-center text-[9px] uppercase tracking-wider text-zinc-600">
-        {phase === "synced" && "ledger-synced"}
-        {phase === "syncing" && "syncing…"}
-        {phase === "error" && (errorStatus === 401 ? "log in to see your wallet" : "stale — last sync failed")}
-        {phase === "empty" && "not synced"}
-      </p>
+      <WalletStatusBanner phase={phase} errorStatus={errorStatus} lastSyncedAt={lastSyncedAt} />
 
       {/* Reels */}
       <div className="mb-6 flex justify-center gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/80 p-4">
@@ -153,15 +141,6 @@ export function MockGameWindow() {
           {toast.message}
         </div>
       )}
-    </div>
-  );
-}
-
-function BalanceChip({ label, value, accent }: { label: string; value: string; accent: string }) {
-  return (
-    <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 px-2 py-2 text-center">
-      <p className="text-[9px] uppercase tracking-wider text-zinc-500">{label}</p>
-      <p className={`truncate text-sm font-bold tabular-nums ${accent}`}>{value}</p>
     </div>
   );
 }

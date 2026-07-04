@@ -175,7 +175,7 @@ describe("component convergence — both windows, one cache entry", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("renders honest '—' placeholders in both windows while the first read is in flight", () => {
+  it("renders honest loading skeletons in both windows while the first read is in flight", () => {
     fetchMock.mockImplementationOnce(() => new Promise<Response>(() => {}));
 
     renderWithClient(
@@ -185,8 +185,11 @@ describe("component convergence — both windows, one cache entry", () => {
       </>,
     );
 
-    // 3 chips in the game window + 2 in the store window, all placeholders.
-    expect(screen.getAllByText("—")).toHaveLength(5);
+    // 3 chips in the game window + 2 in the store window — all skeletons, never zeros.
+    const skeletons = screen.getAllByTestId("balance-skeleton");
+    expect(skeletons).toHaveLength(5);
+    for (const skeleton of skeletons) expect(skeleton).toHaveRole("status");
+    expect(screen.queryAllByTestId("balance-value")).toHaveLength(0);
     expect(screen.getAllByText("syncing…")).toHaveLength(2);
   });
 
