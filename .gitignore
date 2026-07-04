@@ -19,5 +19,10 @@ next-env.d.ts
 # typescript incremental build info
 *.tsbuildinfo
 
+# playwright visual harness output (regenerate with `npm run test:visual`)
+e2e/screenshots
+e2e/test-results
+playwright-report
+
 # misc
 .DS_Store
