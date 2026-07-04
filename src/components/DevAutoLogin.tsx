@@ -44,8 +44,18 @@ export function DevAutoLogin({ children }: { children: ReactNode }) {
 
   if (phase === "pending") {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-black">
-        <p className="animate-pulse text-[10px] uppercase tracking-[0.3em] text-zinc-600">
+      <div className="flex min-h-[60vh] flex-col items-center justify-center gap-5">
+        <span
+          aria-hidden="true"
+          className="bg-gradient-to-b from-gc to-gc-deep bg-clip-text text-4xl text-transparent"
+        >
+          ♛
+        </span>
+        <span
+          aria-hidden="true"
+          className="h-8 w-8 animate-spin rounded-full border-2 border-edge-strong border-t-gc"
+        />
+        <p className="animate-pulse text-[10px] uppercase tracking-[0.3em] text-ink-faint">
           connecting to cashier…
         </p>
       </div>
@@ -57,7 +67,7 @@ export function DevAutoLogin({ children }: { children: ReactNode }) {
       {phase === "failed" && (
         <div
           role="alert"
-          className="fixed inset-x-0 top-0 z-50 bg-red-950/95 px-4 py-2 text-center text-xs font-semibold text-red-200 ring-1 ring-red-500/40"
+          className="fixed inset-x-0 top-16 z-40 border-b border-danger/40 bg-surface-1/95 px-4 py-2.5 text-center text-xs font-semibold text-danger backdrop-blur-md"
         >
           Dev auto-login failed — is the gateway running? Wallet requests will be unauthorized
           until it is.

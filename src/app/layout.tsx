@@ -2,6 +2,9 @@ import type { Metadata } from "next";
 import { Manrope } from "next/font/google";
 import type { ReactNode } from "react";
 
+import { Footer } from "@/components/shell/Footer";
+import { NavBar } from "@/components/shell/NavBar";
+
 import "./globals.css";
 import { Providers } from "./providers";
 
@@ -17,8 +20,9 @@ const manrope = Manrope({
 });
 
 export const metadata: Metadata = {
-  title: "QueenRoyal",
-  description: "Social Sweepstakes Casino — player web UI.",
+  title: "QueenRoyal — Social Sweepstakes Casino",
+  description:
+    "Play-for-fun social casino with sweepstakes prizes. 18+. No purchase necessary. Void where prohibited.",
 };
 
 /**
@@ -29,12 +33,18 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en" className={manrope.variable}>
-      <body>
+      <body className="flex min-h-screen flex-col bg-surface-0 text-ink antialiased">
         {/*
           React Query cache provider. Mounted here in the root layout — ABOVE the page-level
-          DevAutoLogin auth gate — so the gate and every query it gates share one client.
+          DevAutoLogin auth gate — so the gate and every query it gates share one client. The
+          shell (NavBar/Footer) sits inside it too: the NavBar's wallet slot consumes the same
+          cache once M3-T4 wires it.
         */}
-        <Providers>{children}</Providers>
+        <Providers>
+          <NavBar />
+          <div className="flex-1">{children}</div>
+          <Footer />
+        </Providers>
       </body>
     </html>
   );
