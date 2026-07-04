@@ -1,1 +1,182 @@
 @import "tailwindcss";
+
+/**
+ * QueenRoyal design tokens — Tailwind 4 CSS-first theme (M3-T2).
+ *
+ * DARK-ONLY BY DESIGN: this is a casino floor; there is no light theme and none is planned.
+ * `color-scheme: dark` is declared globally so form controls/scrollbars follow.
+ *
+ * Currency families map to fixed semantic accents — components never invent money colors:
+ *   GC (Gold Coins)        → --color-gc        (gold/amber)
+ *   SC Unplayed            → --color-sc-unplayed  (emerald)
+ *   SC Redeemable          → --color-sc-redeemable (sky)
+ *
+ * Text tokens are contrast-locked against the darkest surfaces (--color-surface-0/1):
+ *   --color-ink        ≈ 17.9:1   primary copy
+ *   --color-ink-mute   ≈  7.7:1   secondary copy
+ *   --color-ink-faint  ≈  4.6:1   microcopy floor (the WCAG AA 4.5:1 minimum, verified)
+ * (Ratios computed against #0b0b10; see the M3-T2 task report for the full table.)
+ */
+@theme {
+  /* ── Typography ─────────────────────────────────────────────────────────── */
+  /* --font-manrope is injected by next/font in layout.tsx (self-hosted, display:swap). */
+  --font-sans:
+    var(--font-manrope), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+
+  /* ── Surfaces (dark-only elevation scale) ───────────────────────────────── */
+  --color-surface-0: #050507; /* page depth */
+  --color-surface-1: #0b0b10; /* card base */
+  --color-surface-2: #14141b; /* raised panel */
+  --color-surface-3: #1d1d27; /* highest elevation */
+  --color-edge: #26262f; /* hairline borders */
+  --color-edge-strong: #3a3a46;
+
+  /* ── Text (contrast-locked, see header) ─────────────────────────────────── */
+  --color-ink: #f4f4f6;
+  --color-ink-mute: #a9a9b4;
+  --color-ink-faint: #7d7d8a;
+
+  /* ── Currency families ──────────────────────────────────────────────────── */
+  --color-gc: #f5b62e;
+  --color-gc-deep: #b97f0a;
+  --color-sc-unplayed: #34d399;
+  --color-sc-unplayed-deep: #0f9b6c;
+  --color-sc-redeemable: #38bdf8;
+  --color-sc-redeemable-deep: #0284c7;
+
+  /* ── Global semantics ───────────────────────────────────────────────────── */
+  --color-success: #34d399;
+  --color-danger: #f87171;
+  --color-warning: #fbbf24;
+  /* Distinct state accents for money-flow UI (stale ≠ error; pending ≠ loading). */
+  --color-stale: #fbbf24;
+  --color-pending: #a78bfa;
+  --color-focus: #7dd3fc;
+
+  /* ── Radii ───────────────────────────────────────────────────────────────── */
+  --radius-card: 1.5rem; /* window shells */
+  --radius-control: 0.875rem; /* buttons */
+  --radius-chip: 0.75rem; /* balance chips, badges */
+
+  /* ── Glows (brand shadows) ──────────────────────────────────────────────── */
+  --shadow-glow-gc: 0 0 60px -15px rgb(245 182 46 / 0.4);
+  --shadow-glow-sc: 0 0 60px -15px rgb(52 211 153 / 0.4);
+  --shadow-glow-danger: 0 0 50px -15px rgb(248 113 113 / 0.45);
+  --shadow-lift: 0 10px 30px -12px rgb(0 0 0 / 0.7);
+
+  /* ── Motion ─────────────────────────────────────────────────────────────── */
+  --ease-settle: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-reel: cubic-bezier(0.65, 0, 0.35, 1);
+
+  /* Registered animations → animate-shimmer / animate-pulse-glow / animate-settle-pop /
+     animate-reel-spin utilities. Keyframes live inside @theme so they are always emitted
+     with their tokens. */
+  --animate-shimmer: shimmer 2s linear infinite;
+  --animate-pulse-glow: pulse-glow 1.4s var(--ease-settle) 1;
+  --animate-settle-pop: settle-pop 600ms var(--ease-settle) both;
+  --animate-reel-spin: reel-spin 240ms var(--ease-reel) infinite;
+
+  /* Skeleton/loading sweep for money placeholders (consumed via animate-shimmer +
+     a gradient background sized 200%). */
+  @keyframes shimmer {
+    from {
+      background-position: 200% 0;
+    }
+    to {
+      background-position: -200% 0;
+    }
+  }
+
+  /* String-driven balance-change pulse (NO numeric tweening — money is never parsed). */
+  @keyframes pulse-glow {
+    0%,
+    100% {
+      opacity: 1;
+      filter: brightness(1);
+    }
+    50% {
+      opacity: 0.94;
+      filter: brightness(1.35);
+    }
+  }
+
+  /* Settle confirmation pop (purchase success, reel stop). */
+  @keyframes settle-pop {
+    0% {
+      transform: scale(0.92);
+      opacity: 0.6;
+    }
+    60% {
+      transform: scale(1.05);
+    }
+    100% {
+      transform: scale(1);
+      opacity: 1;
+    }
+  }
+
+  /* Reel blur-cycle while a spin is in flight. */
+  @keyframes reel-spin {
+    0% {
+      transform: translateY(-8%);
+      filter: blur(0);
+    }
+    50% {
+      transform: translateY(8%);
+      filter: blur(1.5px);
+    }
+    100% {
+      transform: translateY(-8%);
+      filter: blur(0);
+    }
+  }
+}
+
+@layer base {
+  /* Dark-only product: native controls, scrollbars and UA widgets follow. */
+  html {
+    color-scheme: dark;
+  }
+
+  /* Brand selection color (gold on deep surface). */
+  ::selection {
+    background-color: rgb(245 182 46 / 0.3);
+    color: var(--color-ink);
+  }
+
+  /* Keyboard-visible focus for every interactive element (a11y floor for the epic). */
+  :focus-visible {
+    outline: 2px solid var(--color-focus);
+    outline-offset: 2px;
+  }
+
+  /* Slim, surface-matched scrollbars (WebKit + Firefox). */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-edge-strong) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-edge-strong);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+
+  /* Global reduced-motion discipline: every animation/transition collapses to a frame.
+     Component-level motion NEVER needs its own guard — this is the single switch. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    ::before,
+    ::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
