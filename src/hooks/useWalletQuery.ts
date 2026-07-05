@@ -12,6 +12,7 @@ import {
   type WalletSyncOutcome,
 } from "@/lib/walletInvalidate";
 import { walletBalancesQueryFn } from "@/lib/walletQueryFn";
+import { reconcileIntervalFor } from "@/lib/walletReconcile";
 
 export type { WalletInvalidateTrigger, WalletSyncOutcome } from "@/lib/walletInvalidate";
 
@@ -68,6 +69,10 @@ export function useWalletQuery(): WalletQueryView {
   const query = useQuery({
     queryKey: walletKeys.balances(),
     queryFn: walletBalancesQueryFn,
+    // Reconcile-until-changed (M4): while a money event is being converged on, this returns
+    // the controller's backoff delay; disarmed/converged/exhausted it returns false — i.e.
+    // exactly the behavior of having no refetchInterval at all.
+    refetchInterval: (query) => reconcileIntervalFor(query.state.data),
   });
 
   const invalidate = useCallback(

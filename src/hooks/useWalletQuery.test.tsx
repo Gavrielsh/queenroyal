@@ -5,6 +5,7 @@ import { MockGameWindow } from "@/components/MockGameWindow";
 import { StoreWindow } from "@/components/StoreWindow";
 import { useWalletQuery } from "@/hooks/useWalletQuery";
 import { walletKeys } from "@/lib/queryKeys";
+import { armReconcile, disarmReconcile, getReconcileState } from "@/lib/walletReconcile";
 import { renderWithClient } from "@/test/renderWithClient";
 
 function jsonResponse(payload: unknown, status = 200): Response {
@@ -35,9 +36,11 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  disarmReconcile(); // the controller is module-level state — never leak an armed cell
   vi.unstubAllGlobals();
   fetchMock.mockReset();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 /** Minimal consumer exposing the hook's view for assertions. */
@@ -151,6 +154,104 @@ describe("useWalletQuery — error semantics", () => {
       (call) => (call[1] as Record<string, unknown> | undefined)?.evt === "wallet.query.error",
     );
     expect(walletErrorEmissions).toHaveLength(0);
+  });
+});
+
+describe("reconcile integration — the wallet query as the polling engine", () => {
+  it("SEAMLESS FALLBACK: disarmed, the query fetches once on mount and never polls", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(walletEnvelope())));
+
+    renderWithClient(<Probe label="a" />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByTestId("a-phase")).toHaveTextContent("synced");
+
+    // A full minute passes with the controller idle: not one extra read.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("armed with an unchanged ledger: polls on the backoff ladder, then exhausts at budget", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(walletEnvelope())));
+
+    const { queryClient } = renderWithClient(<Probe label="a" />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Arm around the CURRENT snapshot with a tight budget: 1s + 2s polls fit; then exhausted.
+    act(() => {
+      armReconcile(
+        { gc: "1000.0000", scUnplayed: "12.5", scRedeemable: "0" },
+        { trigger: "purchase", budgetMs: 3_500 },
+      );
+    });
+    // Kick poll #1 (the M4-T2 contract: arm is followed by an invalidate; refetch stands in).
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: walletKeys.balances() });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const afterKick = fetchMock.mock.calls.length;
+    expect(afterKick).toBe(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000); // walks 1s, 2s → then deadline hits
+    });
+
+    expect(getReconcileState().phase).toBe("exhausted");
+    const totalReads = fetchMock.mock.calls.length;
+    expect(totalReads).toBeGreaterThan(afterKick); // it DID poll
+    expect(totalReads).toBeLessThanOrEqual(afterKick + 3); // …on the ladder, not a hot loop
+
+    // And once exhausted: silence again.
+    const settled = fetchMock.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(settled);
+  });
+
+  it("armed and the ledger answers with NEW strings: converges and stands down", async () => {
+    vi.useFakeTimers();
+    let credited = false;
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(
+        jsonResponse(credited ? walletEnvelope({ gc: "6000.0000" }) : walletEnvelope()),
+      ),
+    );
+
+    const { queryClient } = renderWithClient(<Probe label="a" />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    act(() => {
+      armReconcile(
+        { gc: "1000.0000", scUnplayed: "12.5", scRedeemable: "0" },
+        { trigger: "purchase" },
+      );
+    });
+    credited = true; // the webhook lands while we reconcile
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: walletKeys.balances() });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(getReconcileState().phase).toBe("idle"); // converged on poll #1
+    expect(screen.getByTestId("a-gc")).toHaveTextContent("6000.0000");
+
+    const settled = fetchMock.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(settled); // no residual polling
   });
 });
 

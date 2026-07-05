@@ -20,6 +20,9 @@
 export type TelemetryEvent =
   | "wallet.query.error"
   | "wallet.invalidated"
+  | "wallet.reconcile.armed"
+  | "wallet.reconcile.converged"
+  | "wallet.reconcile.exhausted"
   | "purchase.token.minted"
   | "purchase.token.reused"
   | "purchase.token.cleared"
