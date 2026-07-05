@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ActionNotice, useActionNotice } from "@/components/feedback/ActionNotice";
+import { type DisplayPackage, PackageCard } from "@/components/store/PackageCard";
 import { BalanceChip } from "@/components/wallet/BalanceChip";
 import { WalletStatusBanner } from "@/components/wallet/WalletStatusBanner";
 import { usePurchaseMutation } from "@/hooks/usePurchaseMutation";
@@ -25,22 +26,14 @@ import { logEvent } from "@/lib/telemetry";
  * so a settled purchase shows up in both, by construction.
  */
 
-interface DisplayPackage {
-  /** Must match a gateway catalog id (apps/financial-gateway/src/config/store-packages.ts). */
-  id: string;
-  name: string;
-  /** Preformatted display strings — never computed or parsed in the browser. */
-  price: string;
-  gc: string;
-  sc: string;
-  highlight?: boolean;
-}
-
 const PACKAGES: readonly DisplayPackage[] = [
   { id: "pkg_starter_5", name: "Starter", price: "$5", gc: "5,000 GC", sc: "+5 SC bonus" },
   { id: "pkg_value_20", name: "Value", price: "$20", gc: "20,000 GC", sc: "+20 SC bonus", highlight: true },
   { id: "pkg_pro_50", name: "Pro", price: "$50", gc: "50,000 GC", sc: "+50 SC bonus" },
 ];
+
+/** The M2 idempotency guarantee, surfaced to the player on every retryable failure. */
+const RETRY_SAFE_COPY = "Your attempt is saved — retrying is safe and can never double-charge.";
 
 export function StoreWindow() {
   const { balances, phase, errorStatus, lastSyncedAt } = useWalletQuery();
@@ -51,6 +44,14 @@ export function StoreWindow() {
   const [peerLockedBy, setPeerLockedBy] = useState<string | null>(null);
   /** Synchronous re-entry guard: two clicks in one tick both see isPending === false. */
   const attemptGate = useRef(false);
+
+  /** Presentation-only: which package just settled (drives the check-badge pop cycle). */
+  const [justSettledId, setJustSettledId] = useState<string | null>(null);
+  useEffect(() => {
+    if (justSettledId === null) return;
+    const timer = setTimeout(() => setJustSettledId(null), 1_400);
+    return () => clearTimeout(timer);
+  }, [justSettledId]);
 
   useEffect(() => {
     return onPeerActivity((event) => {
@@ -77,6 +78,7 @@ export function StoreWindow() {
         const outcome = await purchase(pkg.id);
 
         if (outcome.status === "settled") {
+          setJustSettledId(pkg.id); // presentation: the card's settle-pop badge
           showNotice(
             outcome.walletSynced
               ? { kind: "success", message: `${pkg.name} pack purchased — balances updated from the ledger.` }
@@ -94,12 +96,14 @@ export function StoreWindow() {
             showNotice({ kind: "error", message: `Purchase failed: ${failure.message}` });
             break;
           case "retryable":
+            // The retained AttemptToken makes a retry converge on the SAME intent server-side
+            // (M2) — tell the player their money is safe, in plain words.
             showNotice({
               kind: "error",
               message:
                 failure.errorCode === "NETWORK_ERROR" || failure.errorCode === null
-                  ? "Purchase failed: could not reach the cashier."
-                  : `Purchase failed: ${failure.message}`,
+                  ? `Purchase failed: could not reach the cashier. ${RETRY_SAFE_COPY}`
+                  : `Purchase failed: ${failure.message}. ${RETRY_SAFE_COPY}`,
             });
             break;
         }
@@ -113,13 +117,13 @@ export function StoreWindow() {
   const buyLocked = isPending || peerLockedBy !== null;
 
   return (
-    <div className="relative w-full max-w-md rounded-3xl border border-emerald-500/30 bg-gradient-to-b from-zinc-900 via-zinc-950 to-black p-6 shadow-[0_0_60px_-15px_rgba(16,185,129,0.4)]">
+    <div className="relative w-full max-w-md rounded-card border border-sc-unplayed/30 bg-gradient-to-b from-surface-1 via-surface-0 to-black p-6 shadow-glow-sc">
       {/* Header */}
       <div className="mb-6 text-center">
-        <h2 className="bg-gradient-to-r from-emerald-300 via-teal-200 to-emerald-300 bg-clip-text text-2xl font-black tracking-widest text-transparent">
+        <h2 className="bg-gradient-to-r from-sc-unplayed via-teal-200 to-sc-unplayed bg-clip-text text-2xl font-black tracking-widest text-transparent">
           COIN&nbsp;STORE
         </h2>
-        <p className="mt-1 text-[10px] uppercase tracking-[0.3em] text-zinc-500">Gold Coin packages · SC on the house</p>
+        <p className="mt-1 text-[10px] uppercase tracking-[0.3em] text-ink-faint">Gold Coin packages · SC on the house</p>
       </div>
 
       {/* Live balances — verbatim ledger strings via the shared chip (skeletons while loading). */}
@@ -129,49 +133,30 @@ export function StoreWindow() {
       </div>
       <WalletStatusBanner phase={phase} errorStatus={errorStatus} lastSyncedAt={lastSyncedAt} />
 
-      {/* Packages */}
+      {/* Packages — merchandising cards; lifecycle driven by the mutation's state. */}
       <ul className="space-y-3">
-        {PACKAGES.map((pkg) => {
-          const isBuying = pendingPackageId === pkg.id;
-          return (
-            <li
-              key={pkg.id}
-              className={`flex items-center justify-between gap-4 rounded-2xl border p-4 ${
-                pkg.highlight
-                  ? "border-emerald-500/50 bg-emerald-950/30"
-                  : "border-zinc-800 bg-zinc-900/60"
-              }`}
-            >
-              <div>
-                <p className="flex items-center gap-2 text-sm font-bold text-zinc-100">
-                  {pkg.name}
-                  {pkg.highlight && (
-                    <span className="rounded-full bg-emerald-500/20 px-2 py-0.5 text-[9px] font-black uppercase tracking-wider text-emerald-300">
-                      Popular
-                    </span>
-                  )}
-                </p>
-                <p className="mt-1 text-sm font-semibold text-amber-300">{pkg.gc}</p>
-                <p className="text-xs font-medium text-emerald-300">{pkg.sc}</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => void handleBuy(pkg)}
-                disabled={buyLocked}
-                className="min-w-24 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-400 px-4 py-3 text-sm font-black tracking-wide text-zinc-950 shadow-lg shadow-emerald-500/25 transition active:scale-[0.97] enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {isBuying ? "BUYING…" : `BUY ${pkg.price}`}
-              </button>
-            </li>
-          );
-        })}
+        {PACKAGES.map((pkg) => (
+          <PackageCard
+            key={pkg.id}
+            pkg={pkg}
+            buying={pendingPackageId === pkg.id}
+            disabled={buyLocked}
+            justSettled={justSettledId === pkg.id}
+            onBuy={() => void handleBuy(pkg)}
+          />
+        ))}
       </ul>
 
-      <p className="mt-4 text-center text-[9px] uppercase tracking-wider text-zinc-600">
-        {peerLockedBy !== null
-          ? "purchase in progress in another tab"
-          : "Mock checkout — payments settle server-side via the gateway"}
-      </p>
+      {peerLockedBy !== null ? (
+        <p className="mt-4 flex items-center justify-center gap-2 rounded-chip border border-pending/40 bg-pending/10 px-3 py-2 text-center text-[10px] font-semibold uppercase tracking-wider text-pending">
+          <span aria-hidden="true">⛓</span>
+          <span>purchase in progress in another tab</span>
+        </p>
+      ) : (
+        <p className="mt-4 text-center text-[9px] uppercase tracking-wider text-ink-faint">
+          Mock checkout — payments settle server-side via the gateway
+        </p>
+      )}
 
       <ActionNotice notice={notice} onDismiss={dismissNotice} />
     </div>

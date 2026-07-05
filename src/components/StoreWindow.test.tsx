@@ -143,6 +143,9 @@ describe("StoreWindow — purchase flow (invalidate-after-action)", () => {
     );
     expect(invalidations).toHaveLength(1);
     expect(invalidations[0]?.[1]).toMatchObject({ trigger: "purchase" });
+
+    // Lifecycle choreography: the settled card pops its transient check badge.
+    expect(screen.getByTestId("package-settled-badge")).toBeInTheDocument();
   });
 
   it("settled-but-re-read-failed keeps the honest stale warning (Gap 5's surface)", async () => {
@@ -188,6 +191,29 @@ describe("StoreWindow — purchase flow (invalidate-after-action)", () => {
     expect(screen.getByText("1,000")).toBeInTheDocument();
 
     // A failed money action persists until explicitly dismissed.
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss notification" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("a retryable failure surfaces the M2 idempotency promise: the attempt is saved, retrying is safe", async () => {
+    routeGateway({
+      purchase: () =>
+        jsonResponse({ success: false, error: { code: "ENGINE_UNAVAILABLE", message: "ledger unavailable" } }, 503),
+      walletReads: [() => jsonResponse(walletEnvelope("1000.0000"))],
+    });
+
+    renderWithClient(<StoreWindow />);
+    await mountSynced();
+
+    fireEvent.click(screen.getByRole("button", { name: "BUY $5" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Your attempt is saved — retrying is safe and can never double-charge.",
+      ),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("Purchase failed: ledger unavailable.");
+    // The promise persists like every error — visible until the player dismisses it.
     fireEvent.click(screen.getByRole("button", { name: "Dismiss notification" }));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
