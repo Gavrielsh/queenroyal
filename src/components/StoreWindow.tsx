@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { ActionNotice, useActionNotice } from "@/components/feedback/ActionNotice";
 import { BalanceChip } from "@/components/wallet/BalanceChip";
 import { WalletStatusBanner } from "@/components/wallet/WalletStatusBanner";
 import { usePurchaseMutation } from "@/hooks/usePurchaseMutation";
@@ -41,28 +42,15 @@ const PACKAGES: readonly DisplayPackage[] = [
   { id: "pkg_pro_50", name: "Pro", price: "$50", gc: "50,000 GC", sc: "+50 SC bonus" },
 ];
 
-interface Toast {
-  kind: "error" | "success";
-  message: string;
-}
-
 export function StoreWindow() {
   const { balances, phase, errorStatus, lastSyncedAt } = useWalletQuery();
   const { purchase, isPending, pendingPackageId } = usePurchaseMutation();
+  const { notice, showNotice, dismissNotice } = useActionNotice();
 
   /** Package id a PEER TAB is actively purchasing, or null — locks Buy here too. */
   const [peerLockedBy, setPeerLockedBy] = useState<string | null>(null);
   /** Synchronous re-entry guard: two clicks in one tick both see isPending === false. */
   const attemptGate = useRef(false);
-
-  const [toast, setToast] = useState<Toast | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    return () => {
-      if (toastTimer.current) clearTimeout(toastTimer.current);
-    };
-  }, []);
 
   useEffect(() => {
     return onPeerActivity((event) => {
@@ -71,12 +59,6 @@ export function StoreWindow() {
         return previous === event.packageId ? null : previous;
       });
     });
-  }, []);
-
-  const showToast = useCallback((next: Toast) => {
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    setToast(next);
-    toastTimer.current = setTimeout(() => setToast(null), 4_000);
   }, []);
 
   const handleBuy = useCallback(
@@ -95,7 +77,7 @@ export function StoreWindow() {
         const outcome = await purchase(pkg.id);
 
         if (outcome.status === "settled") {
-          showToast(
+          showNotice(
             outcome.walletSynced
               ? { kind: "success", message: `${pkg.name} pack purchased — balances updated from the ledger.` }
               : { kind: "error", message: "Purchase settled, but the wallet re-read failed — balances may be stale." },
@@ -106,13 +88,13 @@ export function StoreWindow() {
         const { failure } = outcome;
         switch (failure.kind) {
           case "unauthorized":
-            showToast({ kind: "error", message: "Log in to make a purchase." });
+            showNotice({ kind: "error", message: "Log in to make a purchase." });
             break;
           case "declined":
-            showToast({ kind: "error", message: `Purchase failed: ${failure.message}` });
+            showNotice({ kind: "error", message: `Purchase failed: ${failure.message}` });
             break;
           case "retryable":
-            showToast({
+            showNotice({
               kind: "error",
               message:
                 failure.errorCode === "NETWORK_ERROR" || failure.errorCode === null
@@ -125,7 +107,7 @@ export function StoreWindow() {
         attemptGate.current = false;
       }
     },
-    [isPending, peerLockedBy, purchase, showToast],
+    [isPending, peerLockedBy, purchase, showNotice],
   );
 
   const buyLocked = isPending || peerLockedBy !== null;
@@ -191,19 +173,7 @@ export function StoreWindow() {
           : "Mock checkout — payments settle server-side via the gateway"}
       </p>
 
-      {/* Toast */}
-      {toast && (
-        <div
-          role="alert"
-          className={`absolute inset-x-6 -bottom-16 rounded-xl px-4 py-3 text-center text-sm font-semibold shadow-xl ${
-            toast.kind === "error"
-              ? "bg-red-950/95 text-red-200 ring-1 ring-red-500/40"
-              : "bg-emerald-950/95 text-emerald-200 ring-1 ring-emerald-500/40"
-          }`}
-        >
-          {toast.message}
-        </div>
-      )}
+      <ActionNotice notice={notice} onDismiss={dismissNotice} />
     </div>
   );
 }

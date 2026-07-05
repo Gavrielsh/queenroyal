@@ -90,6 +90,12 @@ describe("MockGameWindow — spin flow (invalidate-after-action)", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Wallet mirror synced with the ledger.");
     expect(screen.getByRole("button", { name: /SPIN \(settles provider-side\)/ })).toBeEnabled();
 
+    // Success notices are transient: the confirmation dismisses itself.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_000);
+    });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
     // Telemetry: exactly one wallet.invalidated, attributed to the spin.
     const invalidations = info.mock.calls.filter(
       (call) => (call[1] as Record<string, unknown> | undefined)?.evt === "wallet.invalidated",
@@ -120,6 +126,15 @@ describe("MockGameWindow — spin flow (invalidate-after-action)", () => {
     // Stale-but-labeled: the last authoritative strings stay rendered, flagged by the status line.
     expect(screen.getByText("1,000")).toBeInTheDocument();
     expect(screen.getByText("stale — last sync failed")).toBeInTheDocument();
+
+    // Error notices PERSIST — a failed money action must never disappear on its own…
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("Could not reach the cashier");
+    // …until the player explicitly dismisses it.
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss notification" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("a 401 on the post-spin re-read asks the player to log in", async () => {

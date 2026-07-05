@@ -186,6 +186,10 @@ describe("StoreWindow — purchase flow (invalidate-after-action)", () => {
     );
     expect(walletGetCount()).toBe(1); // no invalidation on a failed action — nothing to converge to
     expect(screen.getByText("1,000")).toBeInTheDocument();
+
+    // A failed money action persists until explicitly dismissed.
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss notification" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("a 401 on purchase asks the player to log in", async () => {
