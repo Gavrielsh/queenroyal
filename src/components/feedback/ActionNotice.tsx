@@ -78,9 +78,11 @@ export function ActionNotice({ notice, onDismiss }: { notice: Notice | null; onD
           type="button"
           onClick={onDismiss}
           aria-label="Dismiss notification"
-          className="shrink-0 rounded-full border border-danger/40 px-2 py-0.5 text-[10px] font-black text-danger transition hover:bg-danger/10"
+          className="-my-2 flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-xs font-black text-danger transition hover:bg-danger/10"
         >
-          ✕
+          <span aria-hidden="true" className="flex h-6 w-6 items-center justify-center rounded-full border border-danger/40">
+            ✕
+          </span>
         </button>
       )}
     </div>

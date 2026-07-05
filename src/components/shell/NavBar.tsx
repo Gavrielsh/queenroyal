@@ -14,7 +14,7 @@ export function NavBar({ walletSlot }: { walletSlot?: ReactNode }) {
       <nav className="mx-auto flex h-16 w-full max-w-6xl items-center justify-between gap-4 px-4">
         <Link
           href="/"
-          className="group flex items-center gap-2.5 rounded-control px-1 py-1"
+          className="group flex min-h-11 items-center gap-2.5 rounded-control px-1 py-1"
           aria-label="QueenRoyal home"
         >
           <span
@@ -32,7 +32,7 @@ export function NavBar({ walletSlot }: { walletSlot?: ReactNode }) {
           {walletSlot}
           <Link
             href="/casino"
-            className="rounded-control border border-edge bg-surface-2 px-4 py-2 text-xs font-bold uppercase tracking-widest text-ink-mute transition hover:border-edge-strong hover:text-ink"
+            className="flex min-h-11 items-center rounded-control border border-edge bg-surface-2 px-4 text-xs font-bold uppercase tracking-widest text-ink-mute transition hover:border-edge-strong hover:text-ink"
           >
             Casino Floor
           </Link>

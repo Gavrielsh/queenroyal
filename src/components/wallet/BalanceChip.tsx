@@ -72,6 +72,13 @@ export function BalanceChip({ family, value, stale = false }: BalanceChipProps) 
           {formatBalance(value)}
         </p>
       )}
+      {/* Screen readers hear money change; value-less copy avoids double-reading the amount
+          (the chip itself is right there) and keeps text queries collision-free. */}
+      {pulsing && (
+        <span role="status" className="sr-only">
+          {label} balance updated
+        </span>
+      )}
     </div>
   );
 }

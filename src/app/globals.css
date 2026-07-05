@@ -139,6 +139,12 @@
     color-scheme: dark;
   }
 
+  /* Layout discipline: decorative overflows (ribbons, glows) may never create a horizontal
+     scrollbar — the audit spec measures this on every page. */
+  body {
+    overflow-x: clip;
+  }
+
   /* Brand selection color (gold on deep surface). */
   ::selection {
     background-color: rgb(245 182 46 / 0.3);

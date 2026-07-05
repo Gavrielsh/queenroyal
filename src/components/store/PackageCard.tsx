@@ -69,7 +69,7 @@ export function PackageCard({ pkg, buying, disabled, justSettled, onBuy }: Packa
           type="button"
           onClick={onBuy}
           disabled={disabled}
-          className="min-w-24 shrink-0 rounded-control bg-gradient-to-r from-sc-unplayed to-teal-400 px-4 py-3 text-sm font-black tracking-wide text-surface-0 shadow-glow-sc transition active:scale-[0.97] enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+          className="min-h-11 min-w-24 shrink-0 rounded-control bg-gradient-to-r from-sc-unplayed to-teal-400 px-4 py-3 text-sm font-black tracking-wide text-surface-0 shadow-glow-sc transition active:scale-[0.97] enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {buying ? (
             <span className="flex items-center justify-center gap-2">

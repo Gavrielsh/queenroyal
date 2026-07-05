@@ -33,24 +33,26 @@ export function Footer() {
           Rules.
         </p>
 
-        {/* Policy links */}
-        <nav aria-label="Legal" className="flex flex-wrap gap-x-6 gap-y-2 text-xs font-semibold">
-          <a href="#" className="text-ink-faint transition hover:text-ink">
+        {/* Policy links — 44px tap targets (min-h) without inflating the visual line. */}
+        <nav aria-label="Legal" className="flex flex-wrap items-center gap-x-6 text-xs font-semibold">
+          <a href="#" className="inline-flex min-h-11 items-center text-ink-faint transition hover:text-ink">
             Sweepstakes Rules
           </a>
-          <a href="#" className="text-ink-faint transition hover:text-ink">
+          <a href="#" className="inline-flex min-h-11 items-center text-ink-faint transition hover:text-ink">
             Terms of Service
           </a>
-          <a href="#" className="text-ink-faint transition hover:text-ink">
+          <a href="#" className="inline-flex min-h-11 items-center text-ink-faint transition hover:text-ink">
             Privacy Policy
           </a>
-          <a href="#" className="text-ink-faint transition hover:text-ink">
+          <a href="#" className="inline-flex min-h-11 items-center text-ink-faint transition hover:text-ink">
             Responsible Play
           </a>
         </nav>
 
         <p className="text-xs text-ink-faint">© 2026 QueenRoyal. Play responsibly.</p>
       </div>
+      {/* iOS safe-area: keep the compliance strip clear of the home indicator. */}
+      <div aria-hidden="true" className="h-[env(safe-area-inset-bottom)]" />
     </footer>
   );
 }
