@@ -72,7 +72,7 @@ export function useWalletQuery(): WalletQueryView {
     // Reconcile-until-changed (M4): while a money event is being converged on, this returns
     // the controller's backoff delay; disarmed/converged/exhausted it returns false — i.e.
     // exactly the behavior of having no refetchInterval at all.
-    refetchInterval: (query) => reconcileIntervalFor(query.state.data),
+    refetchInterval: (query) => reconcileIntervalFor(query.state.data, query.state.dataUpdatedAt),
   });
 
   const invalidate = useCallback(

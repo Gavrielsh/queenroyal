@@ -3,7 +3,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useCallback } from "react";
 
-import { ApiError, confirmMockStripeDeposit, initiateStorePurchase } from "@/lib/apiClient";
+import { ApiError, confirmMockStripeDeposit, initiateStorePurchase, type WalletBalancesDto } from "@/lib/apiClient";
 import {
   getOrCreateAttemptToken,
   markAbandoned,
@@ -11,7 +11,9 @@ import {
   markAttemptStarted,
   markSettled,
 } from "@/lib/purchaseIntent";
+import { walletKeys } from "@/lib/queryKeys";
 import { invalidateWalletBalances } from "@/lib/walletInvalidate";
+import { armReconcile } from "@/lib/walletReconcile";
 
 /**
  * The purchase flow as a React Query mutation, with deterministic idempotency.
@@ -95,6 +97,9 @@ export function usePurchaseMutation(): PurchaseMutationView {
     mutationKey: ["purchase"],
     retry: false,
     mutationFn: async ({ packageId }) => {
+      // Pre-action baseline: the exact cache snapshot this purchase must move away from.
+      // Captured BEFORE any money call; a failure below never arms the reconciler.
+      const baseline = queryClient.getQueryData<WalletBalancesDto>(walletKeys.balances()) ?? null;
       const token = getOrCreateAttemptToken(packageId);
       markAttemptStarted(packageId);
       const intent = await initiateStorePurchase(packageId, token);
@@ -104,6 +109,10 @@ export function usePurchaseMutation(): PurchaseMutationView {
       // Terminal success: rotate the token BEFORE the re-read — the money is settled
       // regardless of whether the balance read that follows succeeds.
       markSettled(packageId);
+      // The credit is webhook-driven (eventually consistent): reconcile until the ledger's
+      // answer differs from the pre-purchase baseline. The invalidation below IS poll #1;
+      // if it fails, the armed reconciler is the recovery.
+      armReconcile(baseline, { trigger: "purchase" });
       const synced = await invalidateWalletBalances(queryClient, "purchase");
       return { walletSynced: synced.ok };
     },

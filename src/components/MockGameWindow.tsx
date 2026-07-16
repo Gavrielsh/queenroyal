@@ -6,6 +6,7 @@ import { ActionNotice, useActionNotice } from "@/components/feedback/ActionNotic
 import { BalanceChip } from "@/components/wallet/BalanceChip";
 import { WalletStatusBanner } from "@/components/wallet/WalletStatusBanner";
 import { useWalletQuery } from "@/hooks/useWalletQuery";
+import { armReconcile } from "@/lib/walletReconcile";
 
 /**
  * Dev harness for the Zone 3 wallet mirror.
@@ -52,6 +53,10 @@ export function MockGameWindow() {
     if (isSpinning) return;
     setIsSpinning(true);
 
+    // Pre-spin baseline: the snapshot the (out-of-band) round's settlement must move away
+    // from. Captured before the settle window opens.
+    const baseline = balances;
+
     // Animation only — the round itself settles provider-side against the ledger.
     const spinAnimation = setInterval(() => {
       setReels([
@@ -63,8 +68,9 @@ export function MockGameWindow() {
 
     try {
       await new Promise((resolve) => setTimeout(resolve, 900));
-      // After the (out-of-band) round settles, the ledger may have changed: invalidate the
-      // shared cache entry so EVERY window re-reads the authoritative snapshot at once.
+      // After the (out-of-band) round settles, the ledger may have changed: reconcile until
+      // its answer differs from the pre-spin baseline. The invalidation below IS poll #1.
+      armReconcile(baseline, { trigger: "spin" });
       const result = await invalidate("spin");
       showNotice(
         result.ok
@@ -81,7 +87,7 @@ export function MockGameWindow() {
       clearInterval(spinAnimation);
       setIsSpinning(false);
     }
-  }, [isSpinning, invalidate, showNotice]);
+  }, [isSpinning, balances, invalidate, showNotice]);
 
   return (
     <div className="relative w-full max-w-md rounded-card border border-gc/30 bg-gradient-to-b from-surface-1 via-surface-0 to-black p-6 shadow-glow-gc">

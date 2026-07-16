@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { MockGameWindow } from "@/components/MockGameWindow";
+import { disarmReconcile, getReconcileState } from "@/lib/walletReconcile";
 import { renderWithClient } from "@/test/renderWithClient";
 
 function jsonResponse(payload: unknown, status = 200): Response {
@@ -32,6 +33,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  disarmReconcile(); // the controller is module-level state — never leak an armed cell
   vi.unstubAllGlobals();
   fetchMock.mockReset();
   vi.restoreAllMocks();
@@ -102,6 +104,35 @@ describe("MockGameWindow — spin flow (invalidate-after-action)", () => {
     );
     expect(invalidations).toHaveLength(1);
     expect(invalidations[0]?.[1]).toMatchObject({ evt: "wallet.invalidated", trigger: "spin" });
+
+    // The ledger answered NEW strings on poll #1 → the reconciler converged and stood down.
+    expect(getReconcileState().phase).toBe("idle");
+  });
+
+  it("a spin over an UNCHANGED ledger keeps reconciling on the ladder", async () => {
+    vi.useFakeTimers();
+    routeWalletReads(() => jsonResponse(walletEnvelope("1000.0000"))); // every read identical
+
+    renderWithClient(<MockGameWindow />);
+    await mountSynced();
+
+    fireEvent.click(screen.getByRole("button", { name: /SPIN/ }));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(900);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    // Poll #1 saw the same snapshot the spin started from → still converging.
+    expect(getReconcileState()).toEqual({ phase: "reconciling", trigger: "spin" });
+    const afterSpinReads = fetchMock.mock.calls.length;
+
+    // The ladder's first delay elapses → one more poll fires through React Query.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(fetchMock.mock.calls.length).toBe(afterSpinReads + 1);
+    expect(getReconcileState().phase).toBe("reconciling");
   });
 
   it("a failed post-spin re-read toasts the stale warning (and keeps the old balance visible)", async () => {
@@ -126,6 +157,9 @@ describe("MockGameWindow — spin flow (invalidate-after-action)", () => {
     // Stale-but-labeled: the last authoritative strings stay rendered, flagged by the status line.
     expect(screen.getByText("1,000")).toBeInTheDocument();
     expect(screen.getByText("stale — last sync failed")).toBeInTheDocument();
+
+    // The spin armed BEFORE the failed re-read: the reconciler is the recovery path.
+    expect(getReconcileState()).toEqual({ phase: "reconciling", trigger: "spin" });
 
     // Error notices PERSIST — a failed money action must never disappear on its own…
     await act(async () => {

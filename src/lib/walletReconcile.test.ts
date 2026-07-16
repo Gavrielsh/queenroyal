@@ -58,9 +58,11 @@ describe("balancesDiffer — string inequality only (no-float law)", () => {
 });
 
 describe("arming and the poll ladder", () => {
+  const ARMED_AT = new Date("2026-07-05T12:00:00Z").getTime();
+
   it("idle: the interval is false and the state is idle", async () => {
     const mod = await loadModule();
-    expect(mod.reconcileIntervalFor(SNAPSHOT)).toBe(false);
+    expect(mod.reconcileIntervalFor(SNAPSHOT, ARMED_AT)).toBe(false);
     expect(mod.getReconcileState()).toEqual({ phase: "idle", trigger: null });
   });
 
@@ -76,36 +78,63 @@ describe("arming and the poll ladder", () => {
     expect(ticks).toEqual(["reconciling"]);
   });
 
-  it("unchanged data walks the backoff ladder and caps at its top", async () => {
+  it("EVALUATION-IDEMPOTENT: repeated evaluations with an unchanged snapshot return the SAME delay", async () => {
+    // THE regression this design exists for: React Query evaluates refetchInterval many
+    // times back-to-back; the ladder must advance per LANDED POLL, never per evaluation.
+    const mod = await loadModule();
+    mod.armReconcile(SNAPSHOT, { trigger: "spin" });
+    const pollTs = ARMED_AT + 1; // one poll landed just after arming
+
+    const delays = [1, 2, 3, 4, 5, 6].map(() => mod.reconcileIntervalFor(SNAPSHOT, pollTs));
+
+    expect(delays).toEqual([1_000, 1_000, 1_000, 1_000, 1_000, 1_000]);
+  });
+
+  it("unchanged data walks the ladder ONE STEP PER LANDED POLL and caps at its top", async () => {
     const mod = await loadModule();
     mod.armReconcile(SNAPSHOT, { trigger: "spin" });
 
-    const delays = [1, 2, 3, 4, 5, 6].map(() => mod.reconcileIntervalFor(SNAPSHOT));
+    // Each call presents a strictly-newer dataUpdatedAt — i.e. a poll actually landed.
+    const delays = [1, 2, 3, 4, 5, 6].map((poll) =>
+      mod.reconcileIntervalFor(SNAPSHOT, ARMED_AT + poll),
+    );
 
     expect(delays).toEqual([1_000, 2_000, 4_000, 8_000, 8_000, 8_000]);
+  });
+
+  it("snapshots predating the arm never advance the ladder", async () => {
+    const mod = await loadModule();
+    mod.armReconcile(SNAPSHOT, { trigger: "spin" });
+
+    // The mount-time snapshot (older than the arm) is re-presented repeatedly.
+    const delays = [1, 2, 3].map(() => mod.reconcileIntervalFor(SNAPSHOT, ARMED_AT - 5_000));
+
+    expect(delays).toEqual([1_000, 1_000, 1_000]);
   });
 
   it("re-arming resets the baseline, budget, and ladder (latest event wins)", async () => {
     const mod = await loadModule();
     mod.armReconcile(SNAPSHOT, { trigger: "spin" });
-    mod.reconcileIntervalFor(SNAPSHOT); // 1000
-    mod.reconcileIntervalFor(SNAPSHOT); // 2000
+    mod.reconcileIntervalFor(SNAPSHOT, ARMED_AT + 1); // poll 1
+    mod.reconcileIntervalFor(SNAPSHOT, ARMED_AT + 2); // poll 2 → ladder at 2000
 
     mod.armReconcile(CREDITED, { trigger: "purchase" }); // a NEW event supersedes
 
-    expect(mod.reconcileIntervalFor(CREDITED)).toBe(1_000); // ladder restarted
+    expect(mod.reconcileIntervalFor(CREDITED, ARMED_AT + 3)).toBe(1_000); // ladder restarted
     expect(mod.getReconcileState().trigger).toBe("purchase");
   });
 });
 
 describe("convergence, exhaustion, disarm", () => {
+  const ARMED_AT = new Date("2026-07-05T12:00:00Z").getTime();
+
   it("a differing snapshot converges: stands down, emits elapsed/attempts, notifies", async () => {
     const mod = await loadModule();
     mod.armReconcile(SNAPSHOT, { trigger: "purchase" });
-    mod.reconcileIntervalFor(SNAPSHOT); // one poll scheduled
+    mod.reconcileIntervalFor(SNAPSHOT, ARMED_AT + 1_000); // one poll landed
     vi.setSystemTime(new Date("2026-07-05T12:00:03Z"));
 
-    const result = mod.reconcileIntervalFor(CREDITED);
+    const result = mod.reconcileIntervalFor(CREDITED, ARMED_AT + 3_000);
 
     expect(result).toBe(false);
     expect(mod.getReconcileState()).toEqual({ phase: "idle", trigger: null });
@@ -120,17 +149,17 @@ describe("convergence, exhaustion, disarm", () => {
     const mod = await loadModule();
     mod.armReconcile(null, { trigger: "purchase" });
 
-    expect(mod.reconcileIntervalFor(SNAPSHOT)).toBe(false);
+    expect(mod.reconcileIntervalFor(SNAPSHOT, ARMED_AT + 1)).toBe(false);
     expect(mod.getReconcileState().phase).toBe("idle");
   });
 
   it("the deadline exhausts: phase becomes exhausted (NOT idle), trigger retained for the UI", async () => {
     const mod = await loadModule();
     mod.armReconcile(SNAPSHOT, { trigger: "purchase", budgetMs: 10_000 });
-    mod.reconcileIntervalFor(SNAPSHOT);
+    mod.reconcileIntervalFor(SNAPSHOT, ARMED_AT + 1_000);
     vi.setSystemTime(new Date("2026-07-05T12:00:10Z")); // exactly at the deadline
 
-    const result = mod.reconcileIntervalFor(SNAPSHOT);
+    const result = mod.reconcileIntervalFor(SNAPSHOT, ARMED_AT + 10_000);
 
     expect(result).toBe(false);
     expect(mod.getReconcileState()).toEqual({ phase: "exhausted", trigger: "purchase" });
@@ -144,7 +173,7 @@ describe("convergence, exhaustion, disarm", () => {
     const mod = await loadModule();
     mod.armReconcile(SNAPSHOT, { trigger: "purchase", budgetMs: 1_000 });
     vi.setSystemTime(new Date("2026-07-05T12:00:01Z"));
-    mod.reconcileIntervalFor(SNAPSHOT); // exhausts
+    mod.reconcileIntervalFor(SNAPSHOT, ARMED_AT + 1_000); // exhausts
 
     mod.armReconcile(SNAPSHOT, { trigger: "purchase" });
 
@@ -158,7 +187,7 @@ describe("convergence, exhaustion, disarm", () => {
     mod.disarmReconcile();
 
     expect(mod.getReconcileState()).toEqual({ phase: "idle", trigger: null });
-    expect(mod.reconcileIntervalFor(SNAPSHOT)).toBe(false);
+    expect(mod.reconcileIntervalFor(SNAPSHOT, ARMED_AT + 1)).toBe(false);
     expect(eventsNamed("wallet.reconcile.converged")).toHaveLength(0);
     expect(eventsNamed("wallet.reconcile.exhausted")).toHaveLength(0);
   });

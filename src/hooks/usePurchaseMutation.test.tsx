@@ -1,5 +1,5 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -8,6 +8,7 @@ import { useWalletQuery } from "@/hooks/useWalletQuery";
 import { ApiError } from "@/lib/apiClient";
 import { markSettled, peekAttemptToken } from "@/lib/purchaseIntent";
 import { makeQueryClient } from "@/lib/queryClient";
+import { disarmReconcile, getReconcileState } from "@/lib/walletReconcile";
 
 /** Deterministic BroadcastChannel double (the module wires to it on first use). */
 class FakeBroadcastChannel {
@@ -97,8 +98,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  disarmReconcile(); // the controller is module-level state — never leak an armed cell
   fetchMock.mockReset();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 /** Mount the purchase hook alongside an ACTIVE wallet query (same client) — as in the app. */
@@ -107,10 +110,11 @@ function mountPurchase() {
   function wrapper({ children }: { children: ReactNode }) {
     return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
   }
-  return renderHook(
+  const rendered = renderHook(
     () => ({ wallet: useWalletQuery(), mutation: usePurchaseMutation() }),
     { wrapper },
   );
+  return { ...rendered, queryClient };
 }
 
 function postedBroadcasts(): unknown[] {
@@ -291,6 +295,114 @@ describe("usePurchaseMutation — token lifecycle on the wire", () => {
 
     expect(outcome).toEqual({ status: "settled", walletSynced: false });
     expect(peekAttemptToken(pkg)).toBeNull();
+  });
+
+  it("a settled purchase whose credit is NOT yet visible stays reconciling, then converges on the ladder", async () => {
+    vi.useFakeTimers();
+    let walletReads = 0;
+    fetchMock.mockImplementation((url, init) => {
+      const path = String(url);
+      const method = init?.method ?? "GET";
+      if (method === "GET" && path.endsWith("/wallet")) {
+        walletReads += 1;
+        // Mount + poll #1 still see the PRE-credit snapshot; the ladder poll sees the credit.
+        return Promise.resolve(
+          jsonResponse(walletReads <= 2 ? walletEnvelope("100.0000") : walletEnvelope("600.0000")),
+        );
+      }
+      if (method === "POST" && path.endsWith("/store/purchase")) {
+        initiateBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return Promise.resolve(jsonResponse(intentEnvelope));
+      }
+      return Promise.resolve(jsonResponse(confirmEnvelope));
+    });
+    const { result, rerender, queryClient } = mountPurchase();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0); // settle the mount read
+    });
+    expect(result.current.wallet.phase).toBe("synced");
+    const pkg = "pkg_m4t2_delayed_credit";
+
+    const outcomePromise = result.current.mutation.purchase(pkg);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0); // initiate → confirm → settle → poll #1
+    });
+    const outcome = await outcomePromise;
+
+    // Settled, poll #1 answered pre-credit strings → the controller stays armed.
+    expect(outcome.status).toBe("settled");
+    expect(getReconcileState()).toEqual({ phase: "reconciling", trigger: "purchase" });
+
+    // The ladder's first poll (1s) reads the credited snapshot → converged, stood down.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(getReconcileState().phase).toBe("idle");
+    // One more notify tick: the cache converged above; the OBSERVER render lands a beat later.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    // The cache and observer hold the credited snapshot; under fake timers the final
+    // notify→React hop can drop, so re-read the observer explicitly (real-render delivery
+    // is covered by the spin component test and the e2e purchase state).
+    act(() => {
+      rerender();
+    });
+    expect(
+      (queryClient.getQueryData(["wallet", "balances"]) as { gc?: string } | undefined)?.gc,
+    ).toBe("600.0000");
+    expect(result.current.wallet.balances?.gc).toBe("600.0000");
+  });
+
+  it("an immediately-consistent credit converges on poll #1 — wall-clock identical to before", async () => {
+    scriptGateway({ initiate: [() => jsonResponse(intentEnvelope)] });
+    const { result } = mountPurchase();
+    const pkg = "pkg_m4t2_immediate";
+
+    const outcome = await result.current.mutation.purchase(pkg);
+
+    expect(outcome.status).toBe("settled");
+    // The wallet stub answers a fresh snapshot on poll #1 vs the null-ish baseline → converged.
+    expect(getReconcileState().phase).toBe("idle");
+  });
+
+  it("ZERO ARMING ON FAILURE: declined and retryable purchases leave the controller idle", async () => {
+    scriptGateway({
+      initiate: [
+        () => jsonResponse({ success: false, error: { code: "PAYMENT_DECLINED", message: "Card declined" } }, 402),
+        () => jsonResponse({ success: false, error: { code: "ENGINE_UNAVAILABLE", message: "down" } }, 503),
+      ],
+    });
+    const { result } = mountPurchase();
+
+    const declined = await result.current.mutation.purchase("pkg_m4t2_declined");
+    expect(declined.status).toBe("failed");
+    expect(getReconcileState()).toEqual({ phase: "idle", trigger: null });
+
+    const retryable = await result.current.mutation.purchase("pkg_m4t2_retryable");
+    expect(retryable.status).toBe("failed");
+    expect(getReconcileState()).toEqual({ phase: "idle", trigger: null });
+  });
+
+  it("settled-but-re-read-failed ARMS the reconciler — reconcile IS the recovery for that gap", async () => {
+    let walletCalls = 0;
+    scriptGateway({
+      initiate: [() => jsonResponse(intentEnvelope)],
+      wallet: () => {
+        walletCalls += 1;
+        return walletCalls === 1
+          ? jsonResponse(walletEnvelope("100.0000"))
+          : jsonResponse({ success: false, error: { code: "ENGINE_UNAVAILABLE", message: "down" } }, 503);
+      },
+    });
+    const { result } = mountPurchase();
+    await waitFor(() => expect(result.current.wallet.phase).toBe("synced"));
+
+    const outcome = await result.current.mutation.purchase("pkg_m4t2_reread_fail");
+
+    expect(outcome).toEqual({ status: "settled", walletSynced: false });
+    expect(getReconcileState()).toEqual({ phase: "reconciling", trigger: "purchase" });
   });
 
   it("a peer settling MID-FLIGHT makes confirm a local no-op — the purchase still resolves settled", async () => {

@@ -51,7 +51,10 @@ interface ReconcileCell {
   budgetMs: number;
   deadline: number;
   armedAt: number;
+  /** Polls that have LANDED since arming (not evaluations — see reconcileIntervalFor). */
   attempts: number;
+  /** dataUpdatedAt of the newest snapshot already counted — the landed-poll detector. */
+  lastCountedDataUpdatedAt: number;
 }
 
 let cell: ReconcileCell | null = null;
@@ -103,6 +106,9 @@ export function armReconcile(baseline: WalletBalancesDto | null, opts: ArmOption
     deadline: now + budgetMs,
     armedAt: now,
     attempts: 0,
+    // Snapshots that predate the arm must not count as polls; only strictly-newer
+    // dataUpdatedAt values advance the ladder.
+    lastCountedDataUpdatedAt: now,
   };
   phase = "reconciling";
   lastTrigger = opts.trigger;
@@ -132,12 +138,22 @@ export function subscribeReconcile(subscriber: () => void): () => void {
 }
 
 /**
- * THE React Query integration point — pass the query's current data each time RQ evaluates
- * `refetchInterval`. Returns the next poll delay while reconciling, or `false` to stand
- * down (idle, converged, or exhausted). Disarmed behavior is EXACTLY `false`, i.e. the
- * query behaves as if no refetchInterval were configured.
+ * THE React Query integration point — pass the query's current data AND its dataUpdatedAt
+ * each time RQ evaluates `refetchInterval`. Returns the next poll delay while reconciling,
+ * or `false` to stand down (idle, converged, or exhausted). Disarmed behavior is EXACTLY
+ * `false`, i.e. the query behaves as if no refetchInterval were configured.
+ *
+ * IDEMPOTENT BY DESIGN: React Query evaluates `refetchInterval` many times per poll cycle
+ * (renders, option updates, fetch-status transitions) — several times back-to-back with no
+ * time passing. The ladder therefore advances only when a poll actually LANDS, detected by
+ * `dataUpdatedAt` moving strictly past the last counted snapshot; repeated evaluations with
+ * an unchanged snapshot return the SAME delay (which also stops RQ from endlessly resetting
+ * its timer).
  */
-export function reconcileIntervalFor(current: WalletBalancesDto | undefined): number | false {
+export function reconcileIntervalFor(
+  current: WalletBalancesDto | undefined,
+  dataUpdatedAt: number,
+): number | false {
   if (cell === null) return false;
 
   if (balancesDiffer(cell.baseline, current)) {
@@ -165,7 +181,13 @@ export function reconcileIntervalFor(current: WalletBalancesDto | undefined): nu
     return false;
   }
 
-  const step = Math.min(cell.attempts, BACKOFF_LADDER_MS.length - 1);
-  cell.attempts += 1;
+  // A strictly-newer snapshot means a poll landed (and answered with unchanged balances,
+  // or we would have converged above): advance the ladder exactly once for it.
+  if (dataUpdatedAt > cell.lastCountedDataUpdatedAt) {
+    cell.lastCountedDataUpdatedAt = dataUpdatedAt;
+    cell.attempts += 1;
+  }
+
+  const step = Math.min(Math.max(cell.attempts - 1, 0), BACKOFF_LADDER_MS.length - 1);
   return BACKOFF_LADDER_MS[step] ?? BACKOFF_LADDER_MS[BACKOFF_LADDER_MS.length - 1] ?? 8_000;
 }
