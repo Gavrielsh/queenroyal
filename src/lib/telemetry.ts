@@ -23,6 +23,8 @@ export type TelemetryEvent =
   | "wallet.reconcile.armed"
   | "wallet.reconcile.converged"
   | "wallet.reconcile.exhausted"
+  | "wallet.realtime.connected"
+  | "wallet.realtime.disconnected"
   | "purchase.token.minted"
   | "purchase.token.reused"
   | "purchase.token.cleared"
