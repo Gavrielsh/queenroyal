@@ -46,6 +46,8 @@ e2e/screenshots/
 | 08 | Purchase settled | intent → confirm → wallet re-read returns credited balances |
 | 09 | Purchase declined | initiate 402 `PAYMENT_DECLINED` → error toast |
 | 10 | Spin animation | reels spinning, button locked |
+| 11 | Reconciling | settled purchase, wallet keeps answering the pre-credit snapshot → "balance update pending…" |
+| 12 | Exhausted | reconcile budget elapsed via the Playwright clock → calm "settled — taking longer than usual" + a Check-again that re-polls without charging |
 
 ## Determinism guarantees
 

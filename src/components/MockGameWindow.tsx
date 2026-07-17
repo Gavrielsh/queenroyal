@@ -29,7 +29,8 @@ const GAME_ID = "mock-slot-1";
 const REEL_SYMBOLS = ["🍒", "💎", "7️⃣", "🔔", "👑", "🍋"] as const;
 
 export function MockGameWindow() {
-  const { balances, phase, errorStatus, lastSyncedAt, invalidate } = useWalletQuery();
+  const { balances, phase, errorStatus, lastSyncedAt, reconcilePhase, recheckReconcile, invalidate } =
+    useWalletQuery();
   const { notice, showNotice, dismissNotice } = useActionNotice();
 
   const [isSpinning, setIsSpinning] = useState(false);
@@ -105,7 +106,13 @@ export function MockGameWindow() {
         <BalanceChip family="scUnplayed" value={balances?.scUnplayed ?? null} stale={phase === "error"} />
         <BalanceChip family="scRedeemable" value={balances?.scRedeemable ?? null} stale={phase === "error"} />
       </div>
-      <WalletStatusBanner phase={phase} errorStatus={errorStatus} lastSyncedAt={lastSyncedAt} />
+      <WalletStatusBanner
+        phase={phase}
+        errorStatus={errorStatus}
+        lastSyncedAt={lastSyncedAt}
+        reconcilePhase={reconcilePhase}
+        onRecheck={recheckReconcile}
+      />
 
       {/* Reels — content shuffled by the existing interval, MOTION supplied purely by CSS. */}
       <div className="mb-6 flex justify-center gap-3 rounded-card border border-edge bg-surface-1/80 p-4">

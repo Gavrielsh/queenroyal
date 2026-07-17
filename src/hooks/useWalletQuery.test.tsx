@@ -45,13 +45,17 @@ afterEach(() => {
 
 /** Minimal consumer exposing the hook's view for assertions. */
 function Probe({ label }: { label: string }) {
-  const { balances, phase, errorStatus, lastSyncedAt } = useWalletQuery();
+  const { balances, phase, errorStatus, lastSyncedAt, reconcilePhase, recheckReconcile } = useWalletQuery();
   return (
     <div>
       <span data-testid={`${label}-phase`}>{phase}</span>
       <span data-testid={`${label}-gc`}>{balances?.gc ?? "none"}</span>
       <span data-testid={`${label}-error-status`}>{errorStatus ?? "none"}</span>
       <span data-testid={`${label}-synced-at`}>{lastSyncedAt === null ? "never" : "set"}</span>
+      <span data-testid={`${label}-reconcile`}>{reconcilePhase}</span>
+      <button type="button" data-testid={`${label}-recheck`} onClick={recheckReconcile}>
+        recheck
+      </button>
     </div>
   );
 }
@@ -252,6 +256,85 @@ describe("reconcile integration — the wallet query as the polling engine", () 
       await vi.advanceTimersByTimeAsync(30_000);
     });
     expect(fetchMock).toHaveBeenCalledTimes(settled); // no residual polling
+  });
+});
+
+describe("reconcile UI plumbing — phase exposure, auto-clear, recheck (M4-T3)", () => {
+  it("reconcilePhase is reactive: arming and disarming re-render consumers", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(walletEnvelope()));
+    renderWithClient(<Probe label="a" />);
+    await waitFor(() => expect(screen.getByTestId("a-phase")).toHaveTextContent("synced"));
+    expect(screen.getByTestId("a-reconcile")).toHaveTextContent("idle");
+
+    act(() => {
+      armReconcile({ gc: "1000.0000", scUnplayed: "12.5", scRedeemable: "0" }, { trigger: "purchase" });
+    });
+    expect(screen.getByTestId("a-reconcile")).toHaveTextContent("reconciling");
+
+    act(() => {
+      disarmReconcile();
+    });
+    expect(screen.getByTestId("a-reconcile")).toHaveTextContent("idle");
+  });
+
+  it("an EXHAUSTED flag auto-clears when the balances change by any route (hygiene)", async () => {
+    vi.useFakeTimers();
+    let credited = false;
+    fetchMock.mockImplementation(() =>
+      Promise.resolve(jsonResponse(credited ? walletEnvelope({ gc: "6000.0000" }) : walletEnvelope())),
+    );
+    const { queryClient } = renderWithClient(<Probe label="a" />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    // Arm with a tiny budget and let it exhaust against the unchanged ledger.
+    act(() => {
+      armReconcile(
+        { gc: "1000.0000", scUnplayed: "12.5", scRedeemable: "0" },
+        { trigger: "purchase", budgetMs: 1_500 },
+      );
+    });
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: walletKeys.balances() }); // poll #1
+      await vi.advanceTimersByTimeAsync(2_000); // past the budget → next poll exhausts
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByTestId("a-reconcile")).toHaveTextContent("exhausted");
+
+    // The credit lands later via an ORDINARY read (focus refetch stand-in) → flag clears.
+    credited = true;
+    await act(async () => {
+      await queryClient.refetchQueries({ queryKey: walletKeys.balances() });
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByTestId("a-gc")).toHaveTextContent("6000.0000");
+    expect(screen.getByTestId("a-reconcile")).toHaveTextContent("idle");
+  });
+
+  it("recheck re-arms around the current snapshot and fires exactly one 'recheck' invalidation — a read, never a charge", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(walletEnvelope())));
+    renderWithClient(<Probe label="a" />);
+    await waitFor(() => expect(screen.getByTestId("a-phase")).toHaveTextContent("synced"));
+    const readsBefore = fetchMock.mock.calls.length;
+
+    act(() => {
+      screen.getByTestId("a-recheck").click();
+    });
+    await waitFor(() => expect(fetchMock.mock.calls.length).toBe(readsBefore + 1));
+
+    expect(screen.getByTestId("a-reconcile")).toHaveTextContent("reconciling");
+    const invalidations = info.mock.calls.filter(
+      (call) => (call[1] as Record<string, unknown> | undefined)?.evt === "wallet.invalidated",
+    );
+    expect(invalidations).toHaveLength(1);
+    expect(invalidations[0]?.[1]).toMatchObject({ trigger: "recheck" });
+    // Every request this path produced was a GET /wallet — no money endpoint reachable.
+    for (const [url, init] of fetchMock.mock.calls) {
+      expect(`${init?.method ?? "GET"} ${String(url)}`).toMatch(/GET .*\/wallet$/);
+    }
   });
 });
 

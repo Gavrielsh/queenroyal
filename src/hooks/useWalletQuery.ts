@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback } from "react";
+import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 
 import { type WalletBalancesDto } from "@/lib/apiClient";
 import { walletKeys } from "@/lib/queryKeys";
@@ -12,7 +12,17 @@ import {
   type WalletSyncOutcome,
 } from "@/lib/walletInvalidate";
 import { walletBalancesQueryFn } from "@/lib/walletQueryFn";
-import { reconcileIntervalFor } from "@/lib/walletReconcile";
+import {
+  armReconcile,
+  balancesDiffer,
+  disarmReconcile,
+  getReconcileState,
+  reconcileIntervalFor,
+  subscribeReconcile,
+  type ReconcilePhase,
+} from "@/lib/walletReconcile";
+
+export type { ReconcilePhase } from "@/lib/walletReconcile";
 
 export type { WalletInvalidateTrigger, WalletSyncOutcome } from "@/lib/walletInvalidate";
 
@@ -55,6 +65,13 @@ export interface WalletQueryView {
   errorCode: string | null;
   /** Epoch ms of the last authoritative snapshot, or null if none yet (drives staleness UI). */
   lastSyncedAt: number | null;
+  /** Reconcile lifecycle: idle | reconciling (credit pending) | exhausted (budget spent). */
+  reconcilePhase: ReconcilePhase;
+  /**
+   * Re-check an exhausted reconcile: re-arms around the CURRENT snapshot and kicks one
+   * ordinary read. It can only re-poll — no money endpoint is reachable from it.
+   */
+  recheckReconcile: () => void;
   /**
    * Signal that a money event has (or may have) changed the ledger: marks the shared cache
    * entry stale via `queryClient.invalidateQueries` and awaits the resulting refetch — every
@@ -81,6 +98,34 @@ export function useWalletQuery(): WalletQueryView {
     [queryClient],
   );
 
+  // Reconcile lifecycle, reactively (primitive snapshot — stable for useSyncExternalStore).
+  const reconcilePhase = useSyncExternalStore(
+    subscribeReconcile,
+    () => getReconcileState().phase,
+    () => "idle" as const,
+  );
+
+  // Hygiene: an exhausted reconcile is about a credit that had NOT arrived. If the balances
+  // change by ANY route afterwards (focus refetch, another window's action), the pending
+  // thing is no longer pending — clear the exhausted flag. String comparison only.
+  const previousBalancesRef = useRef(query.data ?? null);
+  useEffect(() => {
+    const previous = previousBalancesRef.current;
+    previousBalancesRef.current = query.data ?? null;
+    if (reconcilePhase === "exhausted" && balancesDiffer(previous, query.data)) {
+      disarmReconcile();
+    }
+  }, [query.data, reconcilePhase]);
+
+  const recheckReconcile = useCallback(() => {
+    // Re-arm around the CURRENT snapshot (converge = any change from here on) and kick one
+    // ordinary choke-point read as poll #1. Structurally charge-free: this path touches the
+    // reconcile controller and the wallet READ — nothing else.
+    const trigger = getReconcileState().trigger ?? "purchase";
+    armReconcile(queryClient.getQueryData(walletKeys.balances()) ?? null, { trigger });
+    void invalidateWalletBalances(queryClient, "recheck");
+  }, [queryClient]);
+
   // Phase precedence: any in-flight fetch shows "syncing" (even over stale data or a failed
   // previous attempt); a genuine query error shows "error" (aborts never reach error state —
   // React Query reverts cancellations, and the transport boundary classifies them ABORTED,
@@ -103,6 +148,8 @@ export function useWalletQuery(): WalletQueryView {
     errorStatus,
     errorCode,
     lastSyncedAt: query.dataUpdatedAt > 0 ? query.dataUpdatedAt : null,
+    reconcilePhase,
+    recheckReconcile,
     invalidate,
   };
 }

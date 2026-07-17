@@ -154,9 +154,12 @@ describe("MockGameWindow — spin flow (invalidate-after-action)", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(
       "Could not reach the cashier — balances may be stale.",
     );
-    // Stale-but-labeled: the last authoritative strings stay rendered, flagged by the status line.
+    // Stale-but-labeled values stay rendered; the STALE chip badges still flag them…
     expect(screen.getByText("1,000")).toBeInTheDocument();
-    expect(screen.getByText("stale — last sync failed")).toBeInTheDocument();
+    expect(screen.getAllByText("STALE").length).toBeGreaterThan(0);
+    // …but the BANNER shows the pending credit (precedence: reconciling outranks stale).
+    expect(screen.getByText("balance update pending…")).toBeInTheDocument();
+    expect(screen.queryByText("stale — last sync failed")).not.toBeInTheDocument();
 
     // The spin armed BEFORE the failed re-read: the reconciler is the recovery path.
     expect(getReconcileState()).toEqual({ phase: "reconciling", trigger: "spin" });

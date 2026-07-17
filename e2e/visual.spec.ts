@@ -141,3 +141,52 @@ test("10 — game: spin animation state", async ({ page, context }, testInfo) =>
   await capture(page, testInfo, "10-game-spinning");
   assertIsolated(gateway);
 });
+
+test("11 — reconciling: settled purchase whose credit is not yet visible", async ({ page, context }, testInfo) => {
+  // The wallet stub keeps answering the PRE-credit snapshot: the purchase settles, the
+  // reconciler arms, and every poll comes back unchanged → the pending banner shows.
+  const gateway = await installGateway(context, { wallet: "synced", purchase: "settled" });
+
+  await page.goto("/casino");
+  await expect(page.getByText("ledger-synced")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "BUY $5", exact: true }).click();
+  await expect(page.getByText("balance update pending…")).toHaveCount(2);
+
+  await capture(page, testInfo, "11-casino-reconciling");
+  assertIsolated(gateway);
+});
+
+test("12 — exhausted: budget spent, calm state, Check-again re-polls WITHOUT charging", async ({
+  page,
+  context,
+}, testInfo) => {
+  const gateway = await installGateway(context, { wallet: "synced", purchase: "settled" });
+  // Fake the page clock so the 45s reconcile budget elapses instantly.
+  await page.clock.install();
+  const initiatePosts: string[] = [];
+  page.on("request", (request) => {
+    const url = request.url();
+    if (request.method() === "POST" && url.endsWith("/store/purchase")) initiatePosts.push(url);
+  });
+
+  await page.goto("/casino");
+  await expect(page.getByText("ledger-synced")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "BUY $5", exact: true }).click();
+  await expect(page.getByText("balance update pending…")).toHaveCount(2);
+  expect(initiatePosts).toHaveLength(1);
+
+  // Burn through the budget: the next poll evaluation stands down as exhausted.
+  await page.clock.fastForward(50_000);
+  await expect(page.getByText("settled — taking longer than usual")).toHaveCount(2);
+
+  await capture(page, testInfo, "12-casino-exhausted");
+
+  // The affordance re-polls — and structurally CANNOT charge: initiate stays at exactly 1.
+  await page.getByRole("button", { name: "Check again" }).first().click();
+  await expect(page.getByText("balance update pending…")).toHaveCount(2);
+  expect(initiatePosts).toHaveLength(1);
+
+  assertIsolated(gateway);
+});

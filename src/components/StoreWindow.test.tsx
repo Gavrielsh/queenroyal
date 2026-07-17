@@ -2,6 +2,7 @@ import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { StoreWindow } from "@/components/StoreWindow";
+import { disarmReconcile } from "@/lib/walletReconcile";
 import { renderWithClient } from "@/test/renderWithClient";
 
 function jsonResponse(payload: unknown, status = 200): Response {
@@ -60,6 +61,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  disarmReconcile(); // the controller is module-level state — never leak an armed cell
   fetchMock.mockReset();
   vi.restoreAllMocks();
 });
@@ -168,7 +170,10 @@ describe("StoreWindow — purchase flow (invalidate-after-action)", () => {
         "Purchase settled, but the wallet re-read failed — balances may be stale.",
       ),
     );
-    expect(screen.getByText("stale — last sync failed")).toBeInTheDocument();
+    // PRECEDENCE (M4-T3): the settled purchase armed the reconciler, and a pending credit
+    // outranks the stale banner — the player must not misread convergence as failure.
+    expect(screen.getByText("balance update pending…")).toBeInTheDocument();
+    expect(screen.queryByText("stale — last sync failed")).not.toBeInTheDocument();
     // The pre-purchase authoritative strings remain (stale-but-labeled, never fabricated).
     expect(screen.getByText("1,000")).toBeInTheDocument();
   });

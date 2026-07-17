@@ -36,7 +36,8 @@ const PACKAGES: readonly DisplayPackage[] = [
 const RETRY_SAFE_COPY = "Your attempt is saved — retrying is safe and can never double-charge.";
 
 export function StoreWindow() {
-  const { balances, phase, errorStatus, lastSyncedAt } = useWalletQuery();
+  const { balances, phase, errorStatus, lastSyncedAt, reconcilePhase, recheckReconcile } =
+    useWalletQuery();
   const { purchase, isPending, pendingPackageId } = usePurchaseMutation();
   const { notice, showNotice, dismissNotice } = useActionNotice();
 
@@ -131,7 +132,13 @@ export function StoreWindow() {
         <BalanceChip family="gc" value={balances?.gc ?? null} stale={phase === "error"} />
         <BalanceChip family="scUnplayed" value={balances?.scUnplayed ?? null} stale={phase === "error"} />
       </div>
-      <WalletStatusBanner phase={phase} errorStatus={errorStatus} lastSyncedAt={lastSyncedAt} />
+      <WalletStatusBanner
+        phase={phase}
+        errorStatus={errorStatus}
+        lastSyncedAt={lastSyncedAt}
+        reconcilePhase={reconcilePhase}
+        onRecheck={recheckReconcile}
+      />
 
       {/* Packages — merchandising cards; lifecycle driven by the mutation's state. */}
       <ul className="space-y-3">
