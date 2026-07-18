@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 
 import { getPackage } from "../config/store-packages";
 import { getEnv } from "../config/env";
@@ -54,9 +54,14 @@ export type PurchaseOutcome =
  * confirming with the `client_secret`, which we return only AFTER the intent is journaled. So
  * no confirmed capture can exist without a durable journal row to settle it.
  *
- * The stable anchor is a per-attempt id (the client idempotency key when supplied, else a
- * generated UUID). The PSP intent keys on it (open-once) and the ledger credit's
- * `operator_transaction_id` is `deposit:<attemptId>`.
+ * The stable anchor is the client's REQUIRED per-attempt idempotency key: the ledger credit's
+ * `operator_transaction_id` is `deposit:<attemptId>`, and the journal row for that anchor is
+ * the durable authority on WHO owns the attempt and WHERE it is in its lifecycle (single-owner,
+ * single-shot — enforced below before any PSP call). The PSP intent keys on a DERIVED,
+ * user-scoped key — sha256(<enginePlayerId>:<attemptId>) — so the same player retrying the same
+ * attempt reaches the SAME intent (open-once), while any other account presenting the same
+ * attempt id derives a DIFFERENT key and can never open, reuse, or observe the original intent
+ * (no client_secret ever crosses accounts, even inside the pre-journal race window).
  */
 export async function purchasePackage(
   user: AuthClaims,
@@ -101,8 +106,54 @@ export async function purchasePackage(
   }
 
   const playerId = player.trueEnginePlayerId;
-  const attemptId = input.idempotencyKey ?? randomUUID();
+  const attemptId = input.idempotencyKey;
   const operatorTransactionId = `deposit:${attemptId}`;
+
+  // ── Attempt-anchor gate (fail closed, BEFORE any PSP call) ──────────────────────
+  // The journal row for this anchor is the durable authority on ownership and lifecycle.
+  // Enforcing both here makes an attempt single-owner and single-shot: a foreign account can
+  // never open or observe another player's intent, a settled attempt can never re-open a card
+  // intent (no accidental double-charge surface), and an exhausted attempt demands a fresh
+  // token instead of resurrecting a stale journaled instruction.
+  const existing = await getPrisma().engineRequestLog.findUnique({ where: { operatorTransactionId } });
+  if (existing) {
+    if (existing.playerId !== playerId) {
+      // Uniform refusal, nothing revealed about the foreign attempt; the token value itself
+      // is never logged (it is a live credential for the owner's retry path).
+      flowLog.warn({ journal_status: existing.status }, "purchase rejected: attempt anchor owned by another player");
+      return {
+        ok: false,
+        status: 409,
+        error: { code: "ATTEMPT_OWNERSHIP", message: "This purchase attempt cannot be used by this account" },
+      };
+    }
+    if (existing.status === "SUCCEEDED") {
+      return {
+        ok: false,
+        status: 409,
+        error: { code: "ATTEMPT_SETTLED", message: "This purchase attempt has already settled; start a new purchase" },
+      };
+    }
+    if (existing.status === "ABANDONED" || existing.status === "COMPENSATED") {
+      return {
+        ok: false,
+        status: 409,
+        error: {
+          code: "ATTEMPT_EXHAUSTED",
+          message: "This purchase attempt can no longer be completed; start a new purchase",
+        },
+      };
+    }
+    // PENDING / FAILED → the owner retrying an in-flight attempt: fall through. The derived
+    // PSP key below makes openDepositIntent return the SAME intent (open-once).
+  }
+
+  // PSP idempotency key, derived and user-scoped: sha256(<enginePlayerId>:<attemptId>). The
+  // same player + attempt always derives the same key (retry-safe open-once at the PSP); any
+  // other player + the same attempt derives a DIFFERENT key, so even before the journal row
+  // exists a foreign caller reaches a different intent — the original client_secret is
+  // structurally unreachable across accounts. The raw attempt id never leaves the gateway.
+  const pspIdempotencyKey = createHash("sha256").update(`${playerId}:${attemptId}`, "utf8").digest("hex");
 
   const scPromo = pkg.sc > 0 ? wholeCoinsToMoneyString(pkg.sc) : undefined;
   const purchase: PurchasePayload = {
@@ -120,7 +171,7 @@ export async function purchasePackage(
     intent = await openDepositIntent({
       amountCents: pkg.priceUsdCents,
       currency: "USD",
-      idempotencyKey: attemptId,
+      idempotencyKey: pspIdempotencyKey,
       customerRef: user.sub,
       // Echoed back on the PSP webhook so async settlement can find this deposit intent.
       metadata: { operator_transaction_id: operatorTransactionId, package_id: pkg.id },

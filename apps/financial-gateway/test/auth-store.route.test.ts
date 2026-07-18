@@ -114,6 +114,18 @@ describe("auth + store routes (Phase 6 extraction)", () => {
       expect(res.statusCode).toBe(422);
       expect(res.json()).toMatchObject({ success: false, error: { code: "VALIDATION_ERROR" } });
     });
+
+    it("→ 422 VALIDATION_ERROR when idempotencyKey is absent — the attempt anchor is REQUIRED (Z2-M1-T1)", async () => {
+      const token = signAccessToken({ sub: "user-1", email: "p@q.io", kycStatus: "VERIFIED", vipLevel: 0 });
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/store/purchase",
+        headers: { authorization: `Bearer ${token}` },
+        payload: { packageId: "pkg_value_20" }, // no idempotencyKey: the UUID fallback is gone
+      });
+      expect(res.statusCode).toBe(422);
+      expect(res.json()).toMatchObject({ success: false, error: { code: "VALIDATION_ERROR" } });
+    });
   });
 
   describe("POST /api/store/purchase/mock-confirm — dev-only settlement stand-in", () => {

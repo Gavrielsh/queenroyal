@@ -58,6 +58,13 @@ export async function handlePspWebhookEvent(event: PspWebhookEvent, traceId?: st
 
   // ── Failure: terminal, nothing captured. Only act while still PENDING. ──
   if (isFailure) {
+    // Identity guard: only the intent this deposit journaled at initiate may terminate it. A
+    // failure event for a DIFFERENT payment_ref under the same anchor must not abandon a
+    // deposit whose real intent may still capture.
+    if (row.providerRef && event.paymentIntentId !== row.providerRef) {
+      log.warn({ journaled_payment_ref: row.providerRef }, "psp failure event payment_ref mismatch; ignored");
+      return { handled: false, note: "payment_ref mismatch" };
+    }
     if (row.status === "PENDING") {
       await prisma.engineRequestLog.update({
         where: { id: row.id },
@@ -86,6 +93,18 @@ export async function handlePspWebhookEvent(event: PspWebhookEvent, traceId?: st
     return { handled: false, note: "corrupt deposit payload" };
   }
   const instruction = parsed.data;
+
+  // Identity guard (defense-in-depth): the capture must reference the EXACT intent this
+  // deposit journaled at initiate. Crediting the journaled instruction on the strength of a
+  // DIFFERENT intent's capture would move coins on the wrong evidence — a correlation bug or
+  // cross-attempt confusion, never a legitimate settlement. Refuse loudly.
+  if (event.paymentIntentId !== instruction.paymentIntentId) {
+    log.fatal(
+      { alert: "psp_payment_ref_mismatch", journaled_payment_ref: instruction.paymentIntentId },
+      "CRITICAL: PSP webhook payment_ref does not match the journaled intent; refusing to credit",
+    );
+    return { handled: false, note: "payment_ref mismatch" };
+  }
 
   // Defense-in-depth: the captured amount must match what we journaled. The ledger credit uses
   // OUR stored coin amounts (not the event's), but a mismatch signals tampering or a wrong

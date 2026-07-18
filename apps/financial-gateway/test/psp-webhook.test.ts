@@ -159,6 +159,49 @@ describe("asynchronous PSP settlement", () => {
     expect(queue.scheduledCount).toBe(0);
   });
 
+  it("Z2-M1-T1 — refuses to CREDIT on a success webhook whose payment_ref is not the journaled intent", async () => {
+    const { opTx } = await seedPendingDeposit("buy-refx");
+    // A second, unrelated intent captured under the same anchor metadata — a correlation bug
+    // (or cross-attempt confusion), never a legitimate settlement of THIS deposit.
+    const rogue = await psp.createPaymentIntent({
+      amountCents: 2000,
+      currency: "USD",
+      idempotencyKey: "rogue-key",
+      customerRef: USER_ID,
+      metadata: { operator_transaction_id: opTx, package_id: "pkg_value_20" },
+    });
+    psp.markIntentSucceeded(rogue.paymentIntentId);
+    setEngineHandler(() => unexpected); // no credit may reach the ledger
+
+    const { rawBody, signature } = psp.buildSignedWebhook(rogue.paymentIntentId, "payment_intent.succeeded");
+    const outcome = await handlePspWebhookEvent(psp.parseWebhook(rawBody, signature));
+
+    expect(outcome).toMatchObject({ handled: false, note: "payment_ref mismatch" });
+    expect(getJournal(opTx)?.status).toBe("PENDING"); // journal untouched — the real intent may still settle
+    expect(engineCalls.filter((c) => c.path === "/api/v1/store/purchase")).toHaveLength(0);
+  });
+
+  it("Z2-M1-T1 — refuses to ABANDON on a failure webhook whose payment_ref is not the journaled intent", async () => {
+    const { opTx } = await seedPendingDeposit("buy-refy");
+    const rogue = await psp.createPaymentIntent({
+      amountCents: 2000,
+      currency: "USD",
+      idempotencyKey: "rogue-key-2",
+      customerRef: USER_ID,
+      metadata: { operator_transaction_id: opTx, package_id: "pkg_value_20" },
+    });
+    psp.markIntentFailed(rogue.paymentIntentId);
+    setEngineHandler(() => unexpected);
+
+    const { rawBody, signature } = psp.buildSignedWebhook(rogue.paymentIntentId, "payment_intent.payment_failed");
+    const outcome = await handlePspWebhookEvent(psp.parseWebhook(rawBody, signature));
+
+    expect(outcome).toMatchObject({ handled: false, note: "payment_ref mismatch" });
+    // The deposit stays PENDING — a foreign failure must not kill an attempt whose real
+    // capture may still arrive.
+    expect(getJournal(opTx)?.status).toBe("PENDING");
+  });
+
   it("rejects a webhook whose HMAC signature does not verify", async () => {
     const { paymentIntentId } = await seedPendingDeposit("buy-3xxx");
     psp.markIntentSucceeded(paymentIntentId);
