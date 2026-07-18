@@ -14,7 +14,7 @@ import { logEvent } from "@/lib/telemetry";
  */
 
 /** What initiated a ledger re-sync; the closed attribution vocabulary for telemetry. */
-export type WalletInvalidateTrigger = "spin" | "purchase" | "recheck";
+export type WalletInvalidateTrigger = "spin" | "purchase" | "recheck" | "realtime";
 
 /** Outcome of a caller-initiated re-sync, with just enough detail to pick honest copy. */
 export type WalletSyncOutcome =

@@ -5,6 +5,13 @@ import dynamic from "next/dynamic";
 import { type ReactNode } from "react";
 
 import { getQueryClient } from "@/lib/queryClient";
+import { useWalletChannel } from "@/lib/realtime/useWalletChannel";
+
+/** Mounts the realtime wallet channel (a no-op unless NEXT_PUBLIC_WALLET_CHANNEL_URL is set). */
+function WalletChannelBridge() {
+  useWalletChannel();
+  return null;
+}
 
 // Devtools load as a separate, browser-only chunk and render in non-production only — they
 // never enter the production First Load JS and never run during SSR.
@@ -24,6 +31,7 @@ export function Providers({ children }: { children: ReactNode }) {
 
   return (
     <QueryClientProvider client={queryClient}>
+      <WalletChannelBridge />
       {children}
       {showDevtools ? <ReactQueryDevtools /> : null}
     </QueryClientProvider>
