@@ -12,6 +12,7 @@ import { errBody } from "./lib/reply";
 import { adminRoutes } from "./routes/admin";
 import { authRoutes } from "./routes/auth";
 import { healthRoutes } from "./routes/health";
+import { spinRoutes } from "./routes/spin";
 import { storeRoutes } from "./routes/store";
 import { walletRoutes } from "./routes/wallet";
 import { webhookRoutes } from "./routes/webhooks";
@@ -115,6 +116,10 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(webhookRoutes);
   await app.register(authRoutes);
   await app.register(storeRoutes);
+  // Server-authoritative player spin. Must stay registered alongside (not inside) the webhook
+  // plugin: webhookRoutes swaps in a raw-body parser for HMAC verification, and this route
+  // needs Fastify's normal JSON parsing.
+  await app.register(spinRoutes);
   await app.register(walletRoutes);
   await app.register(adminRoutes);
 

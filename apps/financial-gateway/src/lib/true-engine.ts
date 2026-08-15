@@ -11,6 +11,8 @@ import type {
   RollbackPayload,
   SessionBalancesResult,
   SessionPayload,
+  SpinPayload,
+  EngineSpinResult,
   TrueEngineErrorBody,
   TrueEngineResult,
   WinPayload,
@@ -34,6 +36,7 @@ import type {
  */
 
 const ENGINE_ENDPOINTS = {
+  spin: "/api/v1/spin",
   bet: "/api/v1/bet",
   win: "/api/v1/win",
   rollback: "/api/v1/rollback",
@@ -58,9 +61,20 @@ export class TrueEngineClient {
 
   // ── Public API ──────────────────────────────────────────────────────────────
 
+  /**
+   * Settle a SERVER-AUTHORITATIVE round. The engine draws the outcome, derives the payout
+   * from its own paytable, and commits both legs atomically.
+   *
+   * This is the only spin path a player may reach. `sendBet`/`sendWin` below are reserved
+   * for third-party aggregator settlement.
+   */
+  sendSpin(payload: SpinPayload): Promise<TrueEngineResult<EngineSpinResult>> {
+    return this.postTx<EngineSpinResult>(ENGINE_ENDPOINTS.spin, payload);
+  }
+
   /** Debit a wager. `operator_transaction_id` must be a stable, deterministic key. */
   sendBet(payload: BetPayload): Promise<TrueEngineResult<EngineTxResult>> {
-    return this.postTx(ENGINE_ENDPOINTS.bet, payload);
+    return this.postTx<EngineTxResult>(ENGINE_ENDPOINTS.bet, payload);
   }
 
   /** Credit a win, optionally linked to the bet's `ledger_transaction_id`. */
@@ -98,8 +112,8 @@ export class TrueEngineClient {
   // ── Internals ─────────────────────────────────────────────────────────────────
 
   /** Post a tx-style call and unwrap the `{ code, result }` envelope to `result`. */
-  private async postTx(path: string, payload: object): Promise<TrueEngineResult<EngineTxResult>> {
-    const res = await this.post<EngineSuccessEnvelope<EngineTxResult>>(path, payload);
+  private async postTx<T>(path: string, payload: object): Promise<TrueEngineResult<T>> {
+    const res = await this.post<EngineSuccessEnvelope<T>>(path, payload);
     if (!res.ok) return res;
     return { ok: true, status: res.status, data: res.data.result };
   }

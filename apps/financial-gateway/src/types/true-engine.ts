@@ -41,6 +41,52 @@ export interface WinPayload {
   metadata?: EngineMetadata;
 }
 
+/**
+ * POST /api/v1/spin — the SERVER-AUTHORITATIVE game round.
+ *
+ * SECURITY: note the absent fields. There is no `win_amount`, no `multiplier`, and no
+ * `outcome`. The engine draws the reels from crypto/rand, evaluates its own version-pinned
+ * paytable, derives the payout, and settles the debit and credit in one transaction.
+ *
+ * This is the shape that replaces the player-facing use of BetPayload + WinPayload. Those
+ * remain ONLY for third-party aggregator settlement, where a certified external provider
+ * generates the outcome — and there the engine enforces an absolute win ceiling
+ * (MAX_PROVIDER_WIN) because it cannot re-derive the payout itself.
+ */
+export interface SpinPayload {
+  operator_transaction_id: string; // deterministic idempotency anchor
+  player_id: string;
+  currency: Currency;
+  bet_amount: string; // decimal string, > 0 — the ONLY caller-supplied money value
+  game_id?: string;
+  round_id?: string;
+  metadata?: EngineMetadata;
+}
+
+/** The engine's authoritative outcome record for one round. Presentation data only. */
+export interface EngineSpinOutcome {
+  game_id: string;
+  paytable_version: string;
+  reels: string[];
+  line: "NONE" | "TWO_OF_A_KIND" | "THREE_OF_A_KIND";
+  win_symbol?: string;
+  multiplier: string;
+}
+
+/** POST /api/v1/spin result. */
+export interface EngineSpinResult {
+  operator_transaction_id: string;
+  player_id: string;
+  bet_ledger_transaction_id: string;
+  win_ledger_transaction_id?: string;
+  family: Currency;
+  bet_amount: string;
+  win_amount: string;
+  outcome: EngineSpinOutcome;
+  post_balances: EngineBalances;
+  status: "PROCESSED" | "CACHED" | "GHOST_RECOVERED";
+}
+
 /** POST /api/v1/store/purchase — issue GC (+ optional SC_UNPLAYED promo) for a fiat buy. */
 export interface PurchasePayload {
   operator_transaction_id: string;
