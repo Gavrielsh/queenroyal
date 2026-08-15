@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 
 import { requireAuth, UnauthorizedError } from "../lib/auth";
+import { requirePermittedJurisdiction } from "../lib/geo-hook";
 import type { AuthClaims } from "../lib/jwt";
 import { errBody, okBody } from "../lib/reply";
 import { spinSchema } from "../schemas/spin.schema";
@@ -24,7 +25,13 @@ declare module "fastify" {
  */
 export const spinRoutes: FastifyPluginAsync = async (app) => {
   app.decorateRequest("authClaims", null);
-  app.post("/api/spin", { preHandler: requireAuthPreHandler }, spinHandler);
+  // Jurisdiction FIRST, then auth: a player in a prohibited state is refused
+  // before we do any account work on their behalf.
+  app.post(
+    "/api/spin",
+    { preHandler: [requirePermittedJurisdiction, requireAuthPreHandler] },
+    spinHandler,
+  );
 };
 
 async function requireAuthPreHandler(req: FastifyRequest, reply: FastifyReply): Promise<void> {
