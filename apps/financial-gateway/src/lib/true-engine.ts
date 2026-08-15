@@ -118,9 +118,24 @@ export class TrueEngineClient {
     return { ok: true, status: res.status, data: res.data.result };
   }
 
-  /** HMAC-SHA256 of the exact serialized body, hex-encoded. */
-  private sign(rawBody: string): string {
-    return createHmac("sha256", this.secret).update(rawBody, "utf8").digest("hex");
+  /**
+   * HMAC-SHA256 of the CANONICAL STRING, hex-encoded:
+   *
+   *     <X-Timestamp> "." <X-Nonce> "." <raw body>
+   *
+   * The timestamp and nonce are part of the signed material, not free-floating headers.
+   *
+   * WHY (audit finding): signing the body alone made replay protection decorative. An
+   * attacker who captured one valid request could replay it indefinitely — reuse the body
+   * and its still-valid signature, attach a fresh timestamp and a brand-new nonce, and every
+   * check passed, because the ATTACKER chose the nonce. Binding all three means a captured
+   * signature is pinned to the instant it was issued and cannot be re-stamped without the
+   * secret.
+   *
+   * Must stay byte-identical to the engine's `canonicalPayload` (internal/api/hmac.go).
+   */
+  private sign(timestamp: string, nonce: string, rawBody: string): string {
+    return createHmac("sha256", this.secret).update(`${timestamp}.${nonce}.${rawBody}`, "utf8").digest("hex");
   }
 
   /**
@@ -130,9 +145,11 @@ export class TrueEngineClient {
    */
   private async post<T>(path: string, payload: object): Promise<TrueEngineResult<T>> {
     const rawBody = JSON.stringify(payload); // serialize ONCE; sign & send identical bytes
-    const signature = this.sign(rawBody);
     const timestamp = Math.floor(Date.now() / 1000).toString();
+    // randomUUID contains no '.', keeping the canonical string unambiguous — the engine
+    // rejects a nonce containing the separator for the same reason.
     const nonce = randomUUID();
+    const signature = this.sign(timestamp, nonce, rawBody);
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);

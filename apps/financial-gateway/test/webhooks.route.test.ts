@@ -13,6 +13,28 @@ function hmacHex(body: string, secret: string): string {
   return createHmac("sha256", secret).update(body, "utf8").digest("hex");
 }
 
+/**
+ * Provider-webhook headers carrying the CANONICAL signature over
+ * "<timestamp>.<nonce>.<body>". The timestamp and nonce are resolved once and
+ * both signed and sent, so the request is internally consistent.
+ */
+function providerHeaders(body: string, opts: { nonce?: string | null } = {}): Record<string, string> {
+  const timestamp = tsNow();
+  const nonce = opts.nonce === null ? undefined : (opts.nonce ?? randomUUID());
+  const signature = createHmac("sha256", PROVIDER_SECRET)
+    .update(`${timestamp}.${nonce ?? ""}.${body}`, "utf8")
+    .digest("hex");
+
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    "x-provider-code": "PRAGMATIC",
+    "x-signature": signature,
+    "x-timestamp": timestamp,
+  };
+  if (nonce !== undefined) headers["x-nonce"] = nonce;
+  return headers;
+}
+
 function tsNow(): string {
   return String(Math.floor(Date.now() / 1000));
 }
@@ -51,22 +73,19 @@ describe("webhook routes (Fastify zero-trust perimeter)", () => {
       expect(res.json()).toMatchObject({ success: false, error: { code: "AUTHENTICATION_FAILED" } });
     });
 
-    it("rejects a missing nonce with 400 (perimeter, before the controller)", async () => {
+    it("rejects a missing nonce with an opaque 401 (perimeter, before the controller)", async () => {
       const body = JSON.stringify({ provider_transaction_id: "t1" });
       const res = await app.inject({
         method: "POST",
         url: "/api/webhooks/provider/spin",
-        headers: {
-          "content-type": "application/json",
-          "x-provider-code": "PRAGMATIC",
-          "x-signature": hmacHex(body, PROVIDER_SECRET),
-          "x-timestamp": tsNow(),
-          // no x-nonce
-        },
+        headers: providerHeaders(body, { nonce: null }),
         payload: body,
       });
-      expect(res.statusCode).toBe(400);
-      expect(res.json()).toMatchObject({ success: false, error: { code: "MISSING_NONCE" } });
+      // CONTRACT CHANGE: the nonce is signed material now, so its absence is
+      // caught before the MAC and reported as an opaque 401 — a caller learns
+      // nothing about which perimeter check failed.
+      expect(res.statusCode).toBe(401);
+      expect(res.json()).toMatchObject({ success: false, error: { code: "AUTHENTICATION_FAILED" } });
     });
 
     it("passes the perimeter but 422s a malformed payload (valid signature)", async () => {
@@ -74,13 +93,7 @@ describe("webhook routes (Fastify zero-trust perimeter)", () => {
       const res = await app.inject({
         method: "POST",
         url: "/api/webhooks/provider/spin",
-        headers: {
-          "content-type": "application/json",
-          "x-provider-code": "PRAGMATIC",
-          "x-signature": hmacHex(body, PROVIDER_SECRET),
-          "x-timestamp": tsNow(),
-          "x-nonce": randomUUID(),
-        },
+        headers: providerHeaders(body),
         payload: body,
       });
       expect(res.statusCode).toBe(422);
@@ -116,13 +129,7 @@ describe("webhook routes (Fastify zero-trust perimeter)", () => {
       const res = await app.inject({
         method: "POST",
         url: "/api/webhooks/provider/rollback",
-        headers: {
-          "content-type": "application/json",
-          "x-provider-code": "PRAGMATIC",
-          "x-signature": hmacHex(body, PROVIDER_SECRET),
-          "x-timestamp": tsNow(),
-          "x-nonce": randomUUID(),
-        },
+        headers: providerHeaders(body),
         payload: body,
       });
       expect(res.statusCode).toBe(422);
