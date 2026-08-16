@@ -49,6 +49,31 @@ export const NONCE_TTL_SECONDS = 600;
 const HEX_RE = /^[0-9a-fA-F]+$/;
 const NONCE_KEY_PREFIX = "webhook:nonce:";
 
+/**
+ * The exact byte string that is signed:
+ *
+ *     <X-Timestamp> "." <X-Nonce> "." <raw body>
+ *
+ * Must stay byte-identical to the engine's `canonicalPayload` (internal/api/hmac.go) and to
+ * TrueEngineClient.sign — all three implement the same contract from opposite ends.
+ */
+function canonicalPayload(timestamp: string, nonce: string, rawBody: string): string {
+  return `${timestamp}.${nonce}.${rawBody}`;
+}
+
+/** Unix seconds, digits only, bounded length. Freshness is checked separately. */
+function timestampIsWellFormed(ts: string): boolean {
+  return ts.length > 0 && ts.length <= 20 && /^\d+$/.test(ts);
+}
+
+/**
+ * Non-empty, bounded, and free of the '.' separator so the canonical string cannot be
+ * re-split into different fields with the same digest.
+ */
+function nonceIsWellFormed(nonce: string): boolean {
+  return nonce.length > 0 && nonce.length <= 128 && !nonce.includes(".");
+}
+
 export class WebhookVerificationError extends Error {
   constructor(
     public readonly code: string,
@@ -132,31 +157,37 @@ export async function verifyProviderWebhook(getHeader: HeaderGetter, rawBody: st
     throw new WebhookVerificationError("AUTHENTICATION_FAILED", "authentication failed", 401);
   }
 
-  // 2. HMAC compare (constant-time over decoded bytes) of the RAW body.
+  // 2. The replay headers are part of the SIGNED material, so they must be present and
+  //    well-formed BEFORE the MAC is computed. Freshness and single-use are still checked
+  //    below; these guards only keep the canonical string unambiguous — neither field may
+  //    contain the '.' separator, or an attacker could shift bytes between fields while
+  //    keeping the same digest.
+  if (!timestampIsWellFormed(timestampRaw) || !nonceIsWellFormed(nonce)) {
+    throw new WebhookVerificationError("AUTHENTICATION_FAILED", "authentication failed", 401);
+  }
+
+  // 3. HMAC compare (constant-time over decoded bytes) of the CANONICAL STRING.
   if (!signature || !HEX_RE.test(signature) || signature.length % 2 !== 0) {
     throw new WebhookVerificationError("AUTHENTICATION_FAILED", "authentication failed", 401);
   }
-  const expected = createHmac("sha256", secret).update(rawBody, "utf8").digest();
+  const expected = createHmac("sha256", secret)
+    .update(canonicalPayload(timestampRaw, nonce, rawBody), "utf8")
+    .digest();
   const provided = Buffer.from(signature, "hex");
   if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
     throw new WebhookVerificationError("AUTHENTICATION_FAILED", "authentication failed", 401);
   }
 
-  // 3. Timestamp freshness, with a symmetric ±CLOCK_DRIFT_TOLERANCE_MS clock-drift window:
+  // 4. Timestamp freshness, with a symmetric ±CLOCK_DRIFT_TOLERANCE_MS clock-drift window:
   //      acceptable iff  -tolerance <= (now - ts) <= MAX_AGE + tolerance
-  if (!timestampRaw || !/^\d+$/.test(timestampRaw)) {
-    throw new WebhookVerificationError("INVALID_TIMESTAMP", "X-Timestamp must be unix seconds", 400);
-  }
   const tsMs = Number(timestampRaw) * 1000;
   const driftMs = Date.now() - tsMs; // > 0 → timestamp is in the past
   if (driftMs > MAX_AGE_SECONDS * 1000 + CLOCK_DRIFT_TOLERANCE_MS || driftMs < -CLOCK_DRIFT_TOLERANCE_MS) {
     throw new WebhookVerificationError("STALE_REQUEST", "X-Timestamp outside acceptable window", 401);
   }
 
-  // 4. Nonce single-use (scoped per provider). FAIL CLOSED on a store error.
-  if (!nonce) {
-    throw new WebhookVerificationError("MISSING_NONCE", "X-Nonce header is required", 400);
-  }
+  // 5. Nonce single-use (scoped per provider). FAIL CLOSED on a store error.
+  //    Presence was already established in step 2 — this burns it.
   let fresh: boolean;
   try {
     fresh = await store.reserve(`${providerCode}:${nonce}`);

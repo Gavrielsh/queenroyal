@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 
 import { requireAuth, UnauthorizedError } from "../lib/auth";
+import { requirePermittedJurisdiction } from "../lib/geo-hook";
 import type { AuthClaims } from "../lib/jwt";
 import { errBody, okBody } from "../lib/reply";
 import { mockConfirmSchema, purchaseSchema } from "../schemas/store.schema";
@@ -23,7 +24,13 @@ declare module "fastify" {
  */
 export const storeRoutes: FastifyPluginAsync = async (app) => {
   app.decorateRequest("authClaims", null);
-  app.post("/api/store/purchase", { preHandler: requireAuthPreHandler }, purchaseHandler);
+  // Jurisdiction FIRST: a player in a prohibited state must not be able to
+  // open a payment intent, let alone be charged.
+  app.post(
+    "/api/store/purchase",
+    { preHandler: [requirePermittedJurisdiction, requireAuthPreHandler] },
+    purchaseHandler,
+  );
   // DEV-ONLY: stands in for the Stripe.js card confirmation + `succeeded` webhook when the
   // mock PSP is active. Responds 409 MOCK_PSP_ONLY under a real provider (see the service).
   app.post("/api/store/purchase/mock-confirm", { preHandler: requireAuthPreHandler }, mockConfirmHandler);

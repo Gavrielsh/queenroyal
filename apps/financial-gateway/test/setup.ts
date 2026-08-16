@@ -14,3 +14,10 @@ process.env.PSP_WEBHOOK_SECRET ??= "test-psp-secret";
 // Auth (JWT). A fixed test secret so tests can mint/verify access tokens deterministically.
 process.env.JWT_SECRET ??= "test-jwt-secret-0123456789abcdef";
 process.env.JWT_ACCESS_TTL ??= "15m";
+
+// Jurisdiction enforcement is ON by default and fails closed, so without a
+// simulated trusted edge every player-facing route test would 403 on
+// `no_trusted_edge`. Route tests are about routing, auth, and validation —
+// the fence's own behaviour (blocked states, spoofed headers, fail-closed
+// paths) is covered directly in test/geo.test.ts against an explicit policy.
+process.env.GEO_ENFORCEMENT_DISABLED ??= "disabled";

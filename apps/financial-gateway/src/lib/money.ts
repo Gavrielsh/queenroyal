@@ -13,8 +13,23 @@ import { z } from "zod";
  *     forward the string verbatim to the engine.
  */
 
-/** `123`, `123.4`, `0.0200`, `20000` — integer part required, up to 4 dp, no sign/exp. */
-export const MONEY_REGEX = /^\d+(\.\d{1,4})?$/;
+/**
+ * `123`, `123.4`, `0.0200`, `20000` — integer part required, up to 4 dp, no sign/exp.
+ *
+ * The integer part is capped at 14 digits to mirror the ledger's `NUMERIC(18,4)` capacity
+ * (18 significant digits, 4 after the point → integer part < 10^14), which the Go side
+ * enforces as `domain.MaxMoneyUnits`.
+ *
+ * WHY THE BOUND MATTERS: without it a 30-digit amount passed every check here and only
+ * failed at the engine's `UPDATE wallets`, as Postgres 22003 numeric_field_overflow — after
+ * the transaction had already taken the wallet's row lock and held it across several
+ * round-trips. A cheap request turned into lock contention and an opaque 500. It is also
+ * load-bearing for the win cap: a payout is stake × multiplier, so an unbounded stake is an
+ * unbounded win however tightly the paytable is capped.
+ *
+ * No sign is accepted, so `-100` is rejected here before it reaches the ledger.
+ */
+export const MONEY_REGEX = /^\d{1,14}(\.\d{1,4})?$/;
 
 /** A non-negative decimal string with ≤ 4 dp. */
 export function isMoneyString(v: unknown): v is string {

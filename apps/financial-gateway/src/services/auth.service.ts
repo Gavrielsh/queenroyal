@@ -11,9 +11,35 @@ import { provisionTrueEnginePlayer } from "./player-provisioning.service";
 import { issueRefreshToken } from "./session.service";
 
 const BCRYPT_ROUNDS = 12;
-// Pre-computed bcrypt hash used to equalize timing when an email is not found, reducing the
-// user-enumeration signal on login.
-const DUMMY_HASH = "$2a$12$CwTycUXWue0Thq9StjUM0uJ8Dvm9k2x9p8jWz4z1qkq1qkq1qkq1";
+
+/**
+ * Decoy hash compared against when an email is not found, so the unknown-account path
+ * costs the same as the known-account path and login cannot be used to enumerate users.
+ *
+ * WHY IT IS DERIVED RATHER THAN HARDCODED
+ *
+ * The previous constant was a 59-character string. A bcrypt digest is exactly 60:
+ * 7 for "$2a$12$", 22 of salt, 31 of hash. bcryptjs could not parse the malformed salt,
+ * so `compare` returned false IMMEDIATELY without ever running the key derivation —
+ * measured at 0.10ms against 330ms for a real cost-12 compare. A ~3200x gap: the exact
+ * signal the decoy exists to suppress, and trivially observable over the network.
+ *
+ * Hardcoding a valid hash fixes the parse failure but introduces a subtler version of the
+ * same bug: a literal pinned at one cost factor drifts the moment BCRYPT_ROUNDS changes.
+ * A cost-10 decoy against cost-12 accounts still leaves a ~4x gap.
+ *
+ * Deriving it from BCRYPT_ROUNDS makes the two paths cost the same BY CONSTRUCTION, and
+ * keeps them equal if the work factor is ever raised. The input is a throwaway random
+ * UUID, so no password on earth verifies against it.
+ *
+ * Computed lazily and memoized: one cost-12 hash per process, on the first login that
+ * needs it, rather than on every module import (which would tax test startup).
+ */
+let dummyHash: string | null = null;
+function decoyHash(): string {
+  if (dummyHash === null) dummyHash = bcrypt.hashSync(randomUUID(), BCRYPT_ROUNDS);
+  return dummyHash;
+}
 
 export class AuthError extends Error {
   constructor(
@@ -95,8 +121,10 @@ export async function register(input: RegisterInput): Promise<AuthResult> {
 export async function login(input: LoginInput): Promise<AuthResult> {
   const user = await getPrisma().user.findUnique({ where: { email: input.email } });
 
-  // Always run a compare (real or dummy hash) so timing doesn't reveal account existence.
-  const hashToCompare = user?.passwordHash ?? DUMMY_HASH;
+  // Always run a FULL compare — real hash or decoy — so the response time does not
+  // reveal whether the account exists. The decoy carries the same cost factor as a real
+  // hash, so both paths run the identical amount of key-derivation work.
+  const hashToCompare = user?.passwordHash ?? decoyHash();
   const passwordValid = await bcrypt.compare(input.password, hashToCompare);
 
   if (!user || !passwordValid) {

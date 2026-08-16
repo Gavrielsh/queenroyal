@@ -11,6 +11,8 @@ import type {
   RollbackPayload,
   SessionBalancesResult,
   SessionPayload,
+  SpinPayload,
+  EngineSpinResult,
   TrueEngineErrorBody,
   TrueEngineResult,
   WinPayload,
@@ -34,6 +36,7 @@ import type {
  */
 
 const ENGINE_ENDPOINTS = {
+  spin: "/api/v1/spin",
   bet: "/api/v1/bet",
   win: "/api/v1/win",
   rollback: "/api/v1/rollback",
@@ -58,9 +61,20 @@ export class TrueEngineClient {
 
   // ── Public API ──────────────────────────────────────────────────────────────
 
+  /**
+   * Settle a SERVER-AUTHORITATIVE round. The engine draws the outcome, derives the payout
+   * from its own paytable, and commits both legs atomically.
+   *
+   * This is the only spin path a player may reach. `sendBet`/`sendWin` below are reserved
+   * for third-party aggregator settlement.
+   */
+  sendSpin(payload: SpinPayload): Promise<TrueEngineResult<EngineSpinResult>> {
+    return this.postTx<EngineSpinResult>(ENGINE_ENDPOINTS.spin, payload);
+  }
+
   /** Debit a wager. `operator_transaction_id` must be a stable, deterministic key. */
   sendBet(payload: BetPayload): Promise<TrueEngineResult<EngineTxResult>> {
-    return this.postTx(ENGINE_ENDPOINTS.bet, payload);
+    return this.postTx<EngineTxResult>(ENGINE_ENDPOINTS.bet, payload);
   }
 
   /** Credit a win, optionally linked to the bet's `ledger_transaction_id`. */
@@ -98,15 +112,30 @@ export class TrueEngineClient {
   // ── Internals ─────────────────────────────────────────────────────────────────
 
   /** Post a tx-style call and unwrap the `{ code, result }` envelope to `result`. */
-  private async postTx(path: string, payload: object): Promise<TrueEngineResult<EngineTxResult>> {
-    const res = await this.post<EngineSuccessEnvelope<EngineTxResult>>(path, payload);
+  private async postTx<T>(path: string, payload: object): Promise<TrueEngineResult<T>> {
+    const res = await this.post<EngineSuccessEnvelope<T>>(path, payload);
     if (!res.ok) return res;
     return { ok: true, status: res.status, data: res.data.result };
   }
 
-  /** HMAC-SHA256 of the exact serialized body, hex-encoded. */
-  private sign(rawBody: string): string {
-    return createHmac("sha256", this.secret).update(rawBody, "utf8").digest("hex");
+  /**
+   * HMAC-SHA256 of the CANONICAL STRING, hex-encoded:
+   *
+   *     <X-Timestamp> "." <X-Nonce> "." <raw body>
+   *
+   * The timestamp and nonce are part of the signed material, not free-floating headers.
+   *
+   * WHY (audit finding): signing the body alone made replay protection decorative. An
+   * attacker who captured one valid request could replay it indefinitely — reuse the body
+   * and its still-valid signature, attach a fresh timestamp and a brand-new nonce, and every
+   * check passed, because the ATTACKER chose the nonce. Binding all three means a captured
+   * signature is pinned to the instant it was issued and cannot be re-stamped without the
+   * secret.
+   *
+   * Must stay byte-identical to the engine's `canonicalPayload` (internal/api/hmac.go).
+   */
+  private sign(timestamp: string, nonce: string, rawBody: string): string {
+    return createHmac("sha256", this.secret).update(`${timestamp}.${nonce}.${rawBody}`, "utf8").digest("hex");
   }
 
   /**
@@ -116,9 +145,11 @@ export class TrueEngineClient {
    */
   private async post<T>(path: string, payload: object): Promise<TrueEngineResult<T>> {
     const rawBody = JSON.stringify(payload); // serialize ONCE; sign & send identical bytes
-    const signature = this.sign(rawBody);
     const timestamp = Math.floor(Date.now() / 1000).toString();
+    // randomUUID contains no '.', keeping the canonical string unambiguous — the engine
+    // rejects a nonce containing the separator for the same reason.
     const nonce = randomUUID();
+    const signature = this.sign(timestamp, nonce, rawBody);
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);

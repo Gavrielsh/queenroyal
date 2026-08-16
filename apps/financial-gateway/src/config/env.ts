@@ -118,6 +118,52 @@ const envSchema = z.object({
   /** Hard cap on request body size (bytes). Webhooks are small; a tight bound blunts abuse. */
   BODY_LIMIT_BYTES: z.coerce.number().int().positive().default(1_048_576), // 1 MiB
 
+  // ── Jurisdiction enforcement (player perimeter) ──────────────────────────────────
+  // FAIL CLOSED: a request whose region cannot be positively established is rejected
+  // with 403. This is the layer where a player's connection actually terminates — the
+  // engine's fence only ever sees this gateway's datacenter address.
+  //
+  // Set to "disabled" to run without enforcement. DEV ONLY: it is deliberately an
+  // explicit, greppable opt-out rather than the accidental consequence of an unset
+  // variable, which is how the previous blocklist looked configured while enforcing
+  // nothing.
+  GEO_ENFORCEMENT_DISABLED: z
+    .string()
+    .default("")
+    .transform((raw) => raw.trim().toLowerCase() === "disabled"),
+
+  // Blocked ISO-3166-2 subdivisions. Defaults to the states this platform does not
+  // serve. Review with counsel before launch — this is a default, not legal advice.
+  BLOCKED_REGIONS: z
+    .string()
+    .default("US-WA,US-ID,US-TN,US-WY")
+    .transform((raw) =>
+      raw
+        .split(",")
+        .map((r) => r.trim().toUpperCase())
+        .filter((r) => r.length > 0),
+    ),
+
+  // CIDRs (or bare IPs) whose forwarded client-IP and geo headers are honoured.
+  // EMPTY means no proxy is trusted — the socket peer is the client and the geo
+  // headers are ignored, so enforcement rejects everything. That is intentional:
+  // a deployment behind a proxy MUST declare it rather than defaulting to trusting
+  // a spoofable header.
+  TRUSTED_PROXIES: z
+    .string()
+    .default("")
+    .transform((raw) =>
+      raw
+        .split(",")
+        .map((c) => c.trim())
+        .filter((c) => c.length > 0),
+    ),
+
+  // Headers the edge (Cloudflare / CloudFront / Fastly) uses to report geography.
+  // Defaults match Cloudflare. Only read when the peer is a trusted proxy.
+  GEO_COUNTRY_HEADER: z.string().min(1).default("cf-ipcountry"),
+  GEO_REGION_HEADER: z.string().min(1).default("cf-region-code"),
+
   // ── Distributed state (Redis: webhook replay nonces, rate limiting, circuit breaker) ──
   // The topology is validated HERE, in the centralized contract, so src/lib/redis.ts consumes a
   // VETTED routing config rather than reading raw process.env. Replay protection fails CLOSED
