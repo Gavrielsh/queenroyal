@@ -7,6 +7,7 @@ import {
   initiateStorePurchase,
   isAbortError,
   isMoneyString,
+  parseSpinEnvelope,
   parseWalletEnvelope,
 } from "@/lib/apiClient";
 import { getOrCreateAttemptToken, markSettled } from "@/lib/purchaseIntent";
@@ -363,5 +364,120 @@ describe("money-string validator (unit)", () => {
       scUnplayed: "12.5",
       scRedeemable: "0",
     });
+  });
+});
+
+describe("parseSpinEnvelope — the validation gate on a settled round", () => {
+  /** A well-formed engine spin result; each test corrupts exactly one field. */
+  function validSpin(): Record<string, unknown> {
+    return {
+      operator_transaction_id: "spin:attempt-1",
+      player_id: "pl_1",
+      bet_ledger_transaction_id: "ltx_bet_1",
+      win_ledger_transaction_id: "ltx_win_1",
+      family: "GC",
+      bet_amount: "1.0000",
+      win_amount: "20.0000",
+      outcome: {
+        game_id: "classic-3reel",
+        paytable_version: "1.0.0",
+        reels: ["BELL", "BELL", "BELL"],
+        line: "THREE_OF_A_KIND",
+        win_symbol: "BELL",
+        multiplier: "20",
+      },
+      post_balances: { gc: "9999.0000", sc_unplayed: "0", sc_redeemable: "0" },
+      status: "PROCESSED",
+    };
+  }
+
+  function envelope(data: unknown): unknown {
+    return { success: true, data };
+  }
+
+  it("accepts a well-formed round and camel-cases it without touching the money strings", () => {
+    const parsed = parseSpinEnvelope(envelope(validSpin()));
+    expect(parsed.betAmount).toBe("1.0000");
+    expect(parsed.winAmount).toBe("20.0000");
+    expect(parsed.postBalances).toEqual({ gc: "9999.0000", scUnplayed: "0", scRedeemable: "0" });
+    expect(parsed.outcome.reels).toEqual(["BELL", "BELL", "BELL"]);
+    expect(parsed.outcome.winSymbol).toBe("BELL");
+    expect(parsed.status).toBe("PROCESSED");
+  });
+
+  it("normalizes an absent win leg on a losing round to null", () => {
+    const losing: Record<string, unknown> = {
+      ...validSpin(),
+      win_amount: "0",
+      win_ledger_transaction_id: undefined,
+    };
+    losing.outcome = {
+      game_id: "classic-3reel",
+      paytable_version: "1.0.0",
+      reels: ["CHERRY", "LEMON", "BELL"],
+      line: "NONE",
+      multiplier: "0",
+    };
+    const parsed = parseSpinEnvelope(envelope(losing));
+    expect(parsed.winLedgerTransactionId).toBeNull();
+    expect(parsed.outcome.winSymbol).toBeNull();
+    expect(parsed.outcome.line).toBe("NONE");
+  });
+
+  it.each([
+    ["a float win amount", (s: Record<string, unknown>) => (s.win_amount = 20.0), "data.win_amount"],
+    ["a 5-dp win amount", (s: Record<string, unknown>) => (s.win_amount = "20.00001"), "data.win_amount"],
+    ["a negative bet", (s: Record<string, unknown>) => (s.bet_amount = "-1.0000"), "data.bet_amount"],
+    ["a float balance", (s: Record<string, unknown>) => (s.post_balances = { gc: 1, sc_unplayed: "0", sc_redeemable: "0" }), "data.post_balances.gc"],
+    ["an unknown family", (s: Record<string, unknown>) => (s.family = "BTC"), "data.family"],
+    ["an unknown status", (s: Record<string, unknown>) => (s.status = "MAYBE"), "data.status"],
+    ["a missing bet ledger id", (s: Record<string, unknown>) => (s.bet_ledger_transaction_id = ""), "data.bet_ledger_transaction_id"],
+  ])("rejects %s", (_label, corrupt, field) => {
+    const spin = validSpin();
+    corrupt(spin);
+    expect(() => parseSpinEnvelope(envelope(spin))).toThrowError(
+      expect.objectContaining({ code: "MALFORMED_SPIN", message: `Spin envelope failed validation at ${field}` }),
+    );
+  });
+
+  it.each([
+    ["empty reels", { reels: [] }, "data.outcome.reels"],
+    ["a non-array reel set", { reels: "CROWN" }, "data.outcome.reels"],
+    ["an absurd reel count", { reels: Array.from({ length: 11 }, () => "BELL") }, "data.outcome.reels"],
+    ["a non-string reel", { reels: ["BELL", 7, "BELL"] }, "data.outcome.reels[1]"],
+    ["an unknown line", { line: "FOUR_OF_A_KIND" }, "data.outcome.line"],
+    ["a numeric multiplier", { multiplier: 20 }, "data.outcome.multiplier"],
+    ["a missing paytable version", { paytable_version: "" }, "data.outcome.paytable_version"],
+  ])("rejects %s", (_label, patch, field) => {
+    const spin = validSpin();
+    spin.outcome = { ...(spin.outcome as Record<string, unknown>), ...patch };
+    expect(() => parseSpinEnvelope(envelope(spin))).toThrowError(
+      expect.objectContaining({ code: "MALFORMED_SPIN", message: `Spin envelope failed validation at ${field}` }),
+    );
+  });
+
+  it("rejects a non-envelope, a failure envelope, and a missing data block", () => {
+    for (const [payload, field] of [
+      [null, "(root)"],
+      ["nope", "(root)"],
+      [{ success: false, error: { code: "X", message: "y" } }, "success"],
+      [{ success: true }, "data"],
+    ] as const) {
+      expect(() => parseSpinEnvelope(payload)).toThrowError(
+        expect.objectContaining({ message: `Spin envelope failed validation at ${field}` }),
+      );
+    }
+  });
+
+  it("never echoes the offending VALUE into the error message (untrusted payload hygiene)", () => {
+    const spin = validSpin();
+    spin.win_amount = "999999.99999-leaked-secret";
+    try {
+      parseSpinEnvelope(envelope(spin));
+      throw new Error("expected a rejection");
+    } catch (err) {
+      expect((err as ApiError).message).toBe("Spin envelope failed validation at data.win_amount");
+      expect((err as ApiError).message).not.toContain("leaked-secret");
+    }
   });
 });

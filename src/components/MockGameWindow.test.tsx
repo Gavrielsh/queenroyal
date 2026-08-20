@@ -2,8 +2,20 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { MockGameWindow } from "@/components/MockGameWindow";
+import { __resetSpinAttempts, peekSpinAttempt } from "@/lib/spinIntent";
 import { disarmReconcile, getReconcileState } from "@/lib/walletReconcile";
 import { renderWithClient } from "@/test/renderWithClient";
+
+/**
+ * Component-level coverage for the SERVER-AUTHORITATIVE spin loop.
+ *
+ * The contract under test, in one line: the only symbols the player ever sees settled are the
+ * ones the ledger recorded. Every failure path therefore asserts BOTH the copy and the reels —
+ * a window that renders a fabricated outcome after a failed wager is the exact bug this
+ * component exists to make impossible.
+ */
+
+const GAME_ID = "classic-3reel";
 
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -22,38 +34,113 @@ function walletEnvelope(gc: string): unknown {
   };
 }
 
+interface SpinOverrides {
+  reels?: string[];
+  line?: string;
+  winSymbol?: string | null;
+  winAmount?: string;
+  multiplier?: string;
+  status?: string;
+}
+
+/** Mirrors apps/financial-gateway/src/routes/spin.ts → `okBody(EngineSpinResult)`. */
+function spinEnvelope(over: SpinOverrides = {}): unknown {
+  const line = over.line ?? "THREE_OF_A_KIND";
+  return {
+    success: true,
+    data: {
+      operator_transaction_id: "spin:attempt-1",
+      player_id: "pl_123",
+      bet_ledger_transaction_id: "ltx_bet_1",
+      win_ledger_transaction_id: line === "NONE" ? undefined : "ltx_win_1",
+      family: "GC",
+      bet_amount: "1.0000",
+      win_amount: over.winAmount ?? (line === "NONE" ? "0" : "400.0000"),
+      outcome: {
+        game_id: GAME_ID,
+        paytable_version: "1.0.0",
+        reels: over.reels ?? ["CROWN", "CROWN", "CROWN"],
+        line,
+        win_symbol: over.winSymbol === undefined ? (line === "NONE" ? undefined : "CROWN") : over.winSymbol,
+        multiplier: over.multiplier ?? (line === "NONE" ? "0" : "400"),
+      },
+      post_balances: { gc: "1399.0000", sc_unplayed: "12.5", sc_redeemable: "0" },
+      status: over.status ?? "PROCESSED",
+    },
+  };
+}
+
+function errorResponse(code: string, message: string, status: number): Response {
+  return jsonResponse({ success: false, error: { code, message } }, status);
+}
+
 function abortException(): Error {
   return new DOMException("The operation was aborted.", "AbortError");
 }
 
 const fetchMock = vi.fn<typeof fetch>();
 
+/** The symbols currently rendered on the reels, read straight from the DOM. */
+function renderedReels(): string[] {
+  return Array.from(document.querySelectorAll('[data-testid="reel"]')).map(
+    (el) => el.getAttribute("data-symbol") ?? "",
+  );
+}
+
+/** POST bodies captured for `/api/spin`, so idempotency can be asserted on the wire. */
+let spinBodies: Array<Record<string, unknown>> = [];
+
+/**
+ * Route `GET /wallet` reads and `POST /spin` wagers independently, each advancing through its
+ * own scripted list (the last entry repeats).
+ */
+function routeGateway(script: {
+  wallet: Array<() => Response | Promise<Response>>;
+  spin?: Array<() => Response | Promise<Response>>;
+}): void {
+  let walletCall = 0;
+  let spinCall = 0;
+  fetchMock.mockImplementation((_url, init) => {
+    const method = init?.method ?? "GET";
+    const path = String(_url);
+
+    if (method === "POST" && path.endsWith("/spin")) {
+      spinBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      const list = script.spin ?? [];
+      const respond = list[spinCall] ?? list[list.length - 1];
+      spinCall += 1;
+      if (!respond) throw new Error("no spin response scripted");
+      return Promise.resolve(respond());
+    }
+
+    if (method === "GET" && path.endsWith("/wallet")) {
+      const respond = script.wallet[walletCall] ?? script.wallet[script.wallet.length - 1];
+      walletCall += 1;
+      if (!respond) throw new Error("no wallet response scripted");
+      return Promise.resolve(respond());
+    }
+
+    throw new Error(`unrouted request: ${method} ${path}`);
+  });
+}
+
 beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock);
+  spinBodies = [];
+  __resetSpinAttempts();
 });
 
 afterEach(() => {
-  disarmReconcile(); // the controller is module-level state — never leak an armed cell
+  disarmReconcile(); // module-level controller — never leak an armed cell between tests
+  __resetSpinAttempts(); // module-level token map — never leak an idempotency key
   vi.unstubAllGlobals();
   fetchMock.mockReset();
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
-/** Route successive GET /wallet reads to the given responses, in order. */
-function routeWalletReads(...responses: Array<() => Response | Promise<Response>>) {
-  let call = 0;
-  fetchMock.mockImplementation((_url, init) => {
-    if ((init?.method ?? "GET") !== "GET") throw new Error("unexpected non-GET in this test");
-    const respond = responses[call] ?? responses[responses.length - 1];
-    call += 1;
-    if (!respond) throw new Error("no wallet response routed");
-    return Promise.resolve(respond());
-  });
-}
-
 /**
- * Settle the hook's auto-hydration under FAKE timers: React Query batches observer
+ * Settle the wallet hook's auto-hydration under FAKE timers: React Query batches observer
  * notifications through a `setTimeout(0)` macrotask, so the notification timer must be
  * advanced explicitly — a bare microtask flush leaves the UI stuck on "syncing".
  */
@@ -64,133 +151,235 @@ async function mountSynced(): Promise<void> {
   expect(screen.getByText("ledger-synced")).toBeInTheDocument();
 }
 
-describe("MockGameWindow — spin flow (invalidate-after-action)", () => {
-  it("spin invalidates the wallet, re-reads the ledger, and renders the fresh balance", async () => {
+/** Click SPIN and let the request, the settle, and the re-read all flush. */
+async function clickSpinAndSettle(): Promise<void> {
+  fireEvent.click(screen.getByRole("button", { name: /SPIN/ }));
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+  });
+}
+
+describe("MockGameWindow — the settled round", () => {
+  it("renders the ENGINE's reels and the verbatim win amount, then re-reads the ledger", async () => {
     vi.useFakeTimers();
     const info = vi.spyOn(console, "info").mockImplementation(() => {});
-    routeWalletReads(
-      () => jsonResponse(walletEnvelope("1000.0000")),
-      () => jsonResponse(walletEnvelope("900.0000")),
-    );
+    routeGateway({
+      wallet: [() => jsonResponse(walletEnvelope("1000.0000")), () => jsonResponse(walletEnvelope("1399.0000"))],
+      spin: [() => jsonResponse(spinEnvelope())],
+    });
 
     renderWithClient(<MockGameWindow />);
     await mountSynced();
     expect(screen.getByText("1,000")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /SPIN/ }));
-    expect(screen.getByRole("button", { name: /SPINNING…/ })).toBeDisabled();
+    await clickSpinAndSettle();
 
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(900); // the settle window before the re-read
-      await vi.advanceTimersByTimeAsync(0); // React Query's batched notification tick
-    });
+    // The symbols on screen are the engine's, not a local draw.
+    expect(renderedReels()).toEqual(["CROWN", "CROWN", "CROWN"]);
+    // The win figure is the engine's decimal string, interpolated verbatim (no re-formatting).
+    expect(screen.getByRole("alert")).toHaveTextContent("you won 400.0000 GC");
+    // The balance came from the RE-READ, never from the spin response's post_balances.
+    expect(screen.getByText("1,399")).toBeInTheDocument();
 
-    // The shared cache entry was re-read once, and the ledger's new answer is rendered.
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(screen.getByText("900")).toBeInTheDocument();
-    expect(screen.queryByText("1,000")).not.toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent("Wallet mirror synced with the ledger.");
-    expect(screen.getByRole("button", { name: /SPIN \(settles provider-side\)/ })).toBeEnabled();
-
-    // Success notices are transient: the confirmation dismisses itself.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(4_000);
-    });
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-
-    // Telemetry: exactly one wallet.invalidated, attributed to the spin.
+    // Exactly one invalidation, attributed to the spin.
     const invalidations = info.mock.calls.filter(
       (call) => (call[1] as Record<string, unknown> | undefined)?.evt === "wallet.invalidated",
     );
     expect(invalidations).toHaveLength(1);
     expect(invalidations[0]?.[1]).toMatchObject({ evt: "wallet.invalidated", trigger: "spin" });
+  });
 
-    // The ledger answered NEW strings on poll #1 → the reconciler converged and stood down.
+  it("renders a losing line without inventing a payout", async () => {
+    vi.useFakeTimers();
+    routeGateway({
+      wallet: [() => jsonResponse(walletEnvelope("1000.0000")), () => jsonResponse(walletEnvelope("999.0000"))],
+      spin: [() => jsonResponse(spinEnvelope({ reels: ["CHERRY", "LEMON", "BELL"], line: "NONE" }))],
+    });
+
+    renderWithClient(<MockGameWindow />);
+    await mountSynced();
+    await clickSpinAndSettle();
+
+    expect(renderedReels()).toEqual(["CHERRY", "LEMON", "BELL"]);
+    expect(screen.getByRole("alert")).toHaveTextContent("No win this round. 1.0000 GC staked.");
+    expect(screen.getByText("999")).toBeInTheDocument();
+  });
+
+  it("does NOT arm the reconciler — a spin settles synchronously at the ledger", async () => {
+    vi.useFakeTimers();
+    // Every wallet read returns the SAME snapshot. Under the purchase flow's
+    // reconcile-until-changed this would poll the whole ladder; a spin must stand still.
+    routeGateway({
+      wallet: [() => jsonResponse(walletEnvelope("1000.0000"))],
+      spin: [() => jsonResponse(spinEnvelope())],
+    });
+
+    renderWithClient(<MockGameWindow />);
+    await mountSynced();
+    await clickSpinAndSettle();
+
     expect(getReconcileState().phase).toBe("idle");
+    const readsAfterSpin = fetchMock.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(fetchMock.mock.calls.length).toBe(readsAfterSpin); // no polling ladder
   });
 
-  it("a spin over an UNCHANGED ledger keeps reconciling on the ladder", async () => {
+  it("surfaces a GHOST_RECOVERED replay honestly instead of passing it off as a fresh round", async () => {
     vi.useFakeTimers();
-    routeWalletReads(() => jsonResponse(walletEnvelope("1000.0000"))); // every read identical
+    routeGateway({
+      wallet: [() => jsonResponse(walletEnvelope("1000.0000")), () => jsonResponse(walletEnvelope("1399.0000"))],
+      spin: [() => jsonResponse(spinEnvelope({ status: "GHOST_RECOVERED" }))],
+    });
+
+    renderWithClient(<MockGameWindow />);
+    await mountSynced();
+    await clickSpinAndSettle();
+
+    expect(renderedReels()).toEqual(["CROWN", "CROWN", "CROWN"]);
+    expect(screen.getByRole("alert")).toHaveTextContent("you were not charged twice");
+    expect(screen.getByRole("button", { name: /SPIN ·/ })).toBeEnabled();
+  });
+});
+
+describe("MockGameWindow — edge cases", () => {
+  it("INSUFFICIENT_FUNDS: warns, leaves the reels untouched, and re-enables the button", async () => {
+    vi.useFakeTimers();
+    routeGateway({
+      wallet: [() => jsonResponse(walletEnvelope("0.5000"))],
+      spin: [() => errorResponse("INSUFFICIENT_FUNDS", "insufficient funds", 400)],
+    });
+
+    renderWithClient(<MockGameWindow />);
+    await mountSynced();
+    const before = renderedReels();
+
+    await clickSpinAndSettle();
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Not enough GC for a 1.0000 stake");
+    expect(screen.getByRole("alert")).toHaveTextContent("Nothing was charged.");
+    // No fabricated outcome survived the failure.
+    expect(renderedReels()).toEqual(before);
+    // A declined wager wrote nothing, so the spent anchor is rotated away.
+    expect(peekSpinAttempt(GAME_ID)).toBeNull();
+    expect(screen.getByRole("button", { name: /SPIN ·/ })).toBeEnabled();
+  });
+
+  it("503: shows the outage copy, DISABLES spin for the cooldown, then recovers", async () => {
+    vi.useFakeTimers();
+    routeGateway({
+      wallet: [() => jsonResponse(walletEnvelope("1000.0000"))],
+      spin: [() => errorResponse("ENGINE_UNAVAILABLE", "the ledger is temporarily unavailable", 503)],
+    });
+
+    renderWithClient(<MockGameWindow />);
+    await mountSynced();
+    const before = renderedReels();
+
+    await clickSpinAndSettle();
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Service temporarily unavailable");
+    expect(renderedReels()).toEqual(before);
+    // The token is RETAINED: the round's fate is unknown, so a retry must ghost-recover it.
+    expect(peekSpinAttempt(GAME_ID)).not.toBeNull();
+
+    const button = screen.getByRole("button", { name: /UNAVAILABLE/ });
+    expect(button).toBeDisabled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(screen.getByRole("button", { name: /SPIN ·/ })).toBeEnabled();
+  });
+
+  it("a network timeout is treated exactly like a 503 (the round's fate is unknown)", async () => {
+    vi.useFakeTimers();
+    routeGateway({
+      wallet: [() => jsonResponse(walletEnvelope("1000.0000"))],
+      spin: [() => Promise.reject(new TypeError("Failed to fetch"))],
+    });
+
+    renderWithClient(<MockGameWindow />);
+    await mountSynced();
+    await clickSpinAndSettle();
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Service temporarily unavailable");
+    expect(peekSpinAttempt(GAME_ID)).not.toBeNull(); // retained for the ghost-recovering retry
+    expect(screen.getByRole("button", { name: /UNAVAILABLE/ })).toBeDisabled();
+  });
+
+  it("409: reports the round as still settling, without a cooldown", async () => {
+    vi.useFakeTimers();
+    routeGateway({
+      wallet: [() => jsonResponse(walletEnvelope("1000.0000"))],
+      spin: [() => errorResponse("TRANSACTION_PENDING", "transaction already in flight", 409)],
+    });
+
+    renderWithClient(<MockGameWindow />);
+    await mountSynced();
+    await clickSpinAndSettle();
+
+    expect(screen.getByRole("alert")).toHaveTextContent("still settling");
+    expect(peekSpinAttempt(GAME_ID)).not.toBeNull(); // same attempt — never a new wager
+    // A 409 is not an outage: the affordance stays live so the player can retry the SAME round.
+    expect(screen.getByRole("button", { name: /SPIN ·/ })).toBeEnabled();
+  });
+
+  it("401: asks the player to log in and keeps the token for the post-login retry", async () => {
+    vi.useFakeTimers();
+    routeGateway({
+      wallet: [() => jsonResponse(walletEnvelope("1000.0000"))],
+      spin: [() => errorResponse("UNAUTHORIZED", "Authentication required", 401)],
+    });
+
+    renderWithClient(<MockGameWindow />);
+    await mountSynced();
+    await clickSpinAndSettle();
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Log in to spin.");
+    expect(peekSpinAttempt(GAME_ID)).not.toBeNull();
+  });
+
+  it("a double-click places exactly ONE wager", async () => {
+    vi.useFakeTimers();
+    routeGateway({
+      wallet: [() => jsonResponse(walletEnvelope("1000.0000")), () => jsonResponse(walletEnvelope("1399.0000"))],
+      spin: [() => jsonResponse(spinEnvelope())],
+    });
 
     renderWithClient(<MockGameWindow />);
     await mountSynced();
 
-    fireEvent.click(screen.getByRole("button", { name: /SPIN/ }));
+    const button = screen.getByRole("button", { name: /SPIN/ });
+    // Both clicks dispatched inside the same tick, before any re-render can disable the button.
+    fireEvent.click(button);
+    fireEvent.click(button);
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(900);
+      await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(0);
     });
 
-    // Poll #1 saw the same snapshot the spin started from → still converging.
-    expect(getReconcileState()).toEqual({ phase: "reconciling", trigger: "spin" });
-    const afterSpinReads = fetchMock.mock.calls.length;
-
-    // The ladder's first delay elapses → one more poll fires through React Query.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1_000);
-      await vi.advanceTimersByTimeAsync(0);
-    });
-    expect(fetchMock.mock.calls.length).toBe(afterSpinReads + 1);
-    expect(getReconcileState().phase).toBe("reconciling");
+    expect(spinBodies).toHaveLength(1);
   });
 
-  it("a failed post-spin re-read toasts the stale warning (and keeps the old balance visible)", async () => {
+  it("sends only a stake, a currency, a game and an idempotency key — never an outcome", async () => {
     vi.useFakeTimers();
-    routeWalletReads(
-      () => jsonResponse(walletEnvelope("1000.0000")),
-      () => jsonResponse({ success: false, error: { code: "ENGINE_UNAVAILABLE", message: "down" } }, 503),
-    );
+    routeGateway({
+      wallet: [() => jsonResponse(walletEnvelope("1000.0000")), () => jsonResponse(walletEnvelope("1399.0000"))],
+      spin: [() => jsonResponse(spinEnvelope())],
+    });
 
     renderWithClient(<MockGameWindow />);
     await mountSynced();
+    await clickSpinAndSettle();
 
-    fireEvent.click(screen.getByRole("button", { name: /SPIN/ }));
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(900);
-      await vi.advanceTimersByTimeAsync(0);
-    });
-
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "Could not reach the cashier — balances may be stale.",
-    );
-    // Stale-but-labeled values stay rendered; the STALE chip badges still flag them…
-    expect(screen.getByText("1,000")).toBeInTheDocument();
-    expect(screen.getAllByText("STALE").length).toBeGreaterThan(0);
-    // …but the BANNER shows the pending credit (precedence: reconciling outranks stale).
-    expect(screen.getByText("balance update pending…")).toBeInTheDocument();
-    expect(screen.queryByText("stale — last sync failed")).not.toBeInTheDocument();
-
-    // The spin armed BEFORE the failed re-read: the reconciler is the recovery path.
-    expect(getReconcileState()).toEqual({ phase: "reconciling", trigger: "spin" });
-
-    // Error notices PERSIST — a failed money action must never disappear on its own…
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(60_000);
-    });
-    expect(screen.getByRole("alert")).toHaveTextContent("Could not reach the cashier");
-    // …until the player explicitly dismisses it.
-    fireEvent.click(screen.getByRole("button", { name: "Dismiss notification" }));
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-  });
-
-  it("a 401 on the post-spin re-read asks the player to log in", async () => {
-    vi.useFakeTimers();
-    routeWalletReads(
-      () => jsonResponse(walletEnvelope("1000.0000")),
-      () => jsonResponse({ success: false, error: { code: "UNAUTHORIZED", message: "expired" } }, 401),
-    );
-
-    renderWithClient(<MockGameWindow />);
-    await mountSynced();
-
-    fireEvent.click(screen.getByRole("button", { name: /SPIN/ }));
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(900);
-      await vi.advanceTimersByTimeAsync(0);
-    });
-
-    expect(screen.getByRole("alert")).toHaveTextContent("Log in to see your wallet.");
+    const body = spinBodies[0];
+    expect(Object.keys(body ?? {}).sort()).toEqual(["betAmount", "currency", "gameId", "idempotencyKey"]);
+    expect(body).toMatchObject({ betAmount: "1.0000", currency: "GC", gameId: GAME_ID });
+    // The gateway's schema requires 8–200 chars for the anchor.
+    expect(String(body?.idempotencyKey).length).toBeGreaterThanOrEqual(8);
   });
 });
 
@@ -213,7 +402,7 @@ describe("MockGameWindow — unmount aborts the in-flight read", () => {
     unmount();
     await act(async () => {}); // let the cancellation settle
 
-    // The signal threaded through queryFn → fetch (M1-T3) genuinely cancelled the request…
+    // The signal threaded through queryFn → fetch genuinely cancelled the request…
     expect(capturedSignal?.aborted).toBe(true);
     // …and a cancellation is not an error: no wallet.query.error reached telemetry.
     const errorEmissions = warn.mock.calls.filter(

@@ -7,6 +7,7 @@
  */
 
 import { type AttemptToken, peekAttemptToken } from "@/lib/purchaseIntent";
+import { type SpinAttemptToken } from "@/lib/spinIntent";
 
 const GATEWAY_BASE_URL = (
   process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:4000/api"
@@ -242,6 +243,33 @@ export interface WalletBalancesDto {
  * Exported for reuse: the M4 realtime path must pass every push through this same gate
  * before `setQueryData` ("realtime is a faster source, never a looser gate").
  */
+/**
+ * Validate the engine's `{ gc, sc_unplayed, sc_redeemable }` balance block and rename it to
+ * camelCase. Shared by every envelope that carries balances (the wallet read and the spin
+ * settlement) so there is exactly ONE definition of "a balance block we accept" — a second,
+ * looser copy is how a money byte eventually slips past validation.
+ *
+ * `malformed` and `path` are injected so each caller keeps its own error code and field
+ * breadcrumbs (`data.balances.gc` vs `data.post_balances.gc`).
+ */
+function parseBalancesRecord(
+  balances: unknown,
+  malformed: (field: string) => ApiError,
+  path: string,
+): WalletBalancesDto {
+  if (typeof balances !== "object" || balances === null) throw malformed(path);
+
+  const record = balances as Record<string, unknown>;
+  const gc = record.gc;
+  if (!isMoneyString(gc)) throw malformed(`${path}.gc`);
+  const scUnplayed = record.sc_unplayed;
+  if (!isMoneyString(scUnplayed)) throw malformed(`${path}.sc_unplayed`);
+  const scRedeemable = record.sc_redeemable;
+  if (!isMoneyString(scRedeemable)) throw malformed(`${path}.sc_redeemable`);
+
+  return { gc, scUnplayed, scRedeemable };
+}
+
 export function parseWalletEnvelope(payload: unknown): WalletBalancesDto {
   const malformed = (field: string): ApiError =>
     new ApiError(0, "MALFORMED_WALLET", `Wallet envelope failed validation at ${field}`);
@@ -252,18 +280,8 @@ export function parseWalletEnvelope(payload: unknown): WalletBalancesDto {
 
   const data = envelope.data;
   if (typeof data !== "object" || data === null) throw malformed("data");
-  const balances = (data as Record<string, unknown>).balances;
-  if (typeof balances !== "object" || balances === null) throw malformed("data.balances");
 
-  const record = balances as Record<string, unknown>;
-  const gc = record.gc;
-  if (!isMoneyString(gc)) throw malformed("data.balances.gc");
-  const scUnplayed = record.sc_unplayed;
-  if (!isMoneyString(scUnplayed)) throw malformed("data.balances.sc_unplayed");
-  const scRedeemable = record.sc_redeemable;
-  if (!isMoneyString(scRedeemable)) throw malformed("data.balances.sc_redeemable");
-
-  return { gc, scUnplayed, scRedeemable };
+  return parseBalancesRecord((data as Record<string, unknown>).balances, malformed, "data.balances");
 }
 
 /**
@@ -363,4 +381,215 @@ export async function confirmMockStripeDeposit(intent: PurchaseIntentDto): Promi
     { paymentIntentId: intent.paymentIntentId },
   );
   return { status: "settled" };
+}
+
+// ── Game (server-authoritative spin) ─────────────────────────────────────────
+
+/**
+ * The wagering families the player may address. The engine routes the SC sub-buckets itself
+ * (bet: SC_UNPLAYED → SC_REDEEMABLE; win: SC_REDEEMABLE only), so the sub-buckets are
+ * deliberately NOT nameable here.
+ */
+export type SpinCurrency = "GC" | "SC";
+
+/** Line classifications the engine's evaluator can return (internal/game/spin.go). */
+export const SPIN_LINES = ["NONE", "TWO_OF_A_KIND", "THREE_OF_A_KIND"] as const;
+export type SpinLine = (typeof SPIN_LINES)[number];
+
+/**
+ * A stake multiplier as an unsigned decimal string. Deliberately NOT validated with
+ * `MONEY_STRING_REGEX`: a multiplier is not money and is not bound by the ledger's
+ * `NUMERIC(18,4)` scale, so capping it at 4 dp would reject a legitimate future paytable.
+ */
+const MULTIPLIER_STRING_REGEX = /^\d+(\.\d+)?$/;
+
+/** Upper bound on reels we will accept from the wire — a sanity cap, not a game rule. */
+const MAX_REELS = 10;
+
+/**
+ * The engine's authoritative outcome record for one round. PRESENTATION DATA ONLY: the payout
+ * was already derived, bounded, and settled server-side before this reached the browser.
+ * Nothing here is used to compute a balance.
+ */
+export interface SpinOutcomeDto {
+  gameId: string;
+  paytableVersion: string;
+  /** Symbol ids as drawn, left to right (e.g. `["CHERRY", "CHERRY", "BELL"]`). */
+  reels: readonly string[];
+  line: SpinLine;
+  /** The paying symbol; absent when `line` is `NONE`. */
+  winSymbol: string | null;
+  /** Stake multiple this outcome paid, as a decimal string. `"0"` for a loss. */
+  multiplier: string;
+}
+
+/**
+ * A settled round, exactly as the ledger recorded it.
+ *
+ * `status` mirrors the engine's idempotency verdict:
+ *   - `PROCESSED`        — a fresh draw, settled now.
+ *   - `CACHED`           — the Redis barrier replayed a response for this same key.
+ *   - `GHOST_RECOVERED`  — the DB had already committed this key (the response to the first
+ *                          attempt was lost); the ORIGINAL outcome was reconstructed. Funds
+ *                          were NOT deducted a second time.
+ * All three are successes and all three render identically — a recovered round is a real
+ * round.
+ */
+export interface SpinResultDto {
+  operatorTransactionId: string;
+  betLedgerTransactionId: string;
+  winLedgerTransactionId: string | null;
+  family: SpinCurrency;
+  /** Verbatim engine decimal strings — rendered, never arithmetic. */
+  betAmount: string;
+  winAmount: string;
+  outcome: SpinOutcomeDto;
+  /**
+   * The ledger's post-state for this round.
+   *
+   * ⚠️ G1 — DO NOT WRITE THIS INTO THE WALLET CACHE. The wallet has exactly one writer
+   * (`walletQueryFn`); seeding the cache from a mutation response would make this a second
+   * writer that races in-flight reads and drifts from the ledger the moment anything else
+   * settles. It is carried for diagnostics and assertions only. Balance updates happen by
+   * invalidating the cache and re-reading — never by copying a number sideways.
+   */
+  postBalances: WalletBalancesDto;
+  status: "PROCESSED" | "CACHED" | "GHOST_RECOVERED";
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+/**
+ * Validate the `POST /api/spin` envelope — `{ success: true, data: { …engine spin result } }`
+ * (apps/financial-gateway/src/routes/spin.ts → `okBody(outcome.data)`, whose payload is the
+ * engine's `EngineSpinResult`) — BEFORE any value can reach React state.
+ *
+ * A payload that fails shape or money-format validation becomes an `ApiError` with code
+ * "MALFORMED_SPIN". Same rule as the wallet gate: failure messages name the offending FIELD
+ * but never echo its value.
+ */
+export function parseSpinEnvelope(payload: unknown): SpinResultDto {
+  const malformed = (field: string): ApiError =>
+    new ApiError(0, "MALFORMED_SPIN", `Spin envelope failed validation at ${field}`);
+
+  if (typeof payload !== "object" || payload === null) throw malformed("(root)");
+  const envelope = payload as Record<string, unknown>;
+  if (envelope.success !== true) throw malformed("success");
+
+  const data = envelope.data;
+  if (typeof data !== "object" || data === null) throw malformed("data");
+  const record = data as Record<string, unknown>;
+
+  const operatorTransactionId = record.operator_transaction_id;
+  if (!isNonEmptyString(operatorTransactionId)) throw malformed("data.operator_transaction_id");
+
+  const betLedgerTransactionId = record.bet_ledger_transaction_id;
+  if (!isNonEmptyString(betLedgerTransactionId)) throw malformed("data.bet_ledger_transaction_id");
+
+  // Present only when the round paid — a loss books no WIN leg.
+  const rawWinLedgerId = record.win_ledger_transaction_id;
+  if (rawWinLedgerId !== undefined && rawWinLedgerId !== null && !isNonEmptyString(rawWinLedgerId)) {
+    throw malformed("data.win_ledger_transaction_id");
+  }
+
+  const family = record.family;
+  if (family !== "GC" && family !== "SC") throw malformed("data.family");
+
+  const betAmount = record.bet_amount;
+  if (!isMoneyString(betAmount)) throw malformed("data.bet_amount");
+  const winAmount = record.win_amount;
+  if (!isMoneyString(winAmount)) throw malformed("data.win_amount");
+
+  const status = record.status;
+  if (status !== "PROCESSED" && status !== "CACHED" && status !== "GHOST_RECOVERED") {
+    throw malformed("data.status");
+  }
+
+  const postBalances = parseBalancesRecord(record.post_balances, malformed, "data.post_balances");
+
+  const outcomeRaw = record.outcome;
+  if (typeof outcomeRaw !== "object" || outcomeRaw === null) throw malformed("data.outcome");
+  const outcomeRecord = outcomeRaw as Record<string, unknown>;
+
+  const gameId = outcomeRecord.game_id;
+  if (!isNonEmptyString(gameId)) throw malformed("data.outcome.game_id");
+  const paytableVersion = outcomeRecord.paytable_version;
+  if (!isNonEmptyString(paytableVersion)) throw malformed("data.outcome.paytable_version");
+
+  const reelsRaw = outcomeRecord.reels;
+  if (!Array.isArray(reelsRaw) || reelsRaw.length === 0 || reelsRaw.length > MAX_REELS) {
+    throw malformed("data.outcome.reels");
+  }
+  const reels: string[] = [];
+  for (const [index, symbol] of reelsRaw.entries()) {
+    if (!isNonEmptyString(symbol)) throw malformed(`data.outcome.reels[${index}]`);
+    reels.push(symbol);
+  }
+
+  const line = outcomeRecord.line;
+  if (!SPIN_LINES.some((candidate) => candidate === line)) throw malformed("data.outcome.line");
+
+  const rawWinSymbol = outcomeRecord.win_symbol;
+  if (rawWinSymbol !== undefined && rawWinSymbol !== null && !isNonEmptyString(rawWinSymbol)) {
+    throw malformed("data.outcome.win_symbol");
+  }
+
+  const multiplier = outcomeRecord.multiplier;
+  if (typeof multiplier !== "string" || !MULTIPLIER_STRING_REGEX.test(multiplier)) {
+    throw malformed("data.outcome.multiplier");
+  }
+
+  return {
+    operatorTransactionId,
+    betLedgerTransactionId,
+    winLedgerTransactionId: isNonEmptyString(rawWinLedgerId) ? rawWinLedgerId : null,
+    family,
+    betAmount,
+    winAmount,
+    outcome: {
+      gameId,
+      paytableVersion,
+      reels,
+      line: line as SpinLine,
+      winSymbol: isNonEmptyString(rawWinSymbol) ? rawWinSymbol : null,
+      multiplier,
+    },
+    postBalances,
+    status,
+  };
+}
+
+/** What the browser is allowed to say about a spin. Note what is absent. */
+export interface SpinRequestDto {
+  gameId: string;
+  currency: SpinCurrency;
+  /** The stake — the ONLY monetary value the player controls. A validated decimal string. */
+  betAmount: string;
+  /** The RETAINED attempt token (the gateway's idempotency anchor for `spin:<token>`). */
+  attemptToken: SpinAttemptToken;
+}
+
+/**
+ * Place a server-authoritative spin.
+ *
+ * SECURITY — read the absent fields as carefully as the present ones. There is no
+ * `winAmount`, no `multiplier`, no `outcome`, and no `reels` in the request. The player says
+ * only how much to stake and which game; the ENGINE draws the reels from crypto/rand and
+ * derives the payout from its own version-pinned paytable. The response is the first time an
+ * outcome exists anywhere, and it arrives already settled in the ledger.
+ *
+ * The attempt token is compile-enforced as a branded `SpinAttemptToken`, so only a value that
+ * went through the `spinIntent` retain/rotate lifecycle can anchor a wager — a raw UUID is a
+ * type error.
+ */
+export async function submitSpin(request: SpinRequestDto): Promise<SpinResultDto> {
+  const payload = await apiClient.post<unknown>("/spin", {
+    idempotencyKey: request.attemptToken,
+    currency: request.currency,
+    betAmount: request.betAmount,
+    gameId: request.gameId,
+  });
+  return parseSpinEnvelope(payload);
 }

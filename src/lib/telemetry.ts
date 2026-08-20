@@ -29,7 +29,12 @@ export type TelemetryEvent =
   | "purchase.token.reused"
   | "purchase.token.cleared"
   | "purchase.attempt.blocked"
-  | "purchase.tab.broadcast";
+  | "purchase.tab.broadcast"
+  | "spin.token.minted"
+  | "spin.token.reused"
+  | "spin.token.cleared"
+  | "spin.settled"
+  | "spin.failed";
 
 /** Structured, JSON-serializable context for an event. No nested objects, no PII, no secrets. */
 export type TelemetryFields = Record<string, string | number | boolean>;
@@ -48,6 +53,9 @@ export interface TelemetryRecord {
 const ALWAYS_EMIT: ReadonlySet<TelemetryEvent> = new Set<TelemetryEvent>([
   "wallet.query.error",
   "purchase.attempt.blocked",
+  // A failed spin is a money-flow fault: it may mean a debit the player cannot see yet
+  // (the ghost-spin window), so it is observable in production, not dev-only.
+  "spin.failed",
 ]);
 
 /**

@@ -91,6 +91,39 @@ export function mockConfirmEnvelope(): unknown {
   });
 }
 
+/** Balances after a 1.0000 GC stake pays a 20x BELL line (bet debited, win credited). */
+export const POST_SPIN_BALANCES: WalletBalances = {
+  gc: "1019.0000",
+  sc_unplayed: "12.5000",
+  sc_redeemable: "0.0000",
+};
+
+/**
+ * `POST /api/spin` success envelope — routes/spin.ts `okBody(EngineSpinResult)`.
+ * Reel symbols are the engine's own ids from `internal/game/paytable.go`.
+ */
+export function spinEnvelope(status: "PROCESSED" | "GHOST_RECOVERED" = "PROCESSED"): unknown {
+  return okBody({
+    operator_transaction_id: "spin:e2e-attempt-1",
+    player_id: "pl_e2e_1",
+    bet_ledger_transaction_id: "ltx_bet_e2e_1",
+    win_ledger_transaction_id: "ltx_win_e2e_1",
+    family: "GC",
+    bet_amount: "1.0000",
+    win_amount: "20.0000",
+    outcome: {
+      game_id: "classic-3reel",
+      paytable_version: "1.0.0",
+      reels: ["BELL", "BELL", "BELL"],
+      line: "THREE_OF_A_KIND",
+      win_symbol: "BELL",
+      multiplier: "20",
+    },
+    post_balances: POST_SPIN_BALANCES,
+    status,
+  });
+}
+
 // ── Scenario wiring ──────────────────────────────────────────────────────────
 
 async function fulfillJson(route: Route, json: unknown, status = 200): Promise<void> {
@@ -107,13 +140,33 @@ export type WalletScenario =
   /** The request never resolves — holds the UI in its loading/skeleton state. */
   | "hanging"
   /** Resolves SEED_BALANCES until mock-confirm settles, then CREDITED_BALANCES. */
-  | "credit-after-purchase";
+  | "credit-after-purchase"
+  /** Resolves SEED_BALANCES until a spin settles, then POST_SPIN_BALANCES. */
+  | "settle-after-spin";
 
 export type PurchaseScenario = "settled" | "declined" | "confirm-hanging";
+
+/**
+ * How `POST /api/spin` behaves. Each mirrors a real gateway/engine outcome:
+ *   settled            → 200, a paying round (routes/spin.ts)
+ *   ghost-recovered    → 200 with status GHOST_RECOVERED (engine 23505 replay)
+ *   insufficient-funds → 400 INSUFFICIENT_FUNDS (pkg/errors → httpStatusFor)
+ *   unavailable        → 503 ENGINE_UNAVAILABLE (fail-closed ledger outage)
+ *   in-flight          → 409 TRANSACTION_PENDING (idempotency barrier)
+ *   hanging            → never resolves; holds the SPINNING… state
+ */
+export type SpinScenario =
+  | "settled"
+  | "ghost-recovered"
+  | "insufficient-funds"
+  | "unavailable"
+  | "in-flight"
+  | "hanging";
 
 export interface GatewayStubOptions {
   wallet: WalletScenario;
   purchase?: PurchaseScenario;
+  spin?: SpinScenario;
   login?: "ok" | "unavailable";
 }
 
@@ -149,6 +202,7 @@ export async function installGateway(
   });
 
   let credited = false;
+  let spun = false;
   await context.route(`${GATEWAY_ORIGIN}/api/wallet`, async (route) => {
     switch (opts.wallet) {
       case "hanging":
@@ -161,6 +215,9 @@ export async function installGateway(
         return;
       case "credit-after-purchase":
         await fulfillJson(route, walletEnvelope(credited ? CREDITED_BALANCES : SEED_BALANCES));
+        return;
+      case "settle-after-spin":
+        await fulfillJson(route, walletEnvelope(spun ? POST_SPIN_BALANCES : SEED_BALANCES));
         return;
       case "synced":
         await fulfillJson(route, walletEnvelope(SEED_BALANCES));
@@ -183,6 +240,33 @@ export async function installGateway(
       }
       credited = true;
       await fulfillJson(route, mockConfirmEnvelope());
+    });
+  }
+
+  if (opts.spin) {
+    const spin = opts.spin;
+    await context.route(`${GATEWAY_ORIGIN}/api/spin`, async (route) => {
+      switch (spin) {
+        case "hanging":
+          return; // deliberately unfulfilled — holds the SPINNING… state
+        case "insufficient-funds":
+          await fulfillJson(route, errBody("INSUFFICIENT_FUNDS", "insufficient funds"), 400);
+          return;
+        case "unavailable":
+          await fulfillJson(route, errBody("ENGINE_UNAVAILABLE", "the ledger is temporarily unavailable"), 503);
+          return;
+        case "in-flight":
+          await fulfillJson(route, errBody("TRANSACTION_PENDING", "transaction already in flight"), 409);
+          return;
+        case "ghost-recovered":
+          spun = true;
+          await fulfillJson(route, spinEnvelope("GHOST_RECOVERED"));
+          return;
+        case "settled":
+          spun = true;
+          await fulfillJson(route, spinEnvelope("PROCESSED"));
+          return;
+      }
     });
   }
 

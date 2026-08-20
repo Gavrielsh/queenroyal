@@ -1,3 +1,67 @@
+# ⛔ NON-NEGOTIABLE ARCHITECTURAL GUARDRAILS ⛔
+
+These four constraints govern **every** change in this repository — Gateway (`apps/financial-gateway`)
+and Frontend (`src/`) alike. They are not style preferences. A change that violates one of them is
+rejected regardless of how well it works. If a rule below ever disagrees with the True Engine's
+source, the engine wins — fix this file, never the engine's contract.
+
+## G1 — Zero-State Gateway
+The Gateway NEVER holds financial state.
+- **No balance columns in Prisma.** `gc_balance`, `sc_balance`, `deposits`, `withdrawals`, or any
+  monetary column is forbidden in `prisma/schema.prisma`. Permitted local state is identity, KYC,
+  VIP metadata, the store *catalog*, the `trueEnginePlayerId` mapping, and the append-only
+  **intent journal** (`EngineRequestLog`) — which records intents, never amounts-as-truth.
+- **All wallet operations proxy to the `True` Go engine.** A balance is only ever *read* from
+  `POST /api/v1/session` and only ever *mutated* by `/spin`, `/bet`, `/win`, `/rollback`,
+  `/store/purchase`, `/store/redeem`. No local ledger, no cache-as-truth, no shadow accounting.
+- The Frontend holds no balance state either: exactly one React Query cache entry
+  (`walletKeys.balances()`) mirrors the ledger. **Realtime and mutation responses are invalidation
+  signals, never second writers** — nothing but `walletQueryFn` may write money into that cache.
+
+## G2 — Numeric Precision
+NEVER use JavaScript floats for money.
+- **Go:** `github.com/shopspring/decimal`; **Postgres:** `NUMERIC(18,4)`.
+- **Node Gateway & React Frontend:** money is a **validated decimal string**, end to end.
+  Validate shape against `^\d+(\.\d{1,4})?$` (`MONEY_REGEX` in `apps/financial-gateway/src/lib/money.ts`;
+  `MONEY_STRING_REGEX` in `src/lib/apiClient.ts`) and forward it **verbatim**.
+- **Forbidden on any monetary value:** `Number()`, `parseFloat`, `parseInt`, `z.number()`, `+x`,
+  arithmetic operators, `toFixed`, `Intl.NumberFormat` on a raw value before validation.
+  Integer "cents" are also wrong — the engine is decimal, not minor-unit. (The single exception is
+  the PSP boundary: Stripe charges integer USD cents, which never crosses to the ledger.)
+- Comparing balances is **string inequality only** (`balancesDiffer`), never numeric comparison.
+
+## G3 — Idempotency is Mandatory
+Every mutating request from the client MUST carry a deterministic idempotency key.
+- The client mints a per-attempt key and **retains it across retries of that attempt**; the Gateway
+  derives the engine anchor from it — `spin:<uuid>` for spins, `deposit:<uuid>` for purchases.
+- Retry semantics are load-bearing: a retryable fault (timeout / 5xx / 409) **must reuse the same
+  key**, so the engine ghost-recovers the original result instead of drawing a new one. Only a
+  terminal outcome (settled, or a business decline that wrote nothing) rotates the key.
+- Server side, the existing layers are mandatory and already built — use them, do not reinvent:
+  the Redis barrier (`SET … NX EX 10`), the Postgres outbox/journal (`UNIQUE` +
+  `ON CONFLICT DO NOTHING`, `SERIALIZABLE` + `FOR UPDATE` transitions, `FOR UPDATE SKIP LOCKED`
+  claims), and the engine's `23505` ghost-spin recovery.
+- Attempt anchors are **player-scoped**: an anchor owned by another account is refused (`409`),
+  never silently reused.
+
+## G4 — Fail-Closed Principle
+If the engine returns `503`, `5xx`, or the call times out, the Gateway and Frontend fail *gracefully
+and honestly*.
+- **Never auto-correct. Never speculatively deduct or credit a local balance.** No optimistic
+  updates on money, no client-side win math, no fabricated balances (not even in dev fixtures —
+  a fabricated balance is a financial mock and is forbidden outright).
+- A balance the engine cannot vouch for is **not served**: the Gateway returns `503`, and the UI
+  renders the last authoritative snapshot explicitly marked stale, or a placeholder — never a zero,
+  because a zero is a claim.
+- Security/financial dependencies (Redis rate limiting, replay nonces, refresh sessions,
+  jurisdiction checks) reject with `503`/`403` when unavailable. **No in-memory `Map`/`Set`
+  fallbacks.**
+- A retryable fault may mean the transaction *did* commit and the response was lost. Treat that
+  state as unknown-but-recoverable: retain the idempotency key, re-read the ledger, and let the
+  reconciler converge. Never assume it failed.
+
+---
+
 # Role and Context
 You are a Principal Backend Engineer building the **"Gateway & Cashier"** API service
 for a US Social Sweepstakes Casino using Next.js (App Router) + TypeScript. This

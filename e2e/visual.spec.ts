@@ -130,12 +130,14 @@ test("09 — store: purchase declined by the gateway", async ({ page, context },
 });
 
 test("10 — game: spin animation state", async ({ page, context }, testInfo) => {
-  const gateway = await installGateway(context, { wallet: "synced" });
+  // The spin stub never resolves, so the in-flight state is held open for the capture. The
+  // SPINNING… state now tracks a real wager on the wire, not a local 900ms animation.
+  const gateway = await installGateway(context, { wallet: "synced", spin: "hanging" });
 
   await page.goto("/casino");
   await expect(page.getByText("ledger-synced")).toHaveCount(2);
 
-  await page.getByRole("button", { name: /SPIN \(settles provider-side\)/ }).click();
+  await page.getByRole("button", { name: /SPIN ·/ }).click();
   await expect(page.getByRole("button", { name: "SPINNING…" })).toBeDisabled();
 
   await capture(page, testInfo, "10-game-spinning");
