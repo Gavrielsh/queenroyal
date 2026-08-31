@@ -45,14 +45,18 @@ Legend: `[ ]` open · `[x]` done · **⚖️** legal/compliance blocker for laun
 
 ### 0.3 CI and hygiene
 - [ ] `.github/workflows` for `True`: `go build`, `go vet`, `go test ./...`, `golangci-lint`
-- [ ] **RTP assertion as a build gate**: `TestDeclaredRTPMatchesModel` + the Monte-Carlo
-      convergence test must run on every PR. `ARCHITECTURE.md` already claims this is enforced
-      in CI — today nothing runs it.
+- [ ] **RTP assertion as a build gate**: `TestDeclaredRTPMatchesModel`, `TestRTPInRegulatoryBand`
+      and the Monte-Carlo `TestSpinConvergesToRTP` all exist in `True/internal/game` and pass —
+      what is missing is a workflow that RUNS them on every PR. The outstanding work is the CI
+      wiring, not the tests. (Corrected in M0-T5: this item previously said `ARCHITECTURE.md`
+      claims the gate is enforced in CI. No architecture doc makes that claim — verified across
+      both repos and their git history — so there was no false claim to retract, only this
+      one. Nothing should assert the gate exists until the workflow does.)
 - [ ] `.github/workflows` for `QueenRoyal`: `tsc --noEmit` + `vitest run` for both workspaces,
       `playwright test` on PR
 - [ ] Remove the committed 53 MB `engine.exe` from `True` and gitignore it
-- [ ] Fix stale docs: `.claude-instructions` documents `GET /session?player_id=…`; the router
-      serves `POST /session` with the id in the signed body
+- [x] Fix stale docs: `.claude-instructions` documented `GET /session?player_id=…`; the router
+      serves `POST /session` with the id in the signed body. Corrected in M0-T5.
 
 ---
 
