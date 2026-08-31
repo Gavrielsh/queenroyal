@@ -93,16 +93,26 @@ export default function HomePage() {
           </article>
         </div>
 
-        {/* Trust strip — honest engineering claims only. */}
-        <div className="mt-10 grid gap-4 rounded-card border border-edge bg-surface-1/60 p-6 text-center sm:grid-cols-3">
+        {/* Trust strip — honest engineering claims only. Every line here must name
+            something a reader could verify in the running product TODAY.
+
+            "Responsible play tools" was removed. No player-facing deposit, loss or
+            session limit, self-exclusion, cool-off or reality-check exists in any zone:
+            there is no route a player can call and no UI that reaches one. (The engine's
+            user_status enum carries a SUSPENDED value whose comment mentions
+            self-exclusion, but nothing ever sets it for that reason — a status value is
+            not a tool.) Responsible gaming is Phase 3 in ROADMAP.md.
+
+            Advertising player-protection tooling that does not exist is the most harmful
+            false claim this page could carry: a player at risk could choose the product
+            BECAUSE of it. Restore the line only when the tools ship and are reachable
+            from the UI — not when they are merely planned. */}
+        <div className="mt-10 grid gap-4 rounded-card border border-edge bg-surface-1/60 p-6 text-center sm:grid-cols-2">
           <p className="text-xs font-semibold uppercase tracking-wider text-ink-faint">
             Double-entry ledger accuracy
           </p>
           <p className="text-xs font-semibold uppercase tracking-wider text-ink-faint">
             Balances read live — never computed in your browser
-          </p>
-          <p className="text-xs font-semibold uppercase tracking-wider text-ink-faint">
-            Responsible play tools
           </p>
         </div>
       </section>
