@@ -1,0 +1,341 @@
+# Zone 2 + Zone 3 pipeline (M1.1-T8).
+#
+# The Go engine has its own workflow in the True repository; this one covers everything in
+# THIS repository: the Next.js app (Zone 3, `src/`) and the Fastify gateway (Zone 2,
+# `apps/financial-gateway/`). They are separate npm packages with separate lockfiles — not a
+# workspace — so every job installs the one it needs and nothing more.
+#
+# COUNT ASSERTIONS ARE THE POINT OF THE TEST JOBS. `vitest run` and `playwright test` both
+# exit 0 when they run FEWER tests than expected — a bad glob, a stray `.skip`, a renamed
+# directory, a config that quietly stops matching. The suite vanishes and CI reports green.
+# That is the same defect shape Milestone 0 kept finding and the Zone 1 skip-guard exists to
+# catch, so the counts below are asserted explicitly rather than trusted.
+name: App CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch makes the older run irrelevant; cancel it rather than
+# paying for two. `main` is exempt: those runs are the record of what landed.
+concurrency:
+  group: app-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  NODE_VERSION: "22"
+
+jobs:
+  typecheck:
+    name: Typecheck (Zone 3 + gateway)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/financial-gateway/package-lock.json
+
+      - name: Install (Zone 3)
+        run: npm ci
+      - name: Install (gateway)
+        working-directory: apps/financial-gateway
+        run: npm ci
+
+      # The gateway's Prisma client is generated code. Without this the gateway typecheck
+      # fails on missing types rather than on anything a developer wrote.
+      - name: Generate Prisma client
+        working-directory: apps/financial-gateway
+        run: npx prisma generate
+
+      - name: Typecheck Zone 3
+        run: npx tsc --noEmit
+
+      - name: Typecheck gateway
+        working-directory: apps/financial-gateway
+        run: npx tsc --noEmit
+
+  lint:
+    name: ESLint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # --max-warnings=0 is deliberate. The config currently reports zero warnings, and the
+      # only way it stays that way is if a warning fails the build the day it appears.
+      # A warning nobody has to clear is a finding that accumulates.
+      - name: ESLint
+        run: npx eslint . --max-warnings=0
+
+  unit:
+    name: Unit tests (vitest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/financial-gateway/package-lock.json
+
+      - name: Install (Zone 3)
+        run: npm ci
+      - name: Install (gateway)
+        working-directory: apps/financial-gateway
+        run: npm ci
+      - name: Generate Prisma client
+        working-directory: apps/financial-gateway
+        run: npx prisma generate
+
+      - name: Zone 3 suite
+        run: npx vitest run --reporter=json --outputFile=zone3.json --reporter=default
+
+      - name: Gateway suite
+        working-directory: apps/financial-gateway
+        run: npx vitest run --reporter=json --outputFile=gateway.json --reporter=default
+
+      # ── The assertion ────────────────────────────────────────────────────────────────
+      # Exact equality, not a floor. A floor catches a suite that disappears but not a suite
+      # that shrinks, and shrinking is the more likely accident. When a test is legitimately
+      # added or removed, this fails once and the number is updated in the same commit —
+      # which is the point: the change becomes visible in review instead of silent.
+      - name: Assert every test actually ran
+        if: always()
+        run: |
+          node -e '
+            const fs = require("fs");
+            const expected = {
+              "Zone 3 (src/)":  { file: "zone3.json",                        files: 18, tests: 274 },
+              "gateway":        { file: "apps/financial-gateway/gateway.json", files: 19, tests: 146 },
+            };
+            let failed = false;
+            for (const [name, want] of Object.entries(expected)) {
+              if (!fs.existsSync(want.file)) {
+                console.log(`::error::${name}: ${want.file} missing — the suite never ran.`);
+                failed = true;
+                continue;
+              }
+              const r = JSON.parse(fs.readFileSync(want.file, "utf8"));
+              const files = r.testResults.length;
+              console.log(
+                `${name}: ${files} file(s), ${r.numTotalTests} test(s) — ` +
+                `${r.numPassedTests} passed, ${r.numFailedTests} failed, ${r.numPendingTests} skipped`
+              );
+              if (files !== want.files) {
+                console.log(`::error::${name}: expected ${want.files} test files, ran ${files}.`);
+                failed = true;
+              }
+              if (r.numTotalTests !== want.tests) {
+                console.log(`::error::${name}: expected ${want.tests} tests, ran ${r.numTotalTests}.`);
+                failed = true;
+              }
+              if (r.numPassedTests !== want.tests) {
+                console.log(`::error::${name}: ${want.tests} tests expected to pass, ${r.numPassedTests} did.`);
+                failed = true;
+              }
+              if (r.numPendingTests !== 0) {
+                console.log(`::error::${name}: ${r.numPendingTests} test(s) skipped; none may be.`);
+                failed = true;
+              }
+            }
+            process.exit(failed ? 1 : 0);
+          '
+
+  e2e:
+    name: E2E (playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # --with-deps pulls the system libraries headless Chromium needs on a bare runner.
+      # Only chromium: playwright.config.ts defines desktop and mobile as viewport variants
+      # of one browser, not as separate engines.
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      # The gateway is stubbed at the network layer (e2e/fixtures/gateway-stubs.ts): no real
+      # gateway, engine, Redis or outbound network is contacted, and an unrouted call fails
+      # the test loudly. So this job needs the Next dev server and nothing else — which
+      # playwright.config.ts starts itself via its `webServer` block.
+      - name: Playwright
+        run: npx playwright test --reporter=json,list
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: playwright.json
+
+      - name: Assert every E2E test actually ran
+        if: always()
+        run: |
+          node -e '
+            const fs = require("fs");
+            const EXPECTED = 44; // 22 tests x 2 viewport projects (desktop, mobile)
+            if (!fs.existsSync("playwright.json")) {
+              console.log("::error::playwright.json missing — the E2E suite never ran.");
+              process.exit(1);
+            }
+            const s = JSON.parse(fs.readFileSync("playwright.json", "utf8")).stats;
+            const ran = s.expected + s.unexpected + s.flaky;
+            console.log(
+              `playwright: ${ran} test(s) ran — ${s.expected} passed, ` +
+              `${s.unexpected} failed, ${s.flaky} flaky, ${s.skipped} skipped`
+            );
+            let failed = false;
+            if (ran !== EXPECTED) {
+              console.log(`::error::expected ${EXPECTED} E2E tests, ran ${ran}.`);
+              failed = true;
+            }
+            if (s.unexpected !== 0) {
+              console.log(`::error::${s.unexpected} E2E test(s) failed outright.`);
+              failed = true;
+            }
+            if (s.expected + s.flaky !== EXPECTED) {
+              console.log(`::error::${EXPECTED} E2E tests expected to pass, ${s.expected + s.flaky} did.`);
+              failed = true;
+            }
+            if (s.skipped !== 0) {
+              console.log(`::error::${s.skipped} E2E test(s) skipped; none may be.`);
+              failed = true;
+            }
+            // Flaky is REPORTED, not gated — and that is a deliberate, narrow exception.
+            // playwright.config.ts sets `retries: 1` on purpose ("absorbs transient
+            // dev-server pauses ... visible, never silent"), so failing here would override
+            // a decision this repository already made. One test is known flaky today:
+            // "audit: dismiss control on a persistent error meets the tap floor" measures a
+            // 44px tap target before layout settles, fails, and passes on retry. It is a
+            // measurement race in the test, not a defect in the product — but it is also
+            // real, so it is surfaced loudly on every run instead of being absorbed in
+            // silence. If the count ever climbs, this is where it will be visible.
+            if (s.flaky !== 0) {
+              console.log(`::warning::${s.flaky} E2E test(s) only passed on retry — not gating, see comment in app.yml`);
+            }
+            process.exit(failed ? 1 : 0);
+          '
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright.json
+            e2e/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  drift:
+    name: Prisma migration drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # `prisma migrate diff --from-migrations` REPLAYS the migration directory into a real
+    # throwaway database, so it cannot run without one — the repo's existing db:migrate:diff
+    # script fails with "You must pass the --shadow-database-url". Postgres 15 matches the
+    # major the engine targets.
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          # No password: this container lives only for the job, listens only on the runner's
+          # loopback, and is destroyed with it.
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: shadow
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d shadow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/financial-gateway/package-lock.json
+
+      - name: Install (gateway)
+        working-directory: apps/financial-gateway
+        run: npm ci
+
+      # --exit-code makes a detected difference a non-zero exit. Without it the command
+      # prints the drift and exits 0, which would make this job decorative.
+      #
+      # This is the check that keeps schema.prisma and prisma/migrations honest: Zone 2 holds
+      # no financial state, but it does own identity and the outbox, and a schema that has
+      # drifted from its migrations means production and the repository disagree about what
+      # those tables are.
+      - name: Drift check
+        working-directory: apps/financial-gateway
+        run: |
+          npx prisma migrate diff \
+            --from-migrations prisma/migrations \
+            --to-schema-datamodel prisma/schema.prisma \
+            --shadow-database-url postgres://postgres@127.0.0.1:5432/shadow \
+            --exit-code
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            apps/financial-gateway/package-lock.json
+
+      # ── What this gate is, honestly ──────────────────────────────────────────────────
+      # It FAILS on critical and REPORTS high. As of M1.1-T8 there are 13 high-severity
+      # advisories across the two packages (5 Zone 3, 8 gateway) and `npm audit fix` clears
+      # none of them without --force, which means a Next.js major upgrade. Gating on high
+      # today would mean a permanently red pipeline or a rushed breaking upgrade inside a CI
+      # task; neither is a real control.
+      #
+      # So the highs are printed in full on every run rather than hidden behind a threshold
+      # that silently passes them. Raising the gate to high belongs with M1.1-T12, where the
+      # upgrade can be reviewed on its own terms.
+      - name: Zone 3 — report high, fail on critical
+        run: |
+          echo "── high-severity advisories (reported, not gating) ──"
+          npm audit --audit-level=high || true
+          echo "── critical advisories (gating) ──"
+          npm audit --audit-level=critical
+
+      - name: Gateway — report high, fail on critical
+        working-directory: apps/financial-gateway
+        run: |
+          echo "── high-severity advisories (reported, not gating) ──"
+          npm audit --audit-level=high || true
+          echo "── critical advisories (gating) ──"
+          npm audit --audit-level=critical
