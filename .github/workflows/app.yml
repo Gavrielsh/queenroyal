@@ -222,15 +222,15 @@ jobs:
               console.log(`::error::${s.skipped} E2E test(s) skipped; none may be.`);
               failed = true;
             }
-            // Flaky is REPORTED, not gated — and that is a deliberate, narrow exception.
-            // playwright.config.ts sets `retries: 1` on purpose ("absorbs transient
-            // dev-server pauses ... visible, never silent"), so failing here would override
-            // a decision this repository already made. One test is known flaky today:
-            // "audit: dismiss control on a persistent error meets the tap floor" measures a
-            // 44px tap target before layout settles, fails, and passes on retry. It is a
-            // measurement race in the test, not a defect in the product — but it is also
-            // real, so it is surfaced loudly on every run instead of being absorbed in
-            // silence. If the count ever climbs, this is where it will be visible.
+            // Flaky is REPORTED, not gated. playwright.config.ts sets `retries: 1` on
+            // purpose ("absorbs transient dev-server pauses ... visible, never silent"), so
+            // failing here would override a decision this repository already made.
+            //
+            // There are no known flaky tests: the one that was — "audit: dismiss control on
+            // a persistent error meets the tap floor" — was measuring the notice during the
+            // backwards fill of its settle-pop animation, and that is fixed at the source in
+            // e2e/audit.spec.ts rather than absorbed by the retry. So a non-zero count here
+            // is NEW information, not the usual noise, and this is where it shows up.
             if (s.flaky !== 0) {
               console.log(`::warning::${s.flaky} E2E test(s) only passed on retry — not gating, see comment in app.yml`);
             }
