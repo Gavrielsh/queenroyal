@@ -171,7 +171,7 @@ All under `/api/v1`, HMAC + ReplayGuard protected:
 - `POST /bet`            — `{ operator_transaction_id, player_id, currency("GC"|"SC"), amount(string), game_id?, round_id?, metadata? }`
 - `POST /win`            — same + `reference_transaction_id?` = the BET's `ledger_transaction_id`
 - `POST /rollback`       — `{ operator_transaction_id, player_id, reference_transaction_id }`
-- `GET  /session?player_id=…`
+- `POST /session`        — `{ player_id }` in the SIGNED body. Not a GET: an empty-body MAC would authenticate nothing, leaving the player id unsigned and swappable
 - `POST /player/create`  — `{ external_id, username?, email?, country_code?, status? }`
 - `POST /store/purchase` — `{ operator_transaction_id, player_id, gc_amount(string), sc_promo_amount?(string), metadata? }`
 - `POST /store/redeem`   — `{ operator_transaction_id, player_id, amount(string), metadata? }`
