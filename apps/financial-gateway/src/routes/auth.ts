@@ -1,10 +1,10 @@
-import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 
-import { getEnv } from "../config/env";
+import { devMockLoginEnabled } from "../config/env";
 import { authRateLimit, clearRefreshCookie, REFRESH_COOKIE, setRefreshCookie } from "../lib/auth";
 import { errBody, okBody } from "../lib/reply";
 import { loginSchema, registerSchema } from "../schemas/auth.schema";
-import { AuthError, loadClaims, login, mintAccessToken, mockLogin, register } from "../services/auth.service";
+import { AuthError, loadClaims, login, mintAccessToken, register } from "../services/auth.service";
 import { rotateRefreshToken, revokeRefreshToken, SessionStoreUnavailableError } from "../services/session.service";
 
 /**
@@ -21,23 +21,46 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
   app.post("/api/auth/refresh", refreshHandler);
   app.post("/api/auth/logout", logoutHandler);
 
-  // DEV-ONLY session bootstrap: NOT REGISTERED in production, so a production request gets a
-  // plain 404 (the service throws there too, as a second layer). Deliberately exempt from the
-  // fail-closed Redis rate limiter — it guards real credentials against brute force, and this
-  // route accepts none — so dev auto-login works with no Redis running. The global per-IP
-  // limiter still applies. No refresh cookie is issued; the client re-calls on token expiry.
-  if (getEnv().NODE_ENV !== "production") {
-    app.post("/api/auth/mock-login", mockLoginHandler);
-  }
+  await registerDevOnlyRoutes(app);
 };
 
-async function mockLoginHandler(req: FastifyRequest, reply: FastifyReply): Promise<void> {
+/**
+ * Wire up the dev-only mock-login route, if and only if this build both CONTAINS it and is
+ * configured to expose it.
+ *
+ * Two independent layers, in order of strength:
+ *
+ *  1. BUILD. `src/dev` is excluded by tsconfig.build.json, so `npm run build` never emits
+ *     src/dev/mock-login.js. In a production artifact the import below throws
+ *     MODULE_NOT_FOUND and the route cannot be registered by any configuration — the code
+ *     is simply not on disk. scripts/verify-no-dev-routes.mjs fails the build if it ever is.
+ *  2. RUNTIME. `devMockLoginEnabled()` is an ALLOWLIST (NODE_ENV exactly "development" or
+ *     "test") AND requires an explicit ENABLE_DEV_MOCK_LOGIN=true. The previous guard was
+ *     `NODE_ENV !== "production"`, which failed OPEN because env parsing defaults NODE_ENV
+ *     to "development" — an unset or misspelled value registered the route.
+ *
+ * The specifier is held in a variable deliberately: with a string literal, tsc would have to
+ * resolve the module while type-checking the production project that excludes it, and the
+ * build would fail on a missing file. Keeping it non-literal is what lets the same source
+ * compile both with and without src/dev present.
+ */
+const DEV_MOCK_LOGIN_MODULE = "../dev/mock-login";
+
+async function registerDevOnlyRoutes(app: FastifyInstance): Promise<void> {
+  if (!devMockLoginEnabled()) return;
+
   try {
-    const result = await mockLogin();
-    req.log.info({ user_id: result.user.id }, "mock dev login issued (non-production)");
-    await reply.code(200).send(okBody({ user: result.user, accessToken: result.accessToken }));
-  } catch (err) {
-    await handleAuthError(req, reply, err, "mock-login");
+    const mod = (await import(DEV_MOCK_LOGIN_MODULE)) as {
+      registerDevMockLogin: (app: FastifyInstance) => void;
+    };
+    mod.registerDevMockLogin(app);
+    app.log.warn(
+      "DEV MOCK LOGIN ENABLED — POST /api/auth/mock-login will mint KYC-VERIFIED sessions " +
+        "with no credentials. This must never be reachable outside local development.",
+    );
+  } catch {
+    // Expected in any build that excluded src/dev: there is no dev route to register.
+    app.log.info("dev-only routes are not present in this build");
   }
 }
 

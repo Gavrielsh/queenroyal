@@ -23,6 +23,18 @@ loadDotenv({ path: resolve(__dirname, "../../.env"), override: true });
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 
+  // Explicit opt-in for the dev-only mock-login route (src/dev/mock-login.ts), the sole
+  // writer of `kycStatus: "VERIFIED"`. Defaults to OFF: the route requires a POSITIVE
+  // signal, never merely the absence of a production marker.
+  //
+  // This is the runtime half of the gate. The build half is stronger — tsconfig.build.json
+  // excludes src/dev, so a production artifact has no such route to enable. Setting this to
+  // true alongside NODE_ENV=production fails the boot outright (see assertDevFlagsSane).
+  ENABLE_DEV_MOCK_LOGIN: z
+    .string()
+    .optional()
+    .transform((v) => (v ?? "").trim().toLowerCase() === "true"),
+
   // ── Database (Postgres via Prisma) ──────────────────────────────────────────────
   // Runtime / pooled connection. In production this points at PgBouncer (transaction mode)
   // and MUST carry `?pgbouncer=true` so Prisma disables server-side prepared statements
@@ -282,8 +294,52 @@ export function getEnv(): Env {
     throw new Error(`Invalid environment configuration: ${issues}`);
   }
 
+  assertDevFlagsSane(parsed.data);
+
   cached = Object.freeze(parsed.data);
   return cached;
+}
+
+/**
+ * Refuse to boot when a dev-only affordance is requested in production.
+ *
+ * ENABLE_DEV_MOCK_LOGIN turns on a route that mints a KYC-VERIFIED session with no
+ * credentials. A production build does not contain that route at all (tsconfig.build.json
+ * excludes src/dev), so the flag could simply be ignored there — but silently ignoring it
+ * would leave the operator believing something about this process that is not true, which is
+ * the same expectation gap the retired HMAC kill switch created. Failing here says plainly
+ * that the deployment is configured for something it will not do.
+ */
+function assertDevFlagsSane(env: Env): void {
+  if (env.ENABLE_DEV_MOCK_LOGIN && env.NODE_ENV === "production") {
+    throw new Error(
+      "REFUSING TO BOOT: ENABLE_DEV_MOCK_LOGIN is set with NODE_ENV=production. " +
+        "That route mints a KYC-VERIFIED session without credentials and must never exist " +
+        "in production — the production build does not even compile it. Remove the variable " +
+        "from this deployment.",
+    );
+  }
+}
+
+/**
+ * Whether the dev-only mock-login route may be wired up.
+ *
+ * ALLOWLIST, not a denylist. The previous guard asked `NODE_ENV !== "production"`, and
+ * env parsing defaults NODE_ENV to "development" — so an unset, misspelled, or
+ * non-forwarded NODE_ENV resolved to a permissive value and the route registered itself.
+ * The check now demands NODE_ENV be EXACTLY "development" or "test" AND the operator to
+ * have opted in explicitly. Two positive signals; the absence of either denies.
+ */
+export function devMockLoginEnabled(): boolean {
+  if (!getEnv().ENABLE_DEV_MOCK_LOGIN) return false;
+
+  // Read the RAW value, not the parsed one. The schema applies `.default("development")`, so
+  // a missing NODE_ENV would otherwise arrive here already looking like a development box —
+  // and a deployment that set the flag but forgot NODE_ENV would open the route. Requiring
+  // the variable to be present makes both signals genuinely positive: something must be
+  // explicitly declared development or test, and someone must explicitly opt in.
+  const declared = process.env.NODE_ENV;
+  return declared === "development" || declared === "test";
 }
 
 /**
