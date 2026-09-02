@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 
 import bcrypt from "bcryptjs";
 
-import { getEnv } from "../config/env";
 import { signAccessToken, type AuthClaims } from "../lib/jwt";
 import { log } from "../lib/logger";
 import { getPrisma } from "../lib/prisma";

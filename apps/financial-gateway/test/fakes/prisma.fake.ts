@@ -13,7 +13,24 @@ import { randomUUID } from "node:crypto";
  *   });
  */
 
-type AnyRow = Record<string, any>;
+// Rows in this fake mirror Prisma model rows loosely; the value type stays wide because
+// the fake stores whatever a test hands it. Named once here so the looseness is declared in
+// a single place instead of re-spelled as `any` at every call site.
+type AnyRow = Record<string, unknown>;
+
+/** The shape of a Prisma delegate argument object, as far as this fake needs it. */
+type QueryArgs = {
+  where?: AnyRow;
+  data?: AnyRow | AnyRow[];
+  create?: AnyRow;
+  update?: AnyRow;
+  orderBy?: AnyRow;
+  take?: number;
+  skipDuplicates?: boolean;
+};
+
+/** A tagged-template argument accepted by $queryRaw / $executeRaw. */
+type RawQuery = TemplateStringsArray | { strings?: unknown; values?: unknown } | string;
 
 const users = new Map<string, AnyRow>();
 const journal = new Map<string, AnyRow>(); // keyed by id
@@ -62,7 +79,7 @@ function matchWhere(row: AnyRow, where: AnyRow): boolean {
         else if (op === "gt" && !(value > operand)) return false;
         else if (op === "gte" && !(value >= operand)) return false;
         else if (op === "equals" && value !== operand) return false;
-        else if (op === "in" && !(operand as any[]).includes(value)) return false;
+        else if (op === "in" && !(operand as unknown[]).includes(value)) return false;
       }
     } else if (value !== cond) {
       return false;
@@ -100,7 +117,7 @@ function newJournalRow(d: AnyRow): AnyRow {
  * template (`$queryRaw\`...\``) and a `Prisma.sql\`...\`` fragment object; the gateway's
  * repository + claim use the latter.
  */
-function readRawQuery(q: any, rest: unknown[]): { text: string; values: unknown[] } {
+function readRawQuery(q: RawQuery, rest: unknown[]): { text: string; values: unknown[] } {
   if (Array.isArray(q) && "raw" in q) {
     return { text: (q as string[]).join(" "), values: rest };
   }
@@ -112,7 +129,7 @@ function readRawQuery(q: any, rest: unknown[]): { text: string; values: unknown[
 
 export const prismaFake = {
   user: {
-    findUnique: async ({ where }: any) => {
+    findUnique: async ({ where }: QueryArgs) => {
       if (where.email !== undefined) {
         for (const u of users.values()) if (u.email === where.email) return { ...u };
         return null;
@@ -121,7 +138,7 @@ export const prismaFake = {
       return u ? { ...u } : null;
     },
     // Upsert by unique email (mockLogin) or id, filling Prisma schema defaults on create.
-    upsert: async ({ where, create, update }: any) => {
+    upsert: async ({ where, create, update }: QueryArgs) => {
       let existing: AnyRow | undefined;
       if (where.email !== undefined) {
         existing = [...users.values()].find((u) => u.email === where.email);
@@ -147,7 +164,7 @@ export const prismaFake = {
       users.set(row.id, row);
       return { ...row };
     },
-    update: async ({ where, data }: any) => {
+    update: async ({ where, data }: QueryArgs) => {
       const u = users.get(where.id);
       if (!u) throw new Error(`user ${where.id} not found`);
       applyData(u, data);
@@ -155,7 +172,7 @@ export const prismaFake = {
     },
   },
   engineRequestLog: {
-    upsert: async ({ where, update, create }: any) => {
+    upsert: async ({ where, update, create }: QueryArgs) => {
       const existing = journalByOpTx(where.operatorTransactionId);
       if (existing) {
         applyData(existing, update);
@@ -168,7 +185,7 @@ export const prismaFake = {
     },
     // Idempotent intent create (createIntentIfAbsent). `skipDuplicates` collapses a repeated
     // deterministic key to the single existing row, mirroring `ON CONFLICT DO NOTHING`.
-    createMany: async ({ data, skipDuplicates }: any) => {
+    createMany: async ({ data, skipDuplicates }: QueryArgs) => {
       const rows: AnyRow[] = Array.isArray(data) ? data : [data];
       let count = 0;
       for (const d of rows) {
@@ -179,18 +196,18 @@ export const prismaFake = {
       }
       return { count };
     },
-    update: async ({ where, data }: any) => {
+    update: async ({ where, data }: QueryArgs) => {
       const row = where.id ? journal.get(where.id) : journalByOpTx(where.operatorTransactionId);
       if (!row) throw new Error("engineRequestLog row not found");
       applyData(row, data);
       row.updatedAt = new Date();
       return { ...row };
     },
-    findUnique: async ({ where }: any) => {
+    findUnique: async ({ where }: QueryArgs) => {
       const row = where.id ? journal.get(where.id) : journalByOpTx(where.operatorTransactionId);
       return row ? { ...row } : null;
     },
-    findMany: async ({ where, orderBy, take }: any) => {
+    findMany: async ({ where, orderBy, take }: QueryArgs) => {
       let rows = [...journal.values()].filter((r) => (where ? matchWhere(r, where) : true));
       if (orderBy?.updatedAt === "asc") {
         rows.sort((a, b) => a.updatedAt.getTime() - b.updatedAt.getTime());
@@ -199,7 +216,7 @@ export const prismaFake = {
       return rows.map((r) => ({ ...r }));
     },
     // Bulk delete (retention sweeper): remove every row matching `where`, return the count.
-    deleteMany: async ({ where }: any) => {
+    deleteMany: async ({ where }: QueryArgs) => {
       let count = 0;
       for (const [id, row] of journal) {
         if (!where || matchWhere(row, where)) {
@@ -225,7 +242,7 @@ export const prismaFake = {
    *     markIntentTerminal; values = [operatorTransactionId].
    * With no real lock contention, SKIP LOCKED always finds the eligible row.
    */
-  $queryRaw: async (q: any, ...rest: unknown[]): Promise<Array<Record<string, unknown>>> => {
+  $queryRaw: async (q: RawQuery, ...rest: unknown[]): Promise<Array<Record<string, unknown>>> => {
     const { text, values } = readRawQuery(q, rest);
     if (text.includes("SKIP LOCKED")) {
       const [operatorTransactionId, maxAttempts] = values as [string, number];

@@ -24,5 +24,10 @@ e2e/screenshots
 e2e/test-results
 playwright-report
 
+# Machine-readable test reports written by the CI count assertions (app.yml).
+zone3.json
+gateway.json
+playwright.json
+
 # misc
 .DS_Store
