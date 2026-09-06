@@ -435,6 +435,33 @@ export interface SpinOutcomeDto {
  * All three are successes and all three render identically — a recovered round is a real
  * round.
  */
+/**
+ * The engine's verdict on how a settled round may be presented.
+ *
+ * GATE C. This is the ONLY thing the UI may use to decide whether to celebrate a
+ * round. It is computed server-side from net position and shipped as a class
+ * precisely so the browser never performs that arithmetic — see
+ * `internal/domain/feedback.go` in the engine.
+ *
+ * The obvious client-side test, `winAmount > 0`, is wrong on this paytable: a
+ * leading CHERRY or LEMON pair pays x1, returning the stake exactly, and those
+ * two outcomes are 10.99% of all spins. Celebrating them is a loss disguised as
+ * a win.
+ */
+export const FEEDBACK_CLASSES = ["WIN", "NEUTRAL", "LOSS"] as const;
+export type FeedbackClass = (typeof FEEDBACK_CLASSES)[number];
+
+/**
+ * A signed engine decimal. Unlike `MONEY_STRING_REGEX` this admits a leading
+ * minus, because net position is negative on every losing round — which is most
+ * of them.
+ */
+const SIGNED_MONEY_STRING_REGEX = /^-?\d+\.\d{4}$/;
+
+function isSignedMoneyString(value: unknown): value is string {
+  return typeof value === "string" && SIGNED_MONEY_STRING_REGEX.test(value);
+}
+
 export interface SpinResultDto {
   operatorTransactionId: string;
   betLedgerTransactionId: string;
@@ -455,6 +482,14 @@ export interface SpinResultDto {
    */
   postBalances: WalletBalancesDto;
   status: "PROCESSED" | "CACHED" | "GHOST_RECOVERED";
+  /**
+   * `winAmount - betAmount`, signed, as the engine computed it. Carried for
+   * display and diagnostics — NEVER to derive `feedbackClass` from. If these two
+   * ever disagree the engine is the authority and the response is the bug.
+   */
+  netPosition: string;
+  /** The engine's presentation verdict. The only input to celebrating a round. */
+  feedbackClass: FeedbackClass;
 }
 
 function isNonEmptyString(value: unknown): value is string {
@@ -541,6 +576,20 @@ export function parseSpinEnvelope(payload: unknown): SpinResultDto {
     throw malformed("data.outcome.multiplier");
   }
 
+  // GATE C, fail-closed at the trust boundary.
+  //
+  // An absent or unrecognised class is a malformed response, not something to
+  // default. Defaulting to WIN would celebrate everything; defaulting to LOSS
+  // would look safe while silently hiding real wins and masking a broken engine
+  // deploy. Refusing to parse surfaces the fault immediately.
+  const netPosition = record.net_position;
+  if (!isSignedMoneyString(netPosition)) throw malformed("data.net_position");
+
+  const feedbackClass = record.feedback_class;
+  if (!FEEDBACK_CLASSES.some((candidate) => candidate === feedbackClass)) {
+    throw malformed("data.feedback_class");
+  }
+
   return {
     operatorTransactionId,
     betLedgerTransactionId,
@@ -558,6 +607,8 @@ export function parseSpinEnvelope(payload: unknown): SpinResultDto {
     },
     postBalances,
     status,
+    netPosition,
+    feedbackClass: feedbackClass as FeedbackClass,
   };
 }
 

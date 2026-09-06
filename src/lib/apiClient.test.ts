@@ -388,6 +388,9 @@ describe("parseSpinEnvelope — the validation gate on a settled round", () => {
       },
       post_balances: { gc: "9999.0000", sc_unplayed: "0", sc_redeemable: "0" },
       status: "PROCESSED",
+      // Gate C: engine-computed and required. 20.0000 back on a 1.0000 stake.
+      net_position: "19.0000",
+      feedback_class: "WIN",
     };
   }
 
@@ -410,6 +413,8 @@ describe("parseSpinEnvelope — the validation gate on a settled round", () => {
       ...validSpin(),
       win_amount: "0",
       win_ledger_transaction_id: undefined,
+      net_position: "-1.0000",
+      feedback_class: "LOSS",
     };
     losing.outcome = {
       game_id: "classic-3reel",

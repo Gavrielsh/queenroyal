@@ -7,7 +7,9 @@ import { BalanceChip } from "@/components/wallet/BalanceChip";
 import { WalletStatusBanner } from "@/components/wallet/WalletStatusBanner";
 import { useSpinMutation, type SpinFailure } from "@/hooks/useSpinMutation";
 import { useWalletQuery } from "@/hooks/useWalletQuery";
-import type { SpinCurrency, SpinResultDto } from "@/lib/apiClient";
+import type { FeedbackClass, SpinCurrency, SpinResultDto } from "@/lib/apiClient";
+
+import { SpinFeedback } from "./feedback/SpinFeedback";
 
 /**
  * The player-facing slot window, wired to the SERVER-AUTHORITATIVE spin.
@@ -85,11 +87,30 @@ function randomShuffleReels(length: number): string[] {
  */
 function settledNotice(result: SpinResultDto, walletSynced: boolean): Notice {
   const recovered = result.status !== "PROCESSED";
-  const won = result.outcome.line !== "NONE";
 
-  const headline = won
-    ? `${result.outcome.winSymbol ?? "Line"} pays — you won ${result.winAmount} ${result.family}.`
-    : `No win this round. ${result.betAmount} ${result.family} staked.`;
+  // GATE C. The headline is chosen from the ENGINE's feedback class, never from
+  // the outcome line or the win amount.
+  //
+  // This previously read `result.outcome.line !== "NONE"` and rendered
+  // "<SYMBOL> pays — you won <amount>" with success styling. On classic-3reel a
+  // leading CHERRY or LEMON pair pays x1: the stake comes back and nothing more,
+  // and those two outcomes are 10.99% of all spins. So roughly one spin in ten
+  // congratulated the player on breaking even — a textbook loss disguised as a
+  // win, in the copy rather than in the sound.
+  //
+  // The NEUTRAL wording states the payout honestly without implying a gain. The
+  // amounts are still shown, because a player who watched a pair land is owed
+  // the figure; what they are not owed is being told they won it.
+  const headline = ((): string => {
+    switch (result.feedbackClass) {
+      case "WIN":
+        return `${result.outcome.winSymbol ?? "Line"} pays — you won ${result.winAmount} ${result.family}.`;
+      case "NEUTRAL":
+        return `${result.outcome.winSymbol ?? "Line"} pays ${result.winAmount} ${result.family} — your ${result.betAmount} stake, returned. You broke even.`;
+      case "LOSS":
+        return `No win this round. ${result.betAmount} ${result.family} staked.`;
+    }
+  })();
 
   if (!walletSynced) {
     return {
@@ -97,8 +118,11 @@ function settledNotice(result: SpinResultDto, walletSynced: boolean): Notice {
       message: `${headline} The round settled, but the balance re-read failed — figures may be stale.`,
     };
   }
+  // `success` is the celebratory notice styling, so it is reserved for a genuine
+  // WIN. A NEUTRAL or LOSS round renders in the neutral style: the round
+  // settled correctly, and that is a statement of fact, not an achievement.
   return {
-    kind: recovered ? "error" : "success",
+    kind: recovered ? "error" : result.feedbackClass === "WIN" ? "success" : "neutral",
     message: recovered
       ? `${headline} (Recovered an already-settled round — you were not charged twice.)`
       : headline,
@@ -140,7 +164,20 @@ export function MockGameWindow() {
   /** True only while glyphs are shuffling — i.e. the rendered reels are NOT an outcome. */
   const [isShuffling, setIsShuffling] = useState(false);
 
+  /**
+   * The engine's feedback class for the last settled round, or null before the
+   * first spin.
+   *
+   * GATE C: this is stored VERBATIM from the response and never recomputed. It
+   * is the sole input to <SpinFeedback>, which is the only component allowed to
+   * celebrate. Nothing here inspects winAmount or the outcome line to decide how
+   * the round felt.
+   */
+  const [feedbackClass, setFeedbackClass] = useState<FeedbackClass | null>(null);
+
   // Presentation-only: one settle-pop cycle on the spinning → settled edge.
+  // NOT a celebration — it fires on every settle, win or lose, and says only
+  // that the reels stopped. See src/components/feedback/celebration.ts.
   const [justSettled, setJustSettled] = useState(false);
   const wasSpinningRef = useRef(false);
   useEffect(() => {
@@ -177,12 +214,16 @@ export function MockGameWindow() {
       if (outcome.status === "settled") {
         // The ONLY place reels are set from data: the engine's own record of the round.
         setReels(outcome.result.outcome.reels);
+        setFeedbackClass(outcome.result.feedbackClass);
         showNotice(settledNotice(outcome.result, outcome.walletSynced));
         return;
       }
 
       // Failed: discard the shuffle, restore the last real outcome, and say what happened.
+      // The previous verdict is cleared too — a stale WIN must not keep celebrating a
+      // round that is no longer the one being shown.
       setReels(settledReels);
+      setFeedbackClass(null);
       showNotice(failureNotice(outcome.failure));
     } finally {
       clearInterval(shuffle);
@@ -245,6 +286,13 @@ export function MockGameWindow() {
           </div>
         ))}
       </div>
+
+      {/*
+        GATE C. The single celebratory surface in the application. It receives the
+        engine's class and nothing else — no amount, no line, no multiplier — so it
+        cannot decide for itself that a stake-returning round was a win.
+      */}
+      {feedbackClass !== null && !isShuffling && <SpinFeedback feedbackClass={feedbackClass} />}
 
       {/* Spin button — shimmer sheen while the round is in flight (CSS keyframe overlay). */}
       <button

@@ -87,6 +87,62 @@ export default tseslint.config(
     },
   },
 
+  // ────────────────────────────────────────────────────────────────────────────
+  // GATE C — the celebration module is quarantined.
+  //
+  // A celebratory sound or animation is a claim about the player's money: this
+  // round left you better off. On classic-3reel that claim is false for 10.99% of
+  // paying spins, because a leading CHERRY or LEMON pair pays x1 — the stake back
+  // and nothing more. The engine decides who may be congratulated and ships a
+  // `feedbackClass`; what this rule prevents is a component deciding for itself,
+  // which is one `winAmount !== "0.0000"` away in any file that can import a sound.
+  //
+  // So there is exactly one door — SpinFeedback — and this is the lock. The
+  // allowance below is granted to that file ALONE, by path.
+  //
+  // If you are here because this rule is blocking you: the answer is almost never
+  // to widen the allowlist. Render <SpinFeedback feedbackClass={...} /> instead,
+  // and if you need a celebration it does not yet do, add it inside that component
+  // where the engine's verdict is already in scope.
+  // ────────────────────────────────────────────────────────────────────────────
+  {
+    files: ["src/**/*.{ts,tsx}"],
+    // TWO exact paths, never a glob.
+    //
+    // SpinFeedback.tsx is the single door. Its own test is the second exception
+    // because it has to import the module to assert the celebration did NOT
+    // fire — an absence is not observable from the DOM alone, and a gate that
+    // cannot see what it guards is decorative.
+    //
+    // These are listed by full path rather than as `**/*.test.tsx` on purpose. A
+    // glob over tests would let any future test trigger real celebrations, and
+    // "it was only in a test" is how a helper ends up imported into a component.
+    ignores: [
+      "src/components/feedback/SpinFeedback.tsx",
+      "src/components/feedback/SpinFeedback.test.tsx",
+    ],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            {
+              group: [
+                "**/feedback/celebration",
+                "**/feedback/celebration.ts",
+                "@/components/feedback/celebration",
+                "./celebration",
+                "../feedback/celebration",
+              ],
+              message:
+                "The celebration module may only be imported by src/components/feedback/SpinFeedback.tsx (Gate C: no celebratory feedback on a net-negative or net-zero round). Render <SpinFeedback feedbackClass={...} /> instead of triggering a celebration directly.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+
   // NOTE: no `any` carve-out for test files. There was going to be one — the 16 findings
   // this config first reported were all in apps/financial-gateway/test/fakes/prisma.fake.ts,
   // and downgrading them to warnings in test code is the usual compromise. They were typed

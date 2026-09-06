@@ -16,7 +16,16 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * exactly once.
  */
 export interface Notice {
-  kind: "error" | "success";
+  /**
+   * `success` is the CELEBRATORY styling (green, success ring) and auto-dismisses.
+   *
+   * GATE C: it is reserved for a round the engine classified WIN. A round that
+   * settled correctly but returned the stake exactly is a `neutral` notice — it
+   * happened, it is worth stating, and it is not an achievement. Reaching for
+   * `success` because "the request succeeded" is how a loss disguised as a win
+   * gets shipped in the copy.
+   */
+  kind: "error" | "success" | "neutral";
   message: string;
 }
 
@@ -48,7 +57,7 @@ export function useActionNotice(): ActionNoticeController {
     (next: Notice) => {
       clearTimer();
       setNotice(next);
-      if (next.kind === "success") {
+      if (next.kind === "success" || next.kind === "neutral") {
         timerRef.current = setTimeout(() => setNotice(null), SUCCESS_DISMISS_MS);
       }
       // Errors arm no timer — they persist until the player dismisses them.
@@ -65,12 +74,21 @@ export function ActionNotice({ notice, onDismiss }: { notice: Notice | null; onD
   if (!notice) return null;
   const isError = notice.kind === "error";
 
+  // Three distinct treatments. `neutral` deliberately does NOT borrow the success
+  // palette: green-on-success is the visual claim "you gained", and a
+  // stake-returning round has not.
+  const tone =
+    isError
+      ? "text-danger ring-danger/40"
+      : notice.kind === "success"
+        ? "text-success ring-success/40"
+        : "text-muted ring-edge-strong";
+
   return (
     <div
       role="alert"
-      className={`absolute inset-x-6 -bottom-16 z-10 flex animate-settle-pop items-center justify-center gap-3 rounded-chip bg-surface-2/95 px-4 py-3 text-center text-sm font-semibold shadow-lift ring-1 backdrop-blur-md ${
-        isError ? "text-danger ring-danger/40" : "text-success ring-success/40"
-      }`}
+      data-notice-kind={notice.kind}
+      className={`absolute inset-x-6 -bottom-16 z-10 flex animate-settle-pop items-center justify-center gap-3 rounded-chip bg-surface-2/95 px-4 py-3 text-center text-sm font-semibold shadow-lift ring-1 backdrop-blur-md ${tone}`}
     >
       <span className="min-w-0 flex-1">{notice.message}</span>
       {isError && (

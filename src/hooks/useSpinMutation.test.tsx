@@ -48,6 +48,8 @@ function spinEnvelope(status = "PROCESSED"): unknown {
       family: "GC",
       bet_amount: "1.0000",
       win_amount: "20.0000",
+      net_position: "19.0000",
+      feedback_class: "WIN",
       outcome: {
         game_id: GAME_ID,
         paytable_version: "1.0.0",

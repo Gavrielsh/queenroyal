@@ -41,6 +41,13 @@ interface SpinOverrides {
   winAmount?: string;
   multiplier?: string;
   status?: string;
+  /**
+   * Gate C. Defaults follow from the default amounts (400.0000 back on a
+   * 1.0000 stake, or nothing on a losing line) and are overridable so a test can
+   * drive a stake-returning round explicitly.
+   */
+  netPosition?: string;
+  feedbackClass?: "WIN" | "NEUTRAL" | "LOSS";
 }
 
 /** Mirrors apps/financial-gateway/src/routes/spin.ts → `okBody(EngineSpinResult)`. */
@@ -66,6 +73,8 @@ function spinEnvelope(over: SpinOverrides = {}): unknown {
       },
       post_balances: { gc: "1399.0000", sc_unplayed: "12.5", sc_redeemable: "0" },
       status: over.status ?? "PROCESSED",
+      net_position: over.netPosition ?? (line === "NONE" ? "-1.0000" : "399.0000"),
+      feedback_class: over.feedbackClass ?? (line === "NONE" ? "LOSS" : "WIN"),
     },
   };
 }

@@ -123,7 +123,7 @@ jobs:
           node -e '
             const fs = require("fs");
             const expected = {
-              "Zone 3 (src/)":  { file: "zone3.json",                        files: 18, tests: 274 },
+              "Zone 3 (src/)":  { file: "zone3.json",                        files: 19, tests: 281 },
               "gateway":        { file: "apps/financial-gateway/gateway.json", files: 19, tests: 146 },
             };
             let failed = false;
@@ -194,7 +194,7 @@ jobs:
         run: |
           node -e '
             const fs = require("fs");
-            const EXPECTED = 44; // 22 tests x 2 viewport projects (desktop, mobile)
+            const EXPECTED = 52; // 26 tests x 2 viewport projects (desktop, mobile)
             if (!fs.existsSync("playwright.json")) {
               console.log("::error::playwright.json missing — the E2E suite never ran.");
               process.exit(1);

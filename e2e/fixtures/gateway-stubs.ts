@@ -99,28 +99,101 @@ export const POST_SPIN_BALANCES: WalletBalances = {
 };
 
 /**
+ * The engine's per-round shape, as `routes/spin.ts` forwards it.
+ *
+ * GATE C: `net_position` and `feedback_class` are engine-computed and REQUIRED —
+ * the client parser rejects a response without them rather than defaulting, so a
+ * stub that omits them is malformed exactly as a broken deploy would be.
+ */
+export interface SpinShape {
+  betAmount: string;
+  winAmount: string;
+  netPosition: string;
+  feedbackClass: "WIN" | "NEUTRAL" | "LOSS";
+  reels: [string, string, string];
+  line: "NONE" | "TWO_OF_A_KIND" | "THREE_OF_A_KIND";
+  winSymbol: string | null;
+  multiplier: string;
+}
+
+/** A genuine win: three BELLs at x20 on a 1.0000 stake. Net +19. */
+export const WINNING_SPIN: SpinShape = {
+  betAmount: "1.0000",
+  winAmount: "20.0000",
+  netPosition: "19.0000",
+  feedbackClass: "WIN",
+  reels: ["BELL", "BELL", "BELL"],
+  line: "THREE_OF_A_KIND",
+  winSymbol: "BELL",
+  multiplier: "20",
+};
+
+/**
+ * THE LOSS DISGUISED AS A WIN. A leading CHERRY pair pays x1: the stake comes
+ * back and nothing more, so net position is exactly zero.
+ *
+ * This is not a contrived edge case — with LEMON it accounts for 10.99% of all
+ * spins on classic-3reel. The reels show a pair, a payout lands in the ledger,
+ * and the player is precisely where they started.
+ */
+export const STAKE_RETURNING_SPIN: SpinShape = {
+  betAmount: "1.0000",
+  winAmount: "1.0000",
+  netPosition: "0.0000",
+  feedbackClass: "NEUTRAL",
+  reels: ["CHERRY", "CHERRY", "BELL"],
+  line: "TWO_OF_A_KIND",
+  winSymbol: "CHERRY",
+  multiplier: "1",
+};
+
+/** The same shape for LEMON, the other stake-returning outcome. */
+export const STAKE_RETURNING_SPIN_LEMON: SpinShape = {
+  ...STAKE_RETURNING_SPIN,
+  reels: ["LEMON", "LEMON", "SEVEN"],
+  winSymbol: "LEMON",
+};
+
+/** A losing round: nothing returned. */
+export const LOSING_SPIN: SpinShape = {
+  betAmount: "1.0000",
+  winAmount: "0.0000",
+  netPosition: "-1.0000",
+  feedbackClass: "LOSS",
+  reels: ["CHERRY", "LEMON", "BELL"],
+  line: "NONE",
+  winSymbol: null,
+  multiplier: "0",
+};
+
+/**
  * `POST /api/spin` success envelope — routes/spin.ts `okBody(EngineSpinResult)`.
  * Reel symbols are the engine's own ids from `internal/game/paytable.go`.
  */
-export function spinEnvelope(status: "PROCESSED" | "GHOST_RECOVERED" = "PROCESSED"): unknown {
+export function spinEnvelope(
+  status: "PROCESSED" | "GHOST_RECOVERED" = "PROCESSED",
+  shape: SpinShape = WINNING_SPIN,
+): unknown {
   return okBody({
     operator_transaction_id: "spin:e2e-attempt-1",
     player_id: "pl_e2e_1",
     bet_ledger_transaction_id: "ltx_bet_e2e_1",
-    win_ledger_transaction_id: "ltx_win_e2e_1",
+    win_ledger_transaction_id: shape.winAmount === "0.0000" ? null : "ltx_win_e2e_1",
     family: "GC",
-    bet_amount: "1.0000",
-    win_amount: "20.0000",
+    bet_amount: shape.betAmount,
+    win_amount: shape.winAmount,
     outcome: {
       game_id: "classic-3reel",
       paytable_version: "1.0.0",
-      reels: ["BELL", "BELL", "BELL"],
-      line: "THREE_OF_A_KIND",
-      win_symbol: "BELL",
-      multiplier: "20",
+      reels: shape.reels,
+      line: shape.line,
+      win_symbol: shape.winSymbol,
+      multiplier: shape.multiplier,
     },
     post_balances: POST_SPIN_BALANCES,
     status,
+    net_position: shape.netPosition,
+    feedback_class: shape.feedbackClass,
   });
 }
 
@@ -157,6 +230,15 @@ export type PurchaseScenario = "settled" | "declined" | "confirm-hanging";
  */
 export type SpinScenario =
   | "settled"
+  /**
+   * A stake-returning round — the loss disguised as a win. A leading CHERRY pair
+   * pays x1, so a payout lands and net position is exactly zero. Gate C.
+   */
+  | "stake-returned"
+  /** The same, on the other x1 outcome (LEMON), so the gate is not symbol-specific. */
+  | "stake-returned-lemon"
+  /** A losing round: nothing comes back. */
+  | "lost"
   | "ghost-recovered"
   | "insufficient-funds"
   | "unavailable"
@@ -264,7 +346,19 @@ export async function installGateway(
           return;
         case "settled":
           spun = true;
-          await fulfillJson(route, spinEnvelope("PROCESSED"));
+          await fulfillJson(route, spinEnvelope("PROCESSED", WINNING_SPIN));
+          return;
+        case "stake-returned":
+          spun = true;
+          await fulfillJson(route, spinEnvelope("PROCESSED", STAKE_RETURNING_SPIN));
+          return;
+        case "stake-returned-lemon":
+          spun = true;
+          await fulfillJson(route, spinEnvelope("PROCESSED", STAKE_RETURNING_SPIN_LEMON));
+          return;
+        case "lost":
+          spun = true;
+          await fulfillJson(route, spinEnvelope("PROCESSED", LOSING_SPIN));
           return;
       }
     });
