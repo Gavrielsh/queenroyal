@@ -8,6 +8,7 @@ import type {
   EngineSuccessEnvelope,
   EngineTxResult,
   PurchasePayload,
+  RedeemPayload,
   RollbackPayload,
   SessionBalancesResult,
   SessionPayload,
@@ -41,6 +42,7 @@ const ENGINE_ENDPOINTS = {
   win: "/api/v1/win",
   rollback: "/api/v1/rollback",
   purchase: "/api/v1/store/purchase",
+  redeem: "/api/v1/store/redeem",
   createPlayer: "/api/v1/player/create",
   session: "/api/v1/session",
 } as const;
@@ -85,6 +87,25 @@ export class TrueEngineClient {
   /** Issue purchased coins (GC + optional SC_UNPLAYED promo) after a fiat charge. */
   sendPurchase(payload: PurchasePayload): Promise<TrueEngineResult<EngineTxResult>> {
     return this.postTx(ENGINE_ENDPOINTS.purchase, payload);
+  }
+
+  /**
+   * Debit SC_REDEEMABLE for a prize payout — the money-OUT leg.
+   *
+   * Goes through `postTx` like every other ledger call, and therefore inherits the entire
+   * zero-trust contract unchanged: one serialization, HMAC-SHA256 over
+   * `<X-Timestamp>.<X-Nonce>.<rawBody>`, the four-header set, and the typed no-throw result.
+   * None of that is re-implemented here — a second copy of signing logic is a second place
+   * for it to drift out of step with the engine.
+   *
+   * SAFE TO RETRY. `operator_transaction_id` is the engine's idempotency anchor, so a repeat
+   * of this exact call debits at most once and otherwise returns the original receipt. It is
+   * worth being precise about what is being retried: this is the LEDGER DEBIT, not the
+   * payout. Money leaves the building later, under the redemption's own PROCESSING → PAID
+   * transition, so replaying this call can never re-send funds to a player.
+   */
+  sendRedeem(payload: RedeemPayload): Promise<TrueEngineResult<EngineTxResult>> {
+    return this.postTx<EngineTxResult>(ENGINE_ENDPOINTS.redeem, payload);
   }
 
   /** Reverse a previously-committed BET by its ledger transaction id. */

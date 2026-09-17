@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import { moneyString, positiveMoneyString } from "../lib/money";
-import type { BetPayload, PurchasePayload, RollbackPayload, WinPayload } from "../types/true-engine";
+import type { BetPayload, PurchasePayload, RedeemPayload, RollbackPayload, WinPayload } from "../types/true-engine";
 
 /**
  * STRICT runtime validation at the JSONB boundary.
@@ -47,6 +47,18 @@ export const rollbackPayloadSchema = z.object({
   metadata: engineMetadata.optional(),
 }) satisfies z.ZodType<RollbackPayload>;
 
+/**
+ * The SC_REDEEMABLE debit body for a redemption. `positiveMoneyString`, not `moneyString`:
+ * the engine refuses amount <= 0, and a zero-amount redemption is a bug upstream rather than
+ * a no-op worth replaying.
+ */
+export const redeemPayloadSchema = z.object({
+  operator_transaction_id: z.string().min(1),
+  player_id: z.string().min(1),
+  amount: positiveMoneyString,
+  metadata: engineMetadata.optional(),
+}) satisfies z.ZodType<RedeemPayload>;
+
 /** The ledger credit body issued once a deposit's PSP intent is confirmed `succeeded`. */
 export const purchasePayloadSchema = z.object({
   operator_transaction_id: z.string().min(1),
@@ -71,13 +83,14 @@ export const depositInstructionSchema = z.object({
 export type DepositInstruction = z.infer<typeof depositInstructionSchema>;
 
 /** Engine-request kinds that carry a replayable JSONB payload. */
-export type ReplayableEngineRequestType = "BET" | "WIN" | "DEPOSIT" | "ROLLBACK";
+export type ReplayableEngineRequestType = "BET" | "WIN" | "DEPOSIT" | "ROLLBACK" | "REDEEM";
 
 export type ParsedEnginePayload =
   | { ok: true; type: "BET"; data: BetPayload }
   | { ok: true; type: "WIN"; data: WinPayload }
   | { ok: true; type: "ROLLBACK"; data: RollbackPayload }
   | { ok: true; type: "DEPOSIT"; data: DepositInstruction }
+  | { ok: true; type: "REDEEM"; data: RedeemPayload }
   | { ok: false; error: string };
 
 /**
@@ -101,6 +114,10 @@ export function parseEngineRequestPayload(type: ReplayableEngineRequestType, pay
     }
     case "DEPOSIT": {
       const r = depositInstructionSchema.safeParse(payload);
+      return r.success ? { ok: true, type, data: r.data } : { ok: false, error: formatIssues(r.error) };
+    }
+    case "REDEEM": {
+      const r = redeemPayloadSchema.safeParse(payload);
       return r.success ? { ok: true, type, data: r.data } : { ok: false, error: formatIssues(r.error) };
     }
     default: {

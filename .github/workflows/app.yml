@@ -124,7 +124,7 @@ jobs:
             const fs = require("fs");
             const expected = {
               "Zone 3 (src/)":  { file: "zone3.json",                        files: 18, tests: 274 },
-              "gateway":        { file: "apps/financial-gateway/gateway.json", files: 20, tests: 154 },
+              "gateway":        { file: "apps/financial-gateway/gateway.json", files: 21, tests: 165 },
             };
             let failed = false;
             for (const [name, want] of Object.entries(expected)) {

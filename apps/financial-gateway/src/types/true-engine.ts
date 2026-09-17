@@ -96,6 +96,24 @@ export interface PurchasePayload {
   metadata?: EngineMetadata;
 }
 
+/**
+ * POST /api/v1/store/redeem — debit SC_REDEEMABLE for a prize payout (money OUT).
+ *
+ * Mirrors the engine's `redeemDTO` (internal/api/casino.go) field for field. There is no
+ * `currency`: redemption draws from SC_REDEEMABLE and nothing else, so naming a currency
+ * would only create a way to ask for the wrong one.
+ *
+ * The engine — not this gateway — decides whether the debit is allowed: sufficient
+ * SC_REDEEMABLE, playthrough discharged (ErrPlaythroughOutstanding), and a player status
+ * that is not blocked. Zone 2 asks; Zone 1 answers.
+ */
+export interface RedeemPayload {
+  operator_transaction_id: string; // deterministic idempotency anchor (stable across retries)
+  player_id: string; // the engine's player UUID
+  amount: string; // decimal string, > 0 — SC_REDEEMABLE only
+  metadata?: EngineMetadata;
+}
+
 /** POST /api/v1/rollback — reverse a previously-committed BET. */
 export interface RollbackPayload {
   operator_transaction_id: string; // the rollback's own (distinct) id
