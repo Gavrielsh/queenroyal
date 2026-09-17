@@ -6,6 +6,7 @@ vi.mock("../src/lib/prisma", async () => {
   return { getPrisma: () => mod.prismaFake };
 });
 
+import { MockPayoutProvider, setPayoutProvider } from "../src/lib/payouts";
 import { DLQ } from "../src/lib/reconcile-queue";
 import { REDEMPTION_GROUP, REDEMPTION_STREAM, RedisStreamRedemptionQueue } from "../src/lib/redemption-queue";
 import {
@@ -34,6 +35,7 @@ const USER_ID = "44444444-4444-4444-8444-444444444444";
 
 let redis: Redis;
 let available = false;
+let payouts: MockPayoutProvider;
 
 beforeAll(async () => {
   redis = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 1, retryStrategy: () => null });
@@ -58,11 +60,15 @@ afterAll(async () => {
 
 beforeEach(async () => {
   resetDb();
+  // A real implementation of the rail contract, not a stub that always says yes.
+  payouts = new MockPayoutProvider();
+  setPayoutProvider(payouts);
   if (!available) return;
   await redis.del(REDEMPTION_STREAM, DLQ, "redemption:scheduled");
 });
 
 afterEach(async () => {
+  setPayoutProvider(null);
   if (!available) return;
   await redis.del(REDEMPTION_STREAM, DLQ, "redemption:scheduled");
 });
@@ -95,7 +101,7 @@ async function readDlq(): Promise<Array<Record<string, string>>> {
 }
 
 describe.runIf(process.env.VITEST_SKIP_REDIS !== "1")("redemption worker (live Redis)", () => {
-  it("advances an APPROVED redemption to PROCESSING and acks the message", async () => {
+  it("carries an APPROVED redemption through the rail to PAID and acks the message", async () => {
     if (!available) return;
     const q = queue();
     const id = approved("red-advance-1");
@@ -104,7 +110,14 @@ describe.runIf(process.env.VITEST_SKIP_REDIS !== "1")("redemption worker (live R
     const outcomes = await processRedemptionBatch({ queue: q, blockMs: 0, reclaimIdleMs: 60_000 });
 
     expect(outcomes).toEqual(["advanced"]);
-    expect(getRedemptions()[0]?.status).toBe("PROCESSING");
+    const row = getRedemptions()[0]!;
+    expect(row.status).toBe("PAID");
+    expect(row.payoutProviderRef).toMatch(/^payout_/);
+    expect(row.paidAt).toBeTruthy();
+    // The rail was given the amount verbatim, as a string.
+    const snap = await payouts.retrievePayout(id);
+    expect(snap?.amount).toBe("150.0000");
+    expect(typeof snap?.amount).toBe("string");
     // Acked AND deleted: nothing is left pending for this group.
     const pending = (await redis.xpending(REDEMPTION_STREAM, REDEMPTION_GROUP)) as [number, ...unknown[]];
     expect(pending[0]).toBe(0);
@@ -122,7 +135,9 @@ describe.runIf(process.env.VITEST_SKIP_REDIS !== "1")("redemption worker (live R
     // Exactly one transition; the rest are idempotent no-ops rather than errors.
     expect(outcomes.filter((o) => o === "advanced")).toHaveLength(1);
     expect(outcomes.filter((o) => o === "skipped")).toHaveLength(2);
-    expect(getRedemptions()[0]?.status).toBe("PROCESSING");
+    expect(getRedemptions()[0]?.status).toBe("PAID");
+    // ONE payout, whatever the delivery count — the rail's idempotency contract holding.
+    expect(await payouts.retrievePayout(id)).not.toBeNull();
     // Nothing quarantined: a duplicate is normal traffic, not a fault.
     expect(await readDlq()).toHaveLength(0);
   });
@@ -141,10 +156,10 @@ describe.runIf(process.env.VITEST_SKIP_REDIS !== "1")("redemption worker (live R
 
     expect(results.filter((r) => r === "advanced")).toHaveLength(1);
     expect(results.filter((r) => r === "skipped")).toHaveLength(3);
-    expect(getRedemptions()[0]?.status).toBe("PROCESSING");
+    expect(getRedemptions()[0]?.status).toBe("PAID");
   });
 
-  it.each(["REQUESTED", "UNDER_REVIEW", "PROCESSING", "PAID", "REJECTED", "CANCELLED_BY_PLAYER"])(
+  it.each(["REQUESTED", "UNDER_REVIEW", "PAID", "REJECTED", "CANCELLED_BY_PLAYER"])(
     "leaves a %s redemption untouched (only APPROVED is actionable)",
     async (status) => {
       if (!available) return;
@@ -158,6 +173,142 @@ describe.runIf(process.env.VITEST_SKIP_REDIS !== "1")("redemption worker (live R
       expect(getRedemptions()[0]?.status).toBe(status);
     },
   );
+
+  it("RESUMES a PROCESSING redemption whose payout was never submitted", async () => {
+    if (!available) return;
+    const q = queue();
+    // The crash case: the claim committed, the submission did not. The rail has never heard of
+    // it, so the work must be finished rather than treated as someone else's in-flight job.
+    seedRedemption({
+      id: "red-resume-1",
+      userId: USER_ID,
+      playerId: PLAYER_ID,
+      amount: "200.0000",
+      status: "PROCESSING",
+      ledgerTransactionId: "ltx-red-resume-1",
+    });
+
+    await q.publish({ operatorTransactionId: "red-resume-1", reason: "reclaimed" });
+    const outcomes = await processRedemptionBatch({ queue: q, blockMs: 0, reclaimIdleMs: 60_000 });
+
+    expect(outcomes).toEqual(["advanced"]);
+    expect(getRedemptions()[0]?.status).toBe("PAID");
+  });
+
+  it("RESUMES a PROCESSING redemption by READING the rail, not by re-sending it", async () => {
+    if (!available) return;
+    const q = queue();
+    const id = "red-resume-2";
+    seedRedemption({
+      id,
+      userId: USER_ID,
+      playerId: PLAYER_ID,
+      amount: "75.0000",
+      status: "PROCESSING",
+      ledgerTransactionId: `ltx-${id}`,
+    });
+    // The payout already went out before we crashed.
+    await payouts.sendPayout({ redemptionId: id, playerRef: USER_ID, amount: "75.0000", currency: "USD" });
+    const before = await payouts.retrievePayout(id);
+
+    await q.publish({ operatorTransactionId: id, reason: "reclaimed" });
+    const outcomes = await processRedemptionBatch({ queue: q, blockMs: 0, reclaimIdleMs: 60_000 });
+
+    expect(outcomes).toEqual(["advanced"]);
+    expect(getRedemptions()[0]?.status).toBe("PAID");
+    // The SAME payout reference — no second payment was created.
+    expect((await payouts.retrievePayout(id))?.payoutRef).toBe(before?.payoutRef);
+  });
+
+  it("leaves a SUBMITTED (in-flight) payout at PROCESSING until the rail settles it", async () => {
+    if (!available) return;
+    const q = queue();
+    const id = approved("red-inflight-1");
+    payouts.holdAsSubmitted(id);
+
+    await q.publish({ operatorTransactionId: id, reason: "approved" });
+    expect(await processRedemptionBatch({ queue: q, blockMs: 0, reclaimIdleMs: 60_000 })).toEqual(["advanced"]);
+
+    // Money is in flight: recorded, but NOT marked paid.
+    let row = getRedemptions()[0]!;
+    expect(row.status).toBe("PROCESSING");
+    expect(row.payoutProviderRef).toMatch(/^payout_/);
+    expect(row.paidAt).toBeNull();
+
+    // The rail settles, a later event arrives, and only then is it PAID.
+    payouts.markPaid(id);
+    await q.publish({ operatorTransactionId: id, reason: "settlement-poll" });
+    expect(await processRedemptionBatch({ queue: q, blockMs: 0, reclaimIdleMs: 60_000 })).toEqual(["advanced"]);
+
+    row = getRedemptions()[0]!;
+    expect(row.status).toBe("PAID");
+    expect(row.paidAt).toBeTruthy();
+  });
+
+  it("TERMINAL rail refusal halts at PROCESSING and dead-letters — it never reads as REJECTED", async () => {
+    if (!available) return;
+    const q = queue();
+    const id = approved("red-terminal-1");
+    payouts.failNext(id, "ACCOUNT_CLOSED", false, "payee account is closed");
+
+    await q.publish({ operatorTransactionId: id, reason: "approved" });
+    const outcomes = await processRedemptionBatch({ queue: q, blockMs: 0, reclaimIdleMs: 60_000 });
+
+    expect(outcomes).toEqual(["abandoned"]);
+
+    const row = getRedemptions()[0]!;
+    // NOT rejected: the SC is already debited, and REJECTED would claim no money moved.
+    expect(row.status).toBe("PROCESSING");
+    expect(row.decisionReason).toContain("ACCOUNT_CLOSED");
+    expect(row.paidAt).toBeNull();
+
+    // And an operator is told, rather than the row quietly sitting there.
+    const dlq = await readDlq();
+    expect(dlq).toHaveLength(1);
+    expect(dlq[0]?.operatorTransactionId).toBe(id);
+  });
+
+  it("RETRYABLE rail failure backs off without paying, then succeeds on the next attempt", async () => {
+    if (!available) return;
+    const q = queue();
+    const id = approved("red-retry-1");
+    payouts.failNext(id, "RAIL_TIMEOUT", true, "gateway timeout");
+
+    await q.publish({ operatorTransactionId: id, reason: "approved" });
+    const first = await processRedemptionBatch({ queue: q, blockMs: 0, reclaimIdleMs: 60_000, maxDeliveries: 5 });
+
+    expect(first).toEqual(["stillFailing"]);
+    // Claimed but unpaid — and crucially NOT quarantined, because a timeout may yet succeed.
+    expect(getRedemptions()[0]?.status).toBe("PROCESSING");
+    expect(getRedemptions()[0]?.paidAt).toBeNull();
+    expect(await readDlq()).toHaveLength(0);
+
+    // The rail recovers; the re-attempt resumes the PROCESSING row and pays exactly once.
+    payouts.clearFault(id);
+    await q.publish({ operatorTransactionId: id, reason: "retry" });
+    const second = await processRedemptionBatch({ queue: q, blockMs: 0, reclaimIdleMs: 60_000, maxDeliveries: 5 });
+
+    expect(second).toEqual(["advanced"]);
+    expect(getRedemptions()[0]?.status).toBe("PAID");
+  });
+
+  it("RETRYABLE failure that never heals is dead-lettered once it blows its budget", async () => {
+    if (!available) return;
+    const q = queue();
+    const id = approved("red-retry-exhaust");
+    payouts.failNext(id, "RAIL_TIMEOUT", true, "gateway timeout");
+
+    await q.publish({ operatorTransactionId: id, reason: "approved" });
+    const [msg] = await q.pull(10, 0);
+    const final = await handleRedemptionMessage(q, { ...msg!, deliveryCount: 3 }, { maxDeliveries: 3 });
+
+    expect(final).toBe("abandoned");
+    const dlq = await readDlq();
+    expect(dlq).toHaveLength(1);
+    expect(dlq[0]?.error).toContain("poison message (3 deliveries)");
+    // Still unpaid, and still not pretending to be resolved.
+    expect(getRedemptions()[0]?.paidAt).toBeNull();
+  });
 
   it("POISON: a message naming no redemption is dead-lettered on first delivery", async () => {
     if (!available) return;
@@ -232,7 +383,7 @@ describe.runIf(process.env.VITEST_SKIP_REDIS !== "1")("redemption worker (live R
     // The peer reclaims anything idle and finishes the job.
     const outcomes = await processRedemptionBatch({ queue: peer, blockMs: 0, reclaimIdleMs: 0 });
     expect(outcomes).toEqual(["advanced"]);
-    expect(getRedemptions()[0]?.status).toBe("PROCESSING");
+    expect(getRedemptions()[0]?.status).toBe("PAID");
 
     const pending = (await redis.xpending(REDEMPTION_STREAM, REDEMPTION_GROUP)) as [number, ...unknown[]];
     expect(pending[0]).toBe(0);
@@ -262,8 +413,11 @@ describe.runIf(process.env.VITEST_SKIP_REDIS !== "1")("redemption worker (live R
     await processRedemptionBatch({ queue: q, blockMs: 0, reclaimIdleMs: 60_000 });
 
     const row = getRedemptions()[0]!;
-    // Byte-identical, still a string, and no balance field appeared.
+    expect(row.status).toBe("PAID");
+    // Byte-identical through the admin decision, the worker and the rail. Still a string, and
+    // no balance field appeared anywhere along the way.
     expect(row.amount).toBe("1234.5678");
+    expect((await payouts.retrievePayout(id))?.amount).toBe("1234.5678");
     expect(typeof row.amount).toBe("string");
     for (const key of Object.keys(row)) expect(key.toLowerCase()).not.toContain("balance");
   });

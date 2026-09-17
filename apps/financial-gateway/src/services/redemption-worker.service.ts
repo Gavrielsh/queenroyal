@@ -2,6 +2,7 @@ import { getEnv } from "../config/env";
 import { childLogger } from "../lib/logger";
 import { getPrisma } from "../lib/prisma";
 import type { ReconcileMessage, ReconcileQueue } from "../lib/reconcile-queue";
+import { getPayoutProvider, PayoutProviderError, type PayoutProvider } from "../lib/payouts";
 import { getRedemptionQueue, toRedemptionMessage } from "../lib/redemption-queue";
 
 /**
@@ -17,11 +18,18 @@ import { getRedemptionQueue, toRedemptionMessage } from "../lib/redemption-queue
  * opaque decimal string it has been since B1 and is never summed, compared or converted here.
  * The SC was already debited in Zone 1 at request time; what remains is orchestration.
  *
- * WHAT IT ADVANCES, AND WHAT IT DOES NOT
- *   APPROVED → PROCESSING is the only transition it makes. Handing the request to a payout
- *   rail, and PROCESSING → PAID, belong to the PayoutProvider that is not built yet — and
- *   wiring a half-present rail in here would mean a worker that looks like it pays people.
- *   Every other status is a no-op, which is exactly what makes redelivery safe.
+ * WHAT IT ADVANCES
+ *   APPROVED → PROCESSING (a compare-and-set claim), then the payout rail, then
+ *   PROCESSING → PAID once the rail settles. Every other status is a no-op, which is exactly
+ *   what makes redelivery safe.
+ *
+ * WHY A TERMINAL PAYOUT FAILURE DOES NOT BECOME "REJECTED"
+ *   By the time the rail is called, the SC has ALREADY been debited in Zone 1. REJECTED means
+ *   "refused by review", and a refused review implies no money moved — writing it after a
+ *   debit would be a lie in the one record an auditor reads. So a terminal rail failure leaves
+ *   the row at PROCESSING, records why, and dead-letters the message for an operator. The row
+ *   is genuinely stuck, and saying so is the honest state; making it look resolved is not.
+ *   Restoring the player's SC needs a compensating credit in Zone 1, which does not exist yet.
  */
 
 export type RedemptionDisposition = "advanced" | "skipped" | "stillFailing" | "abandoned";
@@ -55,8 +63,12 @@ export class UnknownRedemptionError extends Error {
  * delivery, a reclaimed in-flight message and a genuinely concurrent peer all produce the same
  * outcome: the row advances at most once.
  */
-export async function advanceRedemption(redemptionId: string): Promise<RedemptionDisposition> {
-  const row = await getPrisma().redemptionRequest.findUnique({ where: { id: redemptionId } });
+export async function advanceRedemption(
+  redemptionId: string,
+  provider: PayoutProvider = getPayoutProvider(),
+): Promise<RedemptionDisposition> {
+  const prisma = getPrisma();
+  const row = await prisma.redemptionRequest.findUnique({ where: { id: redemptionId } });
   if (!row) {
     // Not retryable: no amount of waiting makes a row appear. Poison.
     throw new UnknownRedemptionError(redemptionId);
@@ -69,14 +81,20 @@ export async function advanceRedemption(redemptionId: string): Promise<Redemptio
     status: row.status,
   });
 
+  // A redelivery of work already in flight at the rail is resumed, not restarted — that is
+  // what makes a crash between "submitted" and "recorded" recoverable.
+  if (row.status === "PROCESSING") {
+    return resolveInFlightPayout(redemptionId, row, provider, rowLog);
+  }
+
   if (row.status !== "APPROVED") {
-    // Already advanced, still awaiting review, or terminal. Nothing to do, and saying so is
-    // not a failure — it is the idempotent answer.
+    // Still awaiting review, or terminal. Nothing to do, and saying so is not a failure — it is
+    // the idempotent answer.
     rowLog.debug("redemption not actionable; skipping");
     return "skipped";
   }
 
-  const claimed = await getPrisma().redemptionRequest.updateMany({
+  const claimed = await prisma.redemptionRequest.updateMany({
     where: { id: redemptionId, status: "APPROVED" },
     data: { status: "PROCESSING", statusChangedAt: new Date() },
   });
@@ -87,7 +105,125 @@ export async function advanceRedemption(redemptionId: string): Promise<Redemptio
     return "skipped";
   }
 
-  rowLog.info("redemption advanced to PROCESSING");
+  rowLog.info("redemption claimed for payout (PROCESSING)");
+  return dispatchPayout(redemptionId, row, provider, rowLog);
+}
+
+/**
+ * Submit the payout and record its outcome.
+ *
+ * The amount travels from the row to the rail as the SAME decimal string it was debited as —
+ * never parsed, never reformatted, never summed. There is no arithmetic anywhere in this path.
+ */
+async function dispatchPayout(
+  redemptionId: string,
+  row: { playerId: string; userId: string; amount: string },
+  provider: PayoutProvider,
+  rowLog: ReturnType<typeof childLogger>,
+): Promise<RedemptionDisposition> {
+  let result;
+  try {
+    result = await provider.sendPayout({
+      redemptionId,
+      playerRef: row.userId,
+      amount: row.amount,
+      currency: "USD",
+      metadata: { player_id: row.playerId },
+    });
+  } catch (err) {
+    if (err instanceof PayoutProviderError && !err.retryable) {
+      // A definite NO from the rail. Halt: the row stays PROCESSING (the SC is already debited
+      // and the player has not been paid), the reason is recorded, and the message is
+      // dead-lettered for an operator. See the note at the top of this file.
+      await getPrisma().redemptionRequest.updateMany({
+        where: { id: redemptionId, status: "PROCESSING" },
+        data: { decisionReason: `payout rail refused: ${err.code}: ${err.message}` },
+      });
+      rowLog.fatal(
+        { alert: "payout_terminal_failure", err_code: err.code },
+        "CRITICAL: payout refused terminally; SC is debited and the player is unpaid — needs an operator",
+      );
+      return "abandoned";
+    }
+    // Retryable, or an unexpected error: rethrow so the message handler backs off and, past its
+    // budget, dead-letters it. We do NOT flip the row — the rail may have accepted the payout
+    // without us seeing the response, and the next attempt resumes via resolveInFlightPayout.
+    throw err;
+  }
+
+  return recordPayoutResult(redemptionId, result, rowLog);
+}
+
+/**
+ * Resume a redemption already at PROCESSING.
+ *
+ * ASKS THE RAIL BEFORE SENDING. The rail is idempotent on redemptionId, so a second send would
+ * be safe — but reading first is cheaper, and more importantly it resolves the case this branch
+ * exists for: we crashed after submitting and before recording, so the money may already be in
+ * flight. Re-sending blind would be safe; reporting "submitted" for a payout that already
+ * settled would not be.
+ */
+async function resolveInFlightPayout(
+  redemptionId: string,
+  row: { playerId: string; userId: string; amount: string },
+  provider: PayoutProvider,
+  rowLog: ReturnType<typeof childLogger>,
+): Promise<RedemptionDisposition> {
+  const snapshot = await provider.retrievePayout(redemptionId);
+  if (!snapshot) {
+    // The rail has never seen it: the claim committed but the submission did not. Send it.
+    rowLog.info("redemption was claimed but never submitted; dispatching now");
+    return dispatchPayout(redemptionId, row, provider, rowLog);
+  }
+  return recordPayoutResult(redemptionId, snapshot, rowLog);
+}
+
+/** Write the rail's answer onto the row. Guarded on PROCESSING so it can never resurrect. */
+async function recordPayoutResult(
+  redemptionId: string,
+  result: { payoutRef: string; status: string; failureReason?: string },
+  rowLog: ReturnType<typeof childLogger>,
+): Promise<RedemptionDisposition> {
+  const prisma = getPrisma();
+
+  if (result.status === "paid") {
+    const settled = await prisma.redemptionRequest.updateMany({
+      where: { id: redemptionId, status: "PROCESSING" },
+      data: {
+        status: "PAID",
+        statusChangedAt: new Date(),
+        paidAt: new Date(),
+        payoutProviderRef: result.payoutRef,
+      },
+    });
+    if (settled.count !== 1) {
+      // Someone else recorded it first. Idempotent, not an error.
+      rowLog.debug({ payout_ref: result.payoutRef }, "payout already recorded by a peer");
+      return "skipped";
+    }
+    rowLog.info({ payout_ref: result.payoutRef }, "redemption PAID");
+    return "advanced";
+  }
+
+  if (result.status === "failed") {
+    await prisma.redemptionRequest.updateMany({
+      where: { id: redemptionId, status: "PROCESSING" },
+      data: { decisionReason: `payout rail failed: ${result.failureReason ?? "unspecified"}` },
+    });
+    rowLog.fatal(
+      { alert: "payout_terminal_failure", payout_ref: result.payoutRef },
+      "CRITICAL: payout failed at the rail; SC is debited and the player is unpaid — needs an operator",
+    );
+    return "abandoned";
+  }
+
+  // submitted — in flight. Record the reference so a later attempt resolves rather than
+  // re-sends, and leave the row at PROCESSING.
+  await prisma.redemptionRequest.updateMany({
+    where: { id: redemptionId, status: "PROCESSING" },
+    data: { payoutProviderRef: result.payoutRef },
+  });
+  rowLog.info({ payout_ref: result.payoutRef }, "payout submitted; awaiting settlement");
   return "advanced";
 }
 
@@ -120,6 +256,11 @@ export async function handleRedemptionMessage(
 
   try {
     const disposition = await advanceRedemption(msg.redemptionId);
+    if (disposition === "abandoned") {
+      // A terminal payout failure. Quarantined so an operator sees it, never silently acked.
+      await queue.deadLetter(raw, `payout halted for redemption ${msg.redemptionId}`);
+      return disposition;
+    }
     await queue.ack(raw);
     return disposition;
   } catch (err) {

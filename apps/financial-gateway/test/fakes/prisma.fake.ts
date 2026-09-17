@@ -343,10 +343,19 @@ export function getRedemptions(): AnyRow[] {
 /** Seed a prior redemption so the period-cap sums have something to count. */
 export function seedRedemption(row: AnyRow): void {
   const now = new Date();
+  // Every nullable column defaults to null, as Prisma returns them — so a test asserting
+  // `paidAt` is null is asserting the same thing it would against a real database, not the
+  // absence of a key in a fixture.
   const full: AnyRow = {
     id: row.id ?? randomUUID(),
     status: "REQUESTED",
     ledgerTransactionId: null,
+    reviewedBy: null,
+    reviewedAt: null,
+    decisionReason: null,
+    payoutProviderRef: null,
+    paidAt: null,
+    cancelledAt: null,
     createdAt: now,
     updatedAt: now,
     statusChangedAt: now,
