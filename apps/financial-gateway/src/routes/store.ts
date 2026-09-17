@@ -1,10 +1,13 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 
 import { requireAuth, UnauthorizedError } from "../lib/auth";
+import { resolveJurisdiction } from "../lib/geo";
 import { requirePermittedJurisdiction } from "../lib/geo-hook";
 import type { AuthClaims } from "../lib/jwt";
 import { errBody, okBody } from "../lib/reply";
+import { redeemSchema } from "../schemas/redeem.schema";
 import { mockConfirmSchema, purchaseSchema } from "../schemas/store.schema";
+import { requestRedemption } from "../services/redemption.service";
 import { confirmMockDeposit, purchasePackage } from "../services/store.service";
 
 /** Per-request authenticated claims, populated by the auth preHandler BEFORE the controller. */
@@ -30,6 +33,13 @@ export const storeRoutes: FastifyPluginAsync = async (app) => {
     "/api/store/purchase",
     { preHandler: [requirePermittedJurisdiction, requireAuthPreHandler] },
     purchaseHandler,
+  );
+  // Money OUT. Same two preHandlers, same order, and for the same reason: a player in a
+  // prohibited state must not be able to move money in either direction.
+  app.post(
+    "/api/store/redeem",
+    { preHandler: [requirePermittedJurisdiction, requireAuthPreHandler] },
+    redeemHandler,
   );
   // DEV-ONLY: stands in for the Stripe.js card confirmation + `succeeded` webhook when the
   // mock PSP is active. Responds 409 MOCK_PSP_ONLY under a real provider (see the service).
@@ -70,6 +80,47 @@ async function purchaseHandler(req: FastifyRequest, reply: FastifyReply): Promis
     await reply.code(200).send(okBody(outcome.data));
   } catch (err) {
     req.log.error({ err, user_id: user.sub }, "unexpected error processing purchase");
+    await reply.code(500).send(errBody("INTERNAL_ERROR", "Unexpected server error"));
+  }
+}
+
+/**
+ * POST /api/store/redeem — request a prize payout.
+ *
+ * Structurally identical to purchaseHandler: authenticate, validate with Zod, delegate, map
+ * the service's typed outcome onto a status code. The handler contains no policy of its own —
+ * every rule lives in lib/redemption-policy, which is the only place it can be audited.
+ */
+async function redeemHandler(req: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const user = req.authClaims;
+  if (!user) {
+    await reply.code(401).send(errBody("UNAUTHORIZED", "Authentication required"));
+    return;
+  }
+
+  const parsed = redeemSchema.safeParse(req.body);
+  if (!parsed.success) {
+    // A native JSON number for `amount` lands here, before the service and long before the
+    // ledger: z.string() refuses it on type.
+    await reply.code(422).send(errBody("VALIDATION_ERROR", "Invalid redemption payload", parsed.error.flatten()));
+    return;
+  }
+
+  try {
+    const outcome = await requestRedemption(user, parsed.data, {
+      traceId: req.id,
+      jurisdiction: resolveJurisdiction((name) => {
+        const v = req.headers[name];
+        return Array.isArray(v) ? v[0] : v;
+      }),
+    });
+    if (!outcome.ok) {
+      await reply.code(outcome.status).send(errBody(outcome.error.code, outcome.error.message, outcome.error.details));
+      return;
+    }
+    await reply.code(200).send(okBody(outcome.data));
+  } catch (err) {
+    req.log.error({ err, user_id: user.sub }, "unexpected error processing redemption");
     await reply.code(500).send(errBody("INTERNAL_ERROR", "Unexpected server error"));
   }
 }

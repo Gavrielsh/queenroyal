@@ -34,6 +34,7 @@ type RawQuery = TemplateStringsArray | { strings?: unknown; values?: unknown } |
 
 const users = new Map<string, AnyRow>();
 const journal = new Map<string, AnyRow>(); // keyed by id
+const redemptions = new Map<string, AnyRow>(); // keyed by id
 
 /**
  * Apply a Prisma-style `data` patch onto a row, honoring atomic numeric ops
@@ -228,6 +229,50 @@ export const prismaFake = {
     },
   },
 
+  redemptionRequest: {
+    create: async ({ data }: QueryArgs) => {
+      const now = new Date();
+      const row: AnyRow = {
+        id: randomUUID(),
+        ledgerTransactionId: null,
+        statusChangedAt: now,
+        reviewedBy: null,
+        reviewedAt: null,
+        decisionReason: null,
+        payoutProviderRef: null,
+        paidAt: null,
+        cancelledAt: null,
+        createdAt: now,
+        updatedAt: now,
+        ...data,
+      };
+      redemptions.set(row.id, row);
+      return { ...row };
+    },
+    update: async ({ where, data }: QueryArgs) => {
+      const row = redemptions.get(where.id);
+      if (!row) throw new Error("redemptionRequest row not found");
+      applyData(row, data);
+      row.updatedAt = new Date();
+      return { ...row };
+    },
+    findMany: async ({ where, select }: QueryArgs) => {
+      const rows = [...redemptions.values()].filter((r) => {
+        if (!where) return true;
+        if (where.playerId !== undefined && r.playerId !== where.playerId) return false;
+        if (where.status?.in && !where.status.in.includes(r.status)) return false;
+        if (where.createdAt?.gte && r.createdAt < where.createdAt.gte) return false;
+        return true;
+      });
+      if (!select) return rows.map((r) => ({ ...r }));
+      return rows.map((r) => {
+        const out: AnyRow = {};
+        for (const k of Object.keys(select)) if (select[k]) out[k] = r[k];
+        return out;
+      });
+    },
+  },
+
   // Interactive transaction: the fake has no real isolation, so it simply runs the callback
   // against itself (ignoring the isolation/timeout options). `txClient()` is referenced (not
   // `prismaFake` directly) to avoid a self-referential-initializer type cycle.
@@ -270,6 +315,27 @@ function txClient(): unknown {
 export function resetDb(): void {
   users.clear();
   journal.clear();
+  redemptions.clear();
+}
+
+/** Every redemption row, newest last. Lets a test assert the orchestration row's lifecycle. */
+export function getRedemptions(): AnyRow[] {
+  return [...redemptions.values()].map((r) => ({ ...r }));
+}
+
+/** Seed a prior redemption so the period-cap sums have something to count. */
+export function seedRedemption(row: AnyRow): void {
+  const now = new Date();
+  const full: AnyRow = {
+    id: row.id ?? randomUUID(),
+    status: "REQUESTED",
+    ledgerTransactionId: null,
+    createdAt: now,
+    updatedAt: now,
+    statusChangedAt: now,
+    ...row,
+  };
+  redemptions.set(full.id, full);
 }
 
 export function seedUser(u: {
