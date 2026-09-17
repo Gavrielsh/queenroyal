@@ -11,9 +11,10 @@ import { buildApp } from "../src/app";
 import { resetEnvCacheForTests } from "../src/config/env";
 import { signAdminToken } from "../src/lib/jwt";
 import { MockPayoutProvider, setPayoutProvider } from "../src/lib/payouts";
-import { DLQ } from "../src/lib/reconcile-queue";
-import { REDEMPTION_STREAM, RedisStreamRedemptionQueue, setRedemptionQueue } from "../src/lib/redemption-queue";
+import { setRedemptionQueue } from "../src/lib/redemption-queue";
+import { RedisStreamQueue } from "../src/lib/reconcile-queue";
 import { processRedemptionBatch } from "../src/services/redemption-worker.service";
+import { testStreamKeys } from "./fakes/redis-keys";
 import { getRedemptions, resetDb, seedRedemption } from "./fakes/prisma.fake";
 
 /**
@@ -25,6 +26,9 @@ import { getRedemptions, resetDb, seedRedemption } from "./fakes/prisma.fake";
  * meet, and a fake queue shared between them would prove only that two mocks agree.
  */
 
+/** This file's private keyspace — see testStreamKeys. */
+const KEYS = testStreamKeys("approval");
+
 const ADMIN_SECRET = "test-admin-jwt-secret-0123456789";
 const ADMIN_SUB = "operator-jane";
 const REDIS_URL = process.env.REDIS_TEST_URL ?? "redis://127.0.0.1:6380";
@@ -35,7 +39,7 @@ let app: FastifyInstance;
 let redis: Redis;
 let available = false;
 let payouts: MockPayoutProvider;
-let queue: RedisStreamRedemptionQueue;
+let queue: RedisStreamQueue;
 
 beforeAll(async () => {
   process.env.ADMIN_JWT_SECRET = ADMIN_SECRET;
@@ -70,8 +74,8 @@ beforeEach(async () => {
   payouts = new MockPayoutProvider();
   setPayoutProvider(payouts);
   if (!available) return;
-  await redis.del(REDEMPTION_STREAM, DLQ, "redemption:scheduled");
-  queue = new RedisStreamRedemptionQueue(redis, "approval-test");
+  await redis.del(KEYS.stream, KEYS.dlq, KEYS.schedule);
+  queue = new RedisStreamQueue(redis, "approval-test", KEYS);
   setRedemptionQueue(queue);
 });
 
@@ -79,7 +83,7 @@ afterEach(async () => {
   setRedemptionQueue(null);
   setPayoutProvider(null);
   if (!available) return;
-  await redis.del(REDEMPTION_STREAM, DLQ, "redemption:scheduled");
+  await redis.del(KEYS.stream, KEYS.dlq, KEYS.schedule);
 });
 
 const bearer = () => ({ authorization: `Bearer ${signAdminToken({ sub: ADMIN_SUB })}` });
@@ -114,7 +118,7 @@ describe("admin redemption review — auth boundary", () => {
 
     expect(res.statusCode).toBe(401);
     expect(getRedemptions()[0]?.status).toBe("UNDER_REVIEW");
-    expect(await redis.exists(REDEMPTION_STREAM)).toBe(0);
+    expect(await redis.exists(KEYS.stream)).toBe(0);
   });
 
   it("→ 403 for a cryptographically valid token WITHOUT the admin role", async () => {
@@ -150,7 +154,7 @@ describe("POST /approve — the producer", () => {
     expect(row.decisionReason).toBe("KYC cleared, AML check passed");
 
     // The message is really on the stream — not merely "the service was called".
-    const entries = (await redis.xrange(REDEMPTION_STREAM, "-", "+")) as Array<[string, string[]]>;
+    const entries = (await redis.xrange(KEYS.stream, "-", "+")) as Array<[string, string[]]>;
     expect(entries).toHaveLength(1);
     expect(entries[0]![1]).toContain(id);
   });
@@ -184,7 +188,7 @@ describe("POST /approve — the producer", () => {
     expect(codes).toEqual([200, 409]);
 
     // And exactly one payout event, so the worker cannot pay twice.
-    const entries = (await redis.xrange(REDEMPTION_STREAM, "-", "+")) as Array<[string, string[]]>;
+    const entries = (await redis.xrange(KEYS.stream, "-", "+")) as Array<[string, string[]]>;
     expect(entries).toHaveLength(1);
   });
 
@@ -198,7 +202,7 @@ describe("POST /approve — the producer", () => {
       expect(res.statusCode).toBe(409);
       expect(res.json().error.code).toBe("NOT_REVIEWABLE");
       expect(getRedemptions()[0]?.status).toBe(status);
-      expect(await redis.exists(REDEMPTION_STREAM)).toBe(0);
+      expect(await redis.exists(KEYS.stream)).toBe(0);
     },
   );
 
@@ -249,7 +253,7 @@ describe("POST /reject", () => {
     expect(row.reviewedAt).toBeTruthy();
 
     // No payout to make, so no event: the worker must never see a rejected redemption.
-    expect(await redis.exists(REDEMPTION_STREAM)).toBe(0);
+    expect(await redis.exists(KEYS.stream)).toBe(0);
   });
 
   it.each([
@@ -291,7 +295,7 @@ describe("approval → payout failure routing", () => {
     expect(row.decisionReason).toContain("PAYEE_BLOCKED");
     expect(row.reviewedBy).toBe(ADMIN_SUB);
 
-    const dlq = (await redis.xrange(DLQ, "-", "+")) as Array<[string, string[]]>;
+    const dlq = (await redis.xrange(KEYS.dlq, "-", "+")) as Array<[string, string[]]>;
     expect(dlq).toHaveLength(1);
   });
 
@@ -305,6 +309,6 @@ describe("approval → payout failure routing", () => {
 
     expect(outcomes).toEqual(["stillFailing"]);
     expect(getRedemptions()[0]?.paidAt).toBeNull();
-    expect(await redis.exists(DLQ)).toBe(0);
+    expect(await redis.exists(KEYS.dlq)).toBe(0);
   });
 });

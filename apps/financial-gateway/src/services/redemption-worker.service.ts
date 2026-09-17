@@ -4,6 +4,7 @@ import { getPrisma } from "../lib/prisma";
 import type { ReconcileMessage, ReconcileQueue } from "../lib/reconcile-queue";
 import { getPayoutProvider, PayoutProviderError, type PayoutProvider } from "../lib/payouts";
 import { getRedemptionQueue, toRedemptionMessage } from "../lib/redemption-queue";
+import { refundRedemption } from "./redemption-refund.service";
 
 /**
  * The redemption payout pipeline's consumer — a STATE MACHINE DRIVER and nothing more.
@@ -23,13 +24,16 @@ import { getRedemptionQueue, toRedemptionMessage } from "../lib/redemption-queue
  *   PROCESSING → PAID once the rail settles. Every other status is a no-op, which is exactly
  *   what makes redelivery safe.
  *
- * WHY A TERMINAL PAYOUT FAILURE DOES NOT BECOME "REJECTED"
- *   By the time the rail is called, the SC has ALREADY been debited in Zone 1. REJECTED means
- *   "refused by review", and a refused review implies no money moved — writing it after a
- *   debit would be a lie in the one record an auditor reads. So a terminal rail failure leaves
- *   the row at PROCESSING, records why, and dead-letters the message for an operator. The row
- *   is genuinely stuck, and saying so is the honest state; making it look resolved is not.
- *   Restoring the player's SC needs a compensating credit in Zone 1, which does not exist yet.
+ * A TERMINAL PAYOUT FAILURE REFUNDS, AND STILL DOES NOT BECOME "REJECTED"
+ *   By the time the rail is called the SC has ALREADY been debited in Zone 1. The player is
+ *   now owed it back, so the compensating credit runs — the same one the admin reject route
+ *   uses, on the same derived anchor, so the two paths cannot double-credit each other.
+ *
+ *   The status still does not become REJECTED. REJECTED means "refused by review", and a
+ *   refused review implies no money moved; writing it after a debit would be a lie in the one
+ *   record an auditor reads. The row stays at PROCESSING with the reason recorded and the
+ *   message dead-lettered, because a payout that was attempted and failed is a thing an
+ *   operator needs to see even once the player has been made whole.
  */
 
 export type RedemptionDisposition = "advanced" | "skipped" | "stillFailing" | "abandoned";
@@ -132,17 +136,24 @@ async function dispatchPayout(
     });
   } catch (err) {
     if (err instanceof PayoutProviderError && !err.retryable) {
-      // A definite NO from the rail. Halt: the row stays PROCESSING (the SC is already debited
-      // and the player has not been paid), the reason is recorded, and the message is
-      // dead-lettered for an operator. See the note at the top of this file.
+      // A definite NO from the rail. Halt, record why, give the money back, and dead-letter
+      // the message so an operator still sees that a payout was attempted and failed.
       await getPrisma().redemptionRequest.updateMany({
         where: { id: redemptionId, status: "PROCESSING" },
         data: { decisionReason: `payout rail refused: ${err.code}: ${err.message}` },
       });
-      rowLog.fatal(
-        { alert: "payout_terminal_failure", err_code: err.code },
-        "CRITICAL: payout refused terminally; SC is debited and the player is unpaid — needs an operator",
-      );
+      const refund = await refundRedemption(redemptionId, `payout rail refused: ${err.code}`);
+      if (!refund.ok) {
+        rowLog.fatal(
+          { alert: "payout_terminal_failure_unrefunded", err_code: err.code, refund_error: refund.error },
+          "CRITICAL: payout refused AND the refund did not land — the player is debited and unpaid",
+        );
+      } else {
+        rowLog.error(
+          { alert: "payout_terminal_failure", err_code: err.code, refund_ledger_tx: refund.ledgerTransactionId },
+          "payout refused terminally; the SC has been refunded to the player",
+        );
+      }
       return "abandoned";
     }
     // Retryable, or an unexpected error: rethrow so the message handler backs off and, past its
@@ -210,10 +221,18 @@ async function recordPayoutResult(
       where: { id: redemptionId, status: "PROCESSING" },
       data: { decisionReason: `payout rail failed: ${result.failureReason ?? "unspecified"}` },
     });
-    rowLog.fatal(
-      { alert: "payout_terminal_failure", payout_ref: result.payoutRef },
-      "CRITICAL: payout failed at the rail; SC is debited and the player is unpaid — needs an operator",
-    );
+    const refund = await refundRedemption(redemptionId, `payout rail failed: ${result.failureReason ?? "unspecified"}`);
+    if (!refund.ok) {
+      rowLog.fatal(
+        { alert: "payout_terminal_failure_unrefunded", payout_ref: result.payoutRef, refund_error: refund.error },
+        "CRITICAL: payout failed AND the refund did not land — the player is debited and unpaid",
+      );
+    } else {
+      rowLog.error(
+        { alert: "payout_terminal_failure", payout_ref: result.payoutRef, refund_ledger_tx: refund.ledgerTransactionId },
+        "payout failed at the rail; the SC has been refunded to the player",
+      );
+    }
     return "abandoned";
   }
 

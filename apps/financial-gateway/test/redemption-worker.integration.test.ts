@@ -7,13 +7,14 @@ vi.mock("../src/lib/prisma", async () => {
 });
 
 import { MockPayoutProvider, setPayoutProvider } from "../src/lib/payouts";
-import { DLQ } from "../src/lib/reconcile-queue";
-import { REDEMPTION_GROUP, REDEMPTION_STREAM, RedisStreamRedemptionQueue } from "../src/lib/redemption-queue";
+import { RECONCILE_KEYS, RedisStreamQueue } from "../src/lib/reconcile-queue";
+import { REDEMPTION_KEYS, REDEMPTION_STREAM } from "../src/lib/redemption-queue";
 import {
   advanceRedemption,
   handleRedemptionMessage,
   processRedemptionBatch,
 } from "../src/services/redemption-worker.service";
+import { testStreamKeys } from "./fakes/redis-keys";
 import { getRedemptions, resetDb, seedRedemption } from "./fakes/prisma.fake";
 
 /**
@@ -28,6 +29,9 @@ import { getRedemptions, resetDb, seedRedemption } from "./fakes/prisma.fake";
  * Skips (rather than fails) when no REDIS_TEST_URL is configured, so the unit suite stays
  * runnable anywhere; CI sets it.
  */
+
+/** This file's private keyspace — see testStreamKeys. */
+const KEYS = testStreamKeys("worker");
 
 const REDIS_URL = process.env.REDIS_TEST_URL ?? "redis://127.0.0.1:6380";
 const PLAYER_ID = "engine-player-worker";
@@ -64,17 +68,17 @@ beforeEach(async () => {
   payouts = new MockPayoutProvider();
   setPayoutProvider(payouts);
   if (!available) return;
-  await redis.del(REDEMPTION_STREAM, DLQ, "redemption:scheduled");
+  await redis.del(KEYS.stream, KEYS.dlq, KEYS.schedule);
 });
 
 afterEach(async () => {
   setPayoutProvider(null);
   if (!available) return;
-  await redis.del(REDEMPTION_STREAM, DLQ, "redemption:scheduled");
+  await redis.del(KEYS.stream, KEYS.dlq, KEYS.schedule);
 });
 
 function queue(consumer = "worker-a") {
-  return new RedisStreamRedemptionQueue(redis, consumer);
+  return new RedisStreamQueue(redis, consumer, KEYS);
 }
 
 /** An APPROVED redemption, ready for the worker to advance. */
@@ -92,7 +96,7 @@ function approved(id: string, amount = "150.0000") {
 
 /** Read the DLQ stream as objects. */
 async function readDlq(): Promise<Array<Record<string, string>>> {
-  const entries = (await redis.xrange(DLQ, "-", "+")) as Array<[string, string[]]>;
+  const entries = (await redis.xrange(KEYS.dlq, "-", "+")) as Array<[string, string[]]>;
   return entries.map(([, fields]) => {
     const out: Record<string, string> = {};
     for (let i = 0; i + 1 < fields.length; i += 2) out[fields[i]!] = fields[i + 1]!;
@@ -119,7 +123,7 @@ describe.runIf(process.env.VITEST_SKIP_REDIS !== "1")("redemption worker (live R
     expect(snap?.amount).toBe("150.0000");
     expect(typeof snap?.amount).toBe("string");
     // Acked AND deleted: nothing is left pending for this group.
-    const pending = (await redis.xpending(REDEMPTION_STREAM, REDEMPTION_GROUP)) as [number, ...unknown[]];
+    const pending = (await redis.xpending(KEYS.stream, KEYS.group)) as [number, ...unknown[]];
     expect(pending[0]).toBe(0);
   });
 
@@ -326,7 +330,7 @@ describe.runIf(process.env.VITEST_SKIP_REDIS !== "1")("redemption worker (live R
     expect(dlq[0]?.deadLetteredAt).toBeTruthy();
 
     // Quarantined, not merely dropped: it is off the stream AND recorded.
-    const pending = (await redis.xpending(REDEMPTION_STREAM, REDEMPTION_GROUP)) as [number, ...unknown[]];
+    const pending = (await redis.xpending(KEYS.stream, KEYS.group)) as [number, ...unknown[]];
     expect(pending[0]).toBe(0);
   });
 
@@ -385,23 +389,35 @@ describe.runIf(process.env.VITEST_SKIP_REDIS !== "1")("redemption worker (live R
     expect(outcomes).toEqual(["advanced"]);
     expect(getRedemptions()[0]?.status).toBe("PAID");
 
-    const pending = (await redis.xpending(REDEMPTION_STREAM, REDEMPTION_GROUP)) as [number, ...unknown[]];
+    const pending = (await redis.xpending(KEYS.stream, KEYS.group)) as [number, ...unknown[]];
     expect(pending[0]).toBe(0);
   });
 
-  it("uses its OWN stream, and shares the DLQ so operators have one place to look", async () => {
+  it("publishes to its own configured stream and quarantines to its own configured DLQ", async () => {
     if (!available) return;
     const q = queue();
     await q.publish({ operatorTransactionId: "red-keys-1", reason: "approved" });
 
-    // The event is on the redemption stream, not the reconcile one.
-    expect(await redis.exists(REDEMPTION_STREAM)).toBe(1);
+    // This suite runs on a private keyspace (see testStreamKeys), so what it can
+    // prove is that the queue honours the keys it was GIVEN — publishing to the
+    // configured stream and nowhere else.
+    expect(await redis.exists(KEYS.stream)).toBe(1);
     expect(await redis.exists("reconcile:events")).toBe(0);
+    expect(await redis.exists(REDEMPTION_STREAM)).toBe(0);
 
-    // And its quarantine lands on the shared DLQ the admin surface already watches.
     await processRedemptionBatch({ queue: q, blockMs: 0, reclaimIdleMs: 60_000 });
-    const dlq = await readDlq();
-    expect(dlq).toHaveLength(1);
+    expect(await readDlq()).toHaveLength(1);
+  });
+
+  it("is CONFIGURED with its own stream and the shared DLQ", () => {
+    // The production key set, asserted directly rather than inferred from a test
+    // keyspace: a separate stream and group so one queue's backlog is never the
+    // other's latency, and the SAME DLQ as reconcile so an operator has one place
+    // to look for stuck work.
+    expect(REDEMPTION_KEYS.stream).toBe(REDEMPTION_STREAM);
+    expect(REDEMPTION_KEYS.stream).not.toBe(RECONCILE_KEYS.stream);
+    expect(REDEMPTION_KEYS.group).not.toBe(RECONCILE_KEYS.group);
+    expect(REDEMPTION_KEYS.dlq).toBe(RECONCILE_KEYS.dlq);
   });
 
   it("never touches money: the amount is carried untouched across the transition", async () => {

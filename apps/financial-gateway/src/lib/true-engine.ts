@@ -9,6 +9,7 @@ import type {
   EngineTxResult,
   PurchasePayload,
   RedeemPayload,
+  RedemptionRefundPayload,
   RollbackPayload,
   SessionBalancesResult,
   SessionPayload,
@@ -43,6 +44,7 @@ const ENGINE_ENDPOINTS = {
   rollback: "/api/v1/rollback",
   purchase: "/api/v1/store/purchase",
   redeem: "/api/v1/store/redeem",
+  redemptionRefund: "/api/v1/store/redeem/refund",
   createPlayer: "/api/v1/player/create",
   session: "/api/v1/session",
 } as const;
@@ -106,6 +108,18 @@ export class TrueEngineClient {
    */
   sendRedeem(payload: RedeemPayload): Promise<TrueEngineResult<EngineTxResult>> {
     return this.postTx<EngineTxResult>(ENGINE_ENDPOINTS.redeem, payload);
+  }
+
+  /**
+   * Return SC_REDEEMABLE a redemption debited but never paid out.
+   *
+   * Through `postTx` like every other ledger call, so the zero-trust contract is inherited
+   * whole. Safe to retry: the engine de-duplicates on operator_transaction_id, and the caller
+   * derives that anchor from the redemption id so a retried rejection and a redelivered worker
+   * message collapse onto the SAME refund rather than crediting twice.
+   */
+  sendRedemptionRefund(payload: RedemptionRefundPayload): Promise<TrueEngineResult<EngineTxResult>> {
+    return this.postTx<EngineTxResult>(ENGINE_ENDPOINTS.redemptionRefund, payload);
   }
 
   /** Reverse a previously-committed BET by its ledger transaction id. */

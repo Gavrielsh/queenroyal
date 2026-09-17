@@ -114,6 +114,22 @@ export interface RedeemPayload {
   metadata?: EngineMetadata;
 }
 
+/**
+ * POST /api/v1/store/redeem/refund — return SC_REDEEMABLE a redemption debited
+ * but never paid out.
+ *
+ * `amount` MUST be exactly what the redemption debited. The engine credits what it is told and
+ * cannot look the original up, so the gateway forwards its STORED decimal string verbatim —
+ * never a recomputed one, and never a value that has been through a JS number.
+ */
+export interface RedemptionRefundPayload {
+  operator_transaction_id: string; // deterministic anchor, derived from the redemption id
+  player_id: string;
+  amount: string; // decimal string, > 0 — exactly the debited figure
+  reference_transaction_id?: string; // the redemption's ledger transaction id
+  metadata?: EngineMetadata;
+}
+
 /** POST /api/v1/rollback — reverse a previously-committed BET. */
 export interface RollbackPayload {
   operator_transaction_id: string; // the rollback's own (distinct) id

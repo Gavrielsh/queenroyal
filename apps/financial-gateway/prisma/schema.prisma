@@ -215,6 +215,14 @@ model RedemptionRequest {
 
   cancelledAt DateTime?
 
+  /// The Zone 1 ledger transaction that gave the SC back, when a redemption was refused after
+  /// its debit committed. Null means no refund has been made — which for a REJECTED row, or one
+  /// stuck at PROCESSING after a terminal payout failure, means the player is still out of
+  /// pocket. UNIQUE for the same reason ledgerTransactionId is: one ledger transaction can back
+  /// at most one refund, so double-crediting is not representable.
+  refundLedgerTransactionId String?   @unique
+  refundedAt                DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

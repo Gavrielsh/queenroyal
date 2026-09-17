@@ -6,6 +6,7 @@ import { AdminRoleError, verifyAdminToken } from "../lib/jwt";
 import { getPrisma } from "../lib/prisma";
 import { getReconcileQueue, type ReconcileQueue, ReconcileQueueUnavailableError } from "../lib/reconcile-queue";
 import { getRedemptionQueue, RedemptionQueueUnavailableError } from "../lib/redemption-queue";
+import { refundRedemption } from "../services/redemption-refund.service";
 import { errBody, okBody } from "../lib/reply";
 
 /**
@@ -299,11 +300,12 @@ async function approveRedemptionHandler(req: FastifyRequest, reply: FastifyReply
  * UNDER_REVIEW → REJECTED with a MANDATORY reason. Nothing is enqueued: a rejected redemption
  * has no payout to make.
  *
- * NOTE ON THE MONEY, because this is the sharp edge. The SC was debited in Zone 1 when the
- * player asked. Rejecting the request does NOT give it back — restoring it needs a compensating
- * credit in Zone 1, which does not exist yet. The row records who refused it and why so the
- * obligation is visible and attributable; discharging that obligation is a separate, deliberate
- * act and must not be inferred from this status.
+ * THE MONEY IS GIVEN BACK. The SC was debited in Zone 1 when the player asked, so a rejection
+ * that only flipped a status would leave them refused AND out of pocket. The compensating
+ * credit runs here, and its failure is reported rather than swallowed: the rejection still
+ * stands (an operator's decision is not undone by a ledger hiccup), but the response says the
+ * refund did not land so the operator knows a player is owed money. The refund is idempotent on
+ * an anchor derived from the redemption id, so retrying this route cannot double-credit.
  */
 async function rejectRedemptionHandler(req: FastifyRequest, reply: FastifyReply): Promise<void> {
   const params = replayParamsSchema.safeParse(req.params);
@@ -347,5 +349,31 @@ async function rejectRedemptionHandler(req: FastifyRequest, reply: FastifyReply)
   }
 
   req.log.warn({ redemption_id: id, reason: body.data.decisionReason }, "redemption rejected by operator");
-  await reply.code(200).send(okBody({ id, status: "REJECTED", reviewedBy: req.adminSub }));
+
+  // Give the SC back. Deliberately AFTER the status transition: the rejection is the
+  // operator's decision and is recorded whether or not the ledger call succeeds, and a refund
+  // attempted before the CAS could credit a redemption a peer then approved.
+  const refund = await refundRedemption(id, `rejected by ${req.adminSub ?? "operator"}`);
+  if (!refund.ok) {
+    req.log.error(
+      { alert: "refund_failed_on_reject", redemption_id: id, err: refund.error, retryable: refund.retryable },
+      "redemption rejected but the refund did not land — the player is still debited",
+    );
+    // 200, not 5xx: the rejection succeeded and re-sending it would not retry the refund any
+    // differently. The body says plainly what did not happen so nobody reads this as settled.
+    await reply.code(200).send(
+      okBody({ id, status: "REJECTED", reviewedBy: req.adminSub, refunded: false, refundError: refund.error }),
+    );
+    return;
+  }
+
+  await reply.code(200).send(
+    okBody({
+      id,
+      status: "REJECTED",
+      reviewedBy: req.adminSub,
+      refunded: true,
+      refundLedgerTransactionId: refund.ledgerTransactionId,
+    }),
+  );
 }
