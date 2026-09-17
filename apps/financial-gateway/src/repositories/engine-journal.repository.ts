@@ -11,7 +11,15 @@ import { getPrisma } from "../lib/prisma";
  * raw SQL.
  */
 
-export type EngineRequestKind = "BET" | "WIN" | "DEPOSIT" | "ROLLBACK" | "PLAYER_CREATE";
+/**
+ * NOTE ON "REDEEM": the kind exists so the money-OUT path can journal its intent, but the
+ * reconciler cannot replay one yet — `isReplayableType` (reconciliation.service) does not
+ * list it, so a REDEEM row reaching reconciliation is ABANDONED as an unhandled type rather
+ * than retried. That is the safe direction (it never re-fires a payout), and it is harmless
+ * today because nothing writes REDEEM rows. Adding the redeem replay path is part of the
+ * task that starts writing them.
+ */
+export type EngineRequestKind = "BET" | "WIN" | "DEPOSIT" | "ROLLBACK" | "PLAYER_CREATE" | "REDEEM";
 
 /** Statuses from which an intent must NEVER regress (already settled / given up). */
 const FINAL_STATUSES: ReadonlySet<string> = new Set(["SUCCEEDED", "COMPENSATED", "ABANDONED"]);

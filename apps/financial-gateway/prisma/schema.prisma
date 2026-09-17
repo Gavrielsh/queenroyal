@@ -8,8 +8,10 @@
 //   is the single source of truth for money.
 //
 //   Same physical tables as the legacy Next.js app during the migration (identical
-//   @@map names and columns). This schema introduces NO structural change, so both
-//   Prisma clients can read the shared database until the legacy DB layer is retired.
+//   @@map names and columns), so both Prisma clients can read the shared database until
+//   the legacy DB layer is retired. `redemption_requests` is the first table this schema
+//   ADDS: it is gateway-owned and adds no column to any legacy table, so the legacy client
+//   keeps working without knowing it exists.
 // ─────────────────────────────────────────────────────────────────────────────
 
 generator client {
@@ -17,12 +19,12 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider  = "postgresql"
   // RUNTIME (pooled) connection — points at PgBouncer in TRANSACTION pool mode. This URL MUST
   // carry `?pgbouncer=true` so Prisma disables server-side prepared statements, which
   // transaction-pooled backends cannot share (see src/lib/prisma.ts). e.g.
   //   postgresql://user:pass@pgbouncer:6432/queenroyal?pgbouncer=true&connection_limit=1
-  url = env("DATABASE_URL")
+  url       = env("DATABASE_URL")
   // MIGRATIONS (direct, session-mode) — `prisma migrate`/`db push` connect STRAIGHT to Postgres
   // on :5432, never the transaction pooler (which cannot run DDL / advisory locks). Unused at
   // runtime by the app itself.
@@ -45,6 +47,9 @@ model User {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  // Back-relation only — adds NO column to `users`. See RedemptionRequest.
+  redemptions RedemptionRequest[]
 
   // 🚫 FORBIDDEN by architecture: gc_balance, sc_balance, deposits, withdrawals.
 
@@ -87,6 +92,7 @@ enum EngineRequestType {
   DEPOSIT
   ROLLBACK
   PLAYER_CREATE
+  REDEEM // SC_REDEEMABLE debit at POST /api/v1/store/redeem — the money-OUT intent
 }
 
 enum EngineRequestStatus {
@@ -109,4 +115,127 @@ model StorePackage {
   updatedAt     DateTime @updatedAt
 
   @@map("store_packages")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MONEY OUT — redemption lifecycle
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One player-initiated request to convert SC_REDEEMABLE into a real-world prize payout.
+///
+/// STATE ORCHESTRATION ONLY. This row is a state machine and an audit record; it is NOT
+/// an account. It never holds, derives, or reconciles a balance:
+///
+///   - Whether the player CAN redeem is answered by the engine (sufficient SC_REDEEMABLE,
+///     playthrough discharged, status not blocked) — never by reading anything here.
+///   - The money itself moves exactly once, in Zone 1, as the ledger transaction named by
+///     `ledgerTransactionId`. Summing `amount` over these rows does NOT yield a balance and
+///     must never be used as one: rows in REQUESTED/REJECTED/CANCELLED_BY_PLAYER moved no
+///     money at all, and the ledger is the only place the truth lives.
+///
+/// WHY STORING `amount` HERE IS NOT FINANCIAL STATE: it is the PARAMETER of an intent, in the
+/// same sense as `EngineRequestLog.requestPayload` — a verbatim copy of what was asked for, so
+/// the request can be reviewed, replayed and audited. It is written once at REQUESTED and
+/// never recomputed. A balance is a running total the system maintains; this is a frozen
+/// argument the system remembers.
+///
+/// LIFECYCLE (the only legal moves — enforced in the service layer, see redemption-policy):
+///
+///   REQUESTED ──▶ UNDER_REVIEW ──▶ APPROVED ──▶ PROCESSING ──▶ PAID
+///        │              │              │             │
+///        │              ▼              ▼             ▼
+///        │           REJECTED       REJECTED      REJECTED
+///        ▼
+///   CANCELLED_BY_PLAYER
+///
+/// PAID, REJECTED and CANCELLED_BY_PLAYER are terminal. A player may withdraw their own
+/// request only while it is still REQUESTED — once review has begun, the decision is the
+/// operator's to record, because a player-side cancel after an AML hold would let a flagged
+/// request disappear from the queue.
+model RedemptionRequest {
+  id String @id @default(uuid())
+
+  /// Local identity (User.id). The FK is what makes a redemption un-orphanable.
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// The True Engine's player UUID (User.trueEnginePlayerId) — the id the ledger row is
+  /// written against. Copied at request time and NOT null: a player the engine has never
+  /// heard of cannot redeem, and resolving it later would make the row ambiguous if the
+  /// identity bridge were ever re-pointed.
+  playerId String
+
+  status RedemptionStatus @default(REQUESTED)
+
+  /// Amount of SC_REDEEMABLE requested, as a decimal **string** in whole-coin units with at
+  /// most 4 dp — the engine's NUMERIC(18,4) wire format.
+  ///
+  /// A STRING, NOT A NUMERIC COLUMN, AND NOT A FLOAT. Prisma maps `Decimal` to
+  /// decimal.js and `Float` to an IEEE-754 double; both invite arithmetic in Zone 2, and
+  /// arithmetic on money in Zone 2 is precisely what the architecture forbids. Keeping the
+  /// column TEXT means the value can only be forwarded verbatim or compared as a string —
+  /// there is no in-language way to quietly add two of them up.
+  ///
+  /// Shape is validated at the perimeter by `positiveMoneyString` (src/lib/money.ts) before
+  /// it is ever written, which is also what bounds it to the ledger's capacity.
+  amount String
+
+  /// Deterministic idempotency anchor for the engine debit, derived from `id` and stable
+  /// across every retry. UNIQUE, so a replayed submit collapses onto the same engine call
+  /// rather than opening a second one.
+  ///
+  /// Linked to `engine_request_log.operatorTransactionId` BY VALUE and deliberately not by
+  /// FK: the journal row is written at call time (B2), while this row exists from the moment
+  /// the player asks. An FK would force the two into one transaction and invert that order.
+  operatorTransactionId String @unique
+
+  /// The Zone 1 `ledger_transaction_id` for the SC_REDEEMABLE debit, assigned by the engine
+  /// and null until it has committed. UNIQUE: one ledger transaction can back at most one
+  /// redemption, which is the constraint that makes double-paying a single debit impossible
+  /// to represent. This column is the ONLY link between a redemption and the money — nothing
+  /// here duplicates the ledger's mechanics.
+  ledgerTransactionId String? @unique
+
+  /// When `status` last moved. Kept alongside `updatedAt` on purpose: `updatedAt` also moves
+  /// for a note edit or a provider-ref backfill, so it cannot answer "how long has this been
+  /// sitting in review?" — the question the payout SLA is measured on.
+  statusChangedAt DateTime @default(now())
+
+  /// Review decision (compliance data Zone 2 legitimately owns). `reviewedBy` is the
+  /// operator subject that approved or rejected; `decisionReason` is the free-text rationale,
+  /// which for a REJECTED request is the record the regulator asks for.
+  reviewedBy     String?
+  reviewedAt     DateTime?
+  decisionReason String?
+
+  /// Payout provider's own reference for the outbound transfer, set when the request enters
+  /// PROCESSING. Not money: a correlation id for the rail.
+  payoutProviderRef String?
+  paidAt            DateTime?
+
+  cancelledAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // 🚫 FORBIDDEN, exactly as in User: any balance, running total, or "available to redeem"
+  // figure. Ask the engine.
+
+  /// The review queue: unfinished work, oldest first.
+  @@index([status, createdAt])
+  /// A player's own redemption history, and the lookup a duplicate-request guard needs.
+  @@index([userId, createdAt])
+  @@map("redemption_requests")
+}
+
+/// The redemption lifecycle. Ordered as the happy path runs, so the enum reads as the
+/// pipeline it describes.
+enum RedemptionStatus {
+  REQUESTED // player submitted; no money has moved
+  UNDER_REVIEW // held for KYC/AML review
+  APPROVED // cleared for payout; SC debit committed at the engine
+  PROCESSING // handed to the payout provider
+  PAID // funds left the building — terminal
+  REJECTED // refused by review — terminal
+  CANCELLED_BY_PLAYER // withdrawn by the player while still REQUESTED — terminal
 }
