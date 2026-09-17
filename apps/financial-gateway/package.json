@@ -22,7 +22,8 @@
     "db:seed": "tsx prisma/seed.ts",
     "worker:reconcile": "tsx src/workers/reconciler.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "worker:redemption": "tsx src/workers/redemption.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",

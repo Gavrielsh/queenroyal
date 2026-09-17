@@ -131,11 +131,23 @@ export interface SessionPayload {
   player_id: string;
 }
 
-/** POST /api/v1/session 2xx body (flat — NOT wrapped in `result`). */
+/**
+ * POST /api/v1/session 2xx body (flat — NOT wrapped in `result`).
+ *
+ * `status` and `playthrough_outstanding` are ADVISORY: the engine takes no lock for this read,
+ * so both are true as of the read and may be stale by the time we act. They exist so a doomed
+ * money operation can be refused before a signed round trip is spent on it — never to
+ * authorise one. The engine re-checks both under the wallet lock on every money path, and
+ * that check is what actually protects a suspended or self-excluded player.
+ */
 export interface SessionBalancesResult {
   code: string; // "OK"
   player_id: string;
   balances: EngineBalances;
+  /** ACTIVE | SUSPENDED | SELF_EXCLUDED | KYC_PENDING | CLOSED. */
+  status: string;
+  /** SC still owed to the 1x wagering requirement, as a decimal string. */
+  playthrough_outstanding: string;
 }
 
 /** POST /api/v1/player/create — provision a player (idempotent on external_id). */

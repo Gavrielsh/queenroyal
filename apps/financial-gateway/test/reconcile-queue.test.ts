@@ -241,13 +241,24 @@ describe("RedisStreamReconcileQueue — Redis command wiring", () => {
 
     const read = redis.callsTo("xreadgroup")[0]!.args.map(String);
     expect(read.slice(0, 3)).toEqual(["GROUP", GROUP, "test-consumer"]);
-    expect(read).toContain("BLOCK");
+    // NO `BLOCK` for a non-blocking pull. Redis reads `BLOCK 0` as "block FOREVER", so passing
+    // the caller's 0 through would wedge the connection on an empty stream and every later
+    // command would queue behind it. This assertion used to require BLOCK unconditionally,
+    // which codified that bug; a live-Redis test caught it.
+    expect(read).not.toContain("BLOCK");
     expect(read[read.length - 2]).toBe(STREAM);
     expect(read[read.length - 1]).toBe(">"); // only never-delivered entries
 
     expect(msgs).toHaveLength(1);
     expect(msgs[0]!.operatorTransactionId).toBe("deposit:due");
     expect(msgs[0]!.deliveryCount).toBe(1);
+
+    // …and a genuinely blocking pull still asks Redis to block, for exactly that long.
+    redis.reset?.();
+    await queue.pull(10, 250);
+    const blocking = redis.callsTo("xreadgroup").at(-1)!.args.map(String);
+    expect(blocking).toContain("BLOCK");
+    expect(blocking[blocking.indexOf("BLOCK") + 1]).toBe("250");
   });
 
   it("Task 3: reclaim sweeps stale in-flight entries via XAUTOCLAIM (deliveryCount > 1)", async () => {

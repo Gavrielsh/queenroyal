@@ -65,18 +65,19 @@ const ENGINE_REFUSAL_TO_POLICY: Readonly<Record<string, RedemptionRefusal>> = {
 };
 
 /**
- * Facts the policy needs that ZONE 1 OWNS and Zone 2 cannot currently see.
+ * Facts the policy needs that ZONE 1 OWNS.
  *
- * `POST /api/v1/session` returns balances and nothing else, so the gateway has no way to read
- * a player's engine status or their outstanding playthrough. Rather than feed the policy an
- * invented "ACTIVE" and "0" — which would leave two compliance gates present in the code and
- * inert in reality — this seam reports them as unknown, and the engine remains the enforcing
- * authority for both. Its refusals are mapped back onto the same refusal vocabulary below, so
- * the API contract is identical whichever layer said no.
+ * These are now read from `POST /api/v1/session`, which reports the player's lifecycle status
+ * and outstanding playthrough alongside the balances — one consistent snapshot, so the two
+ * cannot disagree with each other.
  *
- * Injectable so tests can supply the facts and exercise the gates for real. Closing this
- * properly is a small Zone 1 addition (session returning `status` and
- * `playthrough_outstanding`), which is not this task's to make.
+ * They are ADVISORY and the gate they feed is a PRE-FLIGHT one. The engine re-checks both
+ * under the wallet lock and is still the authority; refusing here only avoids spending a
+ * signed round trip on a request already known to be doomed, and an engine refusal is mapped
+ * back onto the same vocabulary so the contract is identical whichever layer said no.
+ *
+ * Still injectable, because a test that has to stand up an engine to exercise a policy gate is
+ * a test nobody runs.
  */
 export interface EngineOwnedFacts {
   playerStatus: string;
@@ -160,14 +161,16 @@ export async function requestRedemption(
   //    nothing about where a fact came from.
   const jurisdiction = ctx.jurisdiction ?? "";
   const periods = await sumRedeemedPeriods(playerId, deps.now ? deps.now() : new Date());
-  const engineFacts = deps.engineOwnedFacts ? await deps.engineOwnedFacts(playerId) : null;
+  const readFacts = deps.engineOwnedFacts ?? fetchEngineOwnedFacts;
+  const engineFacts = await readFacts(playerId);
 
   const facts: RedemptionFacts = {
     jurisdiction,
     kycStatus: player.kycStatus,
-    // When Zone 1's facts are unavailable the values below are the NEUTRAL element for their
-    // gates, not a claim that the player is active and clear. The engine enforces both and its
-    // refusal is mapped at step 6; see EngineOwnedFacts.
+    // A null here means the snapshot call itself failed, NOT that the player is clear. The
+    // values fall back to the neutral element for their gates and the engine — which refuses
+    // under the wallet lock regardless — decides; its refusal is mapped at step 6. Failing the
+    // whole request on an advisory read would turn a degraded optimisation into an outage.
     playerStatus: engineFacts?.playerStatus ?? "ACTIVE",
     playthroughOutstanding: engineFacts?.playthroughOutstanding ?? "0",
     amount: input.amount,
@@ -340,5 +343,21 @@ function refusalError(refusals: readonly RedemptionRefusal[]): TrueEngineErrorBo
     code: refusals[0] ?? "REDEMPTION_REFUSED",
     message: "This redemption cannot be processed",
     details: { refusals: [...refusals] },
+  };
+}
+
+/**
+ * Default source for the Zone-1-owned facts: the engine's own session snapshot.
+ *
+ * Returns null rather than throwing when the read fails. This is a pre-flight optimisation, and
+ * an engine hiccup on an advisory read must not fail a redemption the engine would have
+ * accepted — the authoritative gates still run inside the debit.
+ */
+async function fetchEngineOwnedFacts(playerId: string): Promise<EngineOwnedFacts | null> {
+  const res = await trueEngine().getBalances({ player_id: playerId });
+  if (!res.ok) return null;
+  return {
+    playerStatus: res.data.status,
+    playthroughOutstanding: res.data.playthrough_outstanding,
   };
 }

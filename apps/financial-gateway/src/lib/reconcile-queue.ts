@@ -105,13 +105,34 @@ interface StreamCommands {
 
 type StreamEntry = [id: string, fields: string[]];
 
-export class RedisStreamReconcileQueue implements ReconcileQueue {
+/**
+ * The Redis key set one queue instance operates on.
+ *
+ * Parameterised rather than hardcoded so a SECOND queue (the redemption worker's) reuses this
+ * exact implementation instead of copying it. Two hand-maintained copies of consumer-group,
+ * reclaim and dead-letter mechanics would drift, and the failure mode of drift here is a lost
+ * or double-processed money event — the one class of bug the broker exists to prevent.
+ *
+ * `dlq` is deliberately shared by default: a single quarantine stream means an operator has
+ * ONE place to look for stuck work, whatever produced it.
+ */
+export interface StreamKeys {
+  stream: string;
+  group: string;
+  schedule: string;
+  dlq: string;
+}
+
+export const RECONCILE_KEYS: StreamKeys = { stream: STREAM, group: GROUP, schedule: SCHEDULE, dlq: DLQ };
+
+export class RedisStreamQueue implements ReconcileQueue {
   private readonly cmd: StreamCommands;
   private groupEnsured = false;
 
   constructor(
     redis: Redis,
     private readonly consumerName: string = `reconciler-${process.pid}`,
+    private readonly keys: StreamKeys = RECONCILE_KEYS,
   ) {
     this.cmd = redis as unknown as StreamCommands;
   }
@@ -120,7 +141,7 @@ export class RedisStreamReconcileQueue implements ReconcileQueue {
   private async ensureGroup(): Promise<void> {
     if (this.groupEnsured) return;
     try {
-      await this.cmd.xgroup("CREATE", STREAM, GROUP, "$", "MKSTREAM");
+      await this.cmd.xgroup("CREATE", this.keys.stream, this.keys.group, "$", "MKSTREAM");
     } catch (err) {
       if (!(err instanceof Error) || !err.message.includes("BUSYGROUP")) throw err;
     }
@@ -141,29 +162,28 @@ export class RedisStreamReconcileQueue implements ReconcileQueue {
     // different instances (the task's clock-skew constraint). `reason` is diagnostic-only and is
     // re-derived on drain.
     const visibleAt = Date.now() + Math.max(0, delayMs);
-    await this.cmd.zadd(SCHEDULE, visibleAt, evt.operatorTransactionId);
+    await this.cmd.zadd(this.keys.schedule, visibleAt, evt.operatorTransactionId);
   }
 
   async unschedule(operatorTransactionId: string): Promise<void> {
-    await this.cmd.zrem(SCHEDULE, operatorTransactionId);
+    await this.cmd.zrem(this.keys.schedule, operatorTransactionId);
   }
 
   async pull(count: number, blockMs: number): Promise<ReconcileMessage[]> {
     await this.ensureGroup();
     await this.drainDueScheduled(count);
 
-    const res = (await this.cmd.xreadgroup(
-      "GROUP",
-      GROUP,
-      this.consumerName,
-      "COUNT",
-      count,
-      "BLOCK",
-      blockMs,
-      "STREAMS",
-      STREAM,
-      ">",
-    )) as Array<[stream: string, entries: StreamEntry[]]> | null;
+    // BLOCK 0 means "block FOREVER" in Redis, not "do not block" — so a caller asking for a
+    // non-blocking read (blockMs <= 0, which this interface documents and tests rely on) must
+    // get a read with NO BLOCK argument at all. Passing 0 through wedges the connection: the
+    // client waits for a message that may never come and every later command on it queues
+    // behind that wait. Caught by the first integration test to run this against real Redis
+    // rather than a fake.
+    const args: Array<string | number> = ["GROUP", this.keys.group, this.consumerName, "COUNT", count];
+    if (blockMs > 0) args.push("BLOCK", blockMs);
+    args.push("STREAMS", this.keys.stream, ">");
+
+    const res = (await this.cmd.xreadgroup(...args)) as Array<[stream: string, entries: StreamEntry[]]> | null;
 
     if (!res || res.length === 0) return [];
     const entries = res[0]?.[1] ?? [];
@@ -173,7 +193,7 @@ export class RedisStreamReconcileQueue implements ReconcileQueue {
   async reclaim(minIdleMs: number, count: number): Promise<ReconcileMessage[]> {
     await this.ensureGroup();
     // XAUTOCLAIM (Redis 6.2+): atomically transfer ownership of entries idle > minIdleMs.
-    const res = (await this.cmd.xautoclaim(STREAM, GROUP, this.consumerName, minIdleMs, "0", "COUNT", count)) as [
+    const res = (await this.cmd.xautoclaim(this.keys.stream, this.keys.group, this.consumerName, minIdleMs, "0", "COUNT", count)) as [
       cursor: string,
       entries: StreamEntry[],
       deleted: string[],
@@ -189,13 +209,13 @@ export class RedisStreamReconcileQueue implements ReconcileQueue {
   }
 
   async ack(msg: ReconcileMessage): Promise<void> {
-    await this.cmd.xack(STREAM, GROUP, msg.deliveryId);
-    await this.cmd.xdel(STREAM, msg.deliveryId);
+    await this.cmd.xack(this.keys.stream, this.keys.group, msg.deliveryId);
+    await this.cmd.xdel(this.keys.stream, msg.deliveryId);
   }
 
   async deadLetter(msg: ReconcileMessage, error: string): Promise<void> {
     await this.cmd.xadd(
-      DLQ,
+      this.keys.dlq,
       "*",
       "operatorTransactionId",
       msg.operatorTransactionId,
@@ -215,7 +235,7 @@ export class RedisStreamReconcileQueue implements ReconcileQueue {
 
   private async xadd(evt: ReconcileEventInput): Promise<void> {
     await this.cmd.xadd(
-      STREAM,
+      this.keys.stream,
       "*",
       "operatorTransactionId",
       evt.operatorTransactionId,
@@ -229,18 +249,18 @@ export class RedisStreamReconcileQueue implements ReconcileQueue {
   /** Move every scheduled entry whose visible-at has passed into the live stream. */
   private async drainDueScheduled(count: number): Promise<void> {
     const now = Date.now();
-    const due = await this.cmd.zrangebyscore(SCHEDULE, "-inf", now, "LIMIT", 0, count);
+    const due = await this.cmd.zrangebyscore(this.keys.schedule, "-inf", now, "LIMIT", 0, count);
     for (const operatorTransactionId of due) {
       // ZREM gates the move: only the consumer that actually removes the member republishes
       // it, so concurrent consumers can't double-enqueue the same scheduled event.
-      const removed = await this.cmd.zrem(SCHEDULE, operatorTransactionId);
+      const removed = await this.cmd.zrem(this.keys.schedule, operatorTransactionId);
       if (removed !== 1) continue;
       await this.xadd({ operatorTransactionId, reason: "scheduled_backstop_due" });
     }
   }
 
   private async deliveryCount(id: string): Promise<number> {
-    const pending = (await this.cmd.xpending(STREAM, GROUP, "IDLE", 0, id, id, 1)) as Array<
+    const pending = (await this.cmd.xpending(this.keys.stream, this.keys.group, "IDLE", 0, id, id, 1)) as Array<
       [id: string, consumer: string, idleMs: number, deliveries: number]
     >;
     return pending?.[0]?.[3] ?? 2;
@@ -267,6 +287,16 @@ function fieldsToObject(fields: string[]): Record<string, string> {
     if (key !== undefined && value !== undefined) out[key] = value;
   }
   return out;
+}
+
+/**
+ * The reconciliation queue, unchanged in behaviour — kept as its own name so every existing
+ * import, worker and test keeps reading as what it is.
+ */
+export class RedisStreamReconcileQueue extends RedisStreamQueue {
+  constructor(redis: Redis, consumerName: string = `reconciler-${process.pid}`) {
+    super(redis, consumerName, RECONCILE_KEYS);
+  }
 }
 
 // ── Factory + dependency-injection seam ──────────────────────────────────────

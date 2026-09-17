@@ -256,6 +256,23 @@ export const prismaFake = {
       row.updatedAt = new Date();
       return { ...row };
     },
+    findUnique: async ({ where }: QueryArgs) => {
+      const row = redemptions.get(where.id);
+      return row ? { ...row } : null;
+    },
+    // Conditional update — the worker's compare-and-set. Matches only rows satisfying EVERY
+    // clause in `where`, so a status precondition is honoured exactly as Postgres would.
+    updateMany: async ({ where, data }: QueryArgs) => {
+      let count = 0;
+      for (const row of redemptions.values()) {
+        if (where.id !== undefined && row.id !== where.id) continue;
+        if (where.status !== undefined && row.status !== where.status) continue;
+        applyData(row, data);
+        row.updatedAt = new Date();
+        count += 1;
+      }
+      return { count };
+    },
     findMany: async ({ where, select }: QueryArgs) => {
       const rows = [...redemptions.values()].filter((r) => {
         if (!where) return true;

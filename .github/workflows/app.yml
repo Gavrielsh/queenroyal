@@ -86,6 +86,22 @@ jobs:
     name: Unit tests (vitest)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
+    # The redemption worker's queue tests run against a REAL Redis. A fake broker can prove
+    # dispositions but not the three things that actually matter about a Streams-backed queue:
+    # that a consumer group redelivers what a crashed consumer left in the PEL, that an acked
+    # entry is really gone, and that a dead-lettered message lands where an operator looks.
+    # Those are Redis behaviours, so CI provides Redis.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -110,6 +126,10 @@ jobs:
 
       - name: Gateway suite
         working-directory: apps/financial-gateway
+        env:
+          # 127.0.0.1, not localhost: the service port is published on the runner's IPv4
+          # loopback and "localhost" can resolve to ::1 first and refuse the connection.
+          REDIS_TEST_URL: redis://127.0.0.1:6379
         run: npx vitest run --reporter=json --outputFile=gateway.json --reporter=default
 
       # ── The assertion ────────────────────────────────────────────────────────────────
@@ -124,7 +144,7 @@ jobs:
             const fs = require("fs");
             const expected = {
               "Zone 3 (src/)":  { file: "zone3.json",                        files: 18, tests: 274 },
-              "gateway":        { file: "apps/financial-gateway/gateway.json", files: 23, tests: 242 },
+              "gateway":        { file: "apps/financial-gateway/gateway.json", files: 24, tests: 256 },
             };
             let failed = false;
             for (const [name, want] of Object.entries(expected)) {
