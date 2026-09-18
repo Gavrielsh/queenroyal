@@ -130,6 +130,47 @@ export interface RedemptionRefundPayload {
   metadata?: EngineMetadata;
 }
 
+/**
+ * The no-purchase route a grant came through. Mirrors the engine's `promo_grant_channel`
+ * enum (migration 000014) exactly.
+ *
+ * A typed union rather than a free string because the distinction is the whole of the AMOE
+ * defense: `AMOE` is the statutorily-required free entry method, `BONUS` is discretionary
+ * marketing, and they are legally different acts. The engine stores it in a typed column
+ * precisely so it cannot be a loose convention; widening it to `string` here would put the
+ * looseness back one layer up.
+ */
+export type PromoChannel = "AMOE" | "BONUS" | "COMPENSATION";
+
+/**
+ * POST /api/v1/store/promo-grant — issue coins with NO purchase behind them.
+ *
+ * Mirrors the engine's `promoGrantDTO` (internal/api/casino.go) field for field.
+ *
+ * There is no `sc_redeemable_amount` and there cannot be one. `sc_amount` is credited to
+ * SC_UNPLAYED and carries the standard 1x wagering requirement, the same as a purchaser's
+ * promotional SC; a no-purchase path that could mint cashable tokens would be a withdrawal
+ * channel with neither payment nor gameplay behind it, and the engine's allocator cannot
+ * express it.
+ *
+ * `channel_reference` is REQUIRED by the engine when `channel` is "AMOE" — an AMOE record
+ * that cannot be tied back to the entry it answers is an assertion rather than evidence.
+ *
+ * THE ENGINE DOES NOT CAP THIS. It issues what an authenticated operator asks for, because
+ * its job is to record movements correctly rather than to decide who deserves one. Frequency
+ * capping, rate limiting and fraud pre-checks are entirely this gateway's responsibility —
+ * see prisma/schema.prisma's AmoeGrant and lib/amoe-policy.
+ */
+export interface PromoGrantPayload {
+  operator_transaction_id: string; // deterministic anchor, derived from the AmoeGrant id
+  player_id: string;
+  gc_amount?: string; // decimal string, >= 0
+  sc_amount?: string; // decimal string, >= 0 — credited as SC_UNPLAYED, never SC_REDEEMABLE
+  channel: PromoChannel;
+  channel_reference?: string; // required by the engine for the AMOE channel
+  metadata?: EngineMetadata;
+}
+
 /** POST /api/v1/rollback — reverse a previously-committed BET. */
 export interface RollbackPayload {
   operator_transaction_id: string; // the rollback's own (distinct) id

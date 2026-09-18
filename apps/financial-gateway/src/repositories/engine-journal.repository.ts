@@ -11,7 +11,14 @@ import { getPrisma } from "../lib/prisma";
  * raw SQL.
  */
 
-export type EngineRequestKind = "BET" | "WIN" | "DEPOSIT" | "ROLLBACK" | "PLAYER_CREATE" | "REDEEM";
+export type EngineRequestKind =
+  | "BET"
+  | "WIN"
+  | "DEPOSIT"
+  | "ROLLBACK"
+  | "PLAYER_CREATE"
+  | "REDEEM"
+  | "PROMO_GRANT";
 
 /** Statuses from which an intent must NEVER regress (already settled / given up). */
 const FINAL_STATUSES: ReadonlySet<string> = new Set(["SUCCEEDED", "COMPENSATED", "ABANDONED"]);

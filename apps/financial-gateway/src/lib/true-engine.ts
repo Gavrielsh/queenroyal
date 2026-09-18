@@ -7,6 +7,7 @@ import type {
   CreatePlayerResult,
   EngineSuccessEnvelope,
   EngineTxResult,
+  PromoGrantPayload,
   PurchasePayload,
   RedeemPayload,
   RedemptionRefundPayload,
@@ -44,6 +45,7 @@ const ENGINE_ENDPOINTS = {
   rollback: "/api/v1/rollback",
   purchase: "/api/v1/store/purchase",
   redeem: "/api/v1/store/redeem",
+  promoGrant: "/api/v1/store/promo-grant",
   redemptionRefund: "/api/v1/store/redeem/refund",
   createPlayer: "/api/v1/player/create",
   session: "/api/v1/session",
@@ -120,6 +122,29 @@ export class TrueEngineClient {
    */
   sendRedemptionRefund(payload: RedemptionRefundPayload): Promise<TrueEngineResult<EngineTxResult>> {
     return this.postTx<EngineTxResult>(ENGINE_ENDPOINTS.redemptionRefund, payload);
+  }
+
+  /**
+   * Issue coins with NO purchase behind them — the AMOE free-entry route.
+   *
+   * Through `postTx` like every other ledger call, so the zero-trust contract is inherited
+   * whole: one serialization, HMAC-SHA256 over `<X-Timestamp>.<X-Nonce>.<rawBody>`, the four
+   * header set, and the typed no-throw result. Nothing about this call being a "free" grant
+   * makes it less sensitive than a purchase — if anything more, since a purchase is bounded by
+   * a fiat charge that actually cleared and this is bounded by nothing at all.
+   *
+   * SAFE TO RETRY. `operator_transaction_id` is the engine's idempotency anchor, so a repeat
+   * of this exact call credits at most once and otherwise returns the original receipt. The
+   * caller derives that anchor from the AmoeGrant row id, so a retried claim and a reconciler
+   * replay collapse onto the SAME grant rather than issuing coins twice.
+   *
+   * THE ENGINE APPLIES NO FREQUENCY CAP TO THIS CALL. Whatever this client sends, the ledger
+   * issues. The cap lives in the `(userId, grantPeriod)` unique index on `amoe_grants`, and
+   * the only thing standing between this method and unbounded issuance is that the service
+   * layer takes that row first. Do not call this method from a path that has not.
+   */
+  sendPromoGrant(payload: PromoGrantPayload): Promise<TrueEngineResult<EngineTxResult>> {
+    return this.postTx<EngineTxResult>(ENGINE_ENDPOINTS.promoGrant, payload);
   }
 
   /** Reverse a previously-committed BET by its ledger transaction id. */

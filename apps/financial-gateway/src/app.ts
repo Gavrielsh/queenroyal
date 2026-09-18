@@ -10,6 +10,7 @@ import { registerMetrics } from "./lib/metrics";
 import { getRedis } from "./lib/redis";
 import { errBody } from "./lib/reply";
 import { adminRoutes } from "./routes/admin";
+import { amoeRoutes } from "./routes/amoe";
 import { authRoutes } from "./routes/auth";
 import { healthRoutes } from "./routes/health";
 import { spinRoutes } from "./routes/spin";
@@ -116,6 +117,9 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(webhookRoutes);
   await app.register(authRoutes);
   await app.register(storeRoutes);
+  // NO PURCHASE NECESSARY. Registered alongside the cashier because the free route and the
+  // paid one are two ways to obtain the same currency, and they should be read together.
+  await app.register(amoeRoutes);
   // Server-authoritative player spin. Must stay registered alongside (not inside) the webhook
   // plugin: webhookRoutes swaps in a raw-body parser for HMAC verification, and this route
   // needs Fastify's normal JSON parsing.

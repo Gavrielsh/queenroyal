@@ -35,6 +35,7 @@ type RawQuery = TemplateStringsArray | { strings?: unknown; values?: unknown } |
 const users = new Map<string, AnyRow>();
 const journal = new Map<string, AnyRow>(); // keyed by id
 const redemptions = new Map<string, AnyRow>(); // keyed by id
+const amoeGrants = new Map<string, AnyRow>(); // keyed by id
 
 /**
  * Apply a Prisma-style `data` patch onto a row, honoring atomic numeric ops
@@ -292,6 +293,110 @@ export const prismaFake = {
     },
   },
 
+  amoeGrant: {
+    /**
+     * `create` ENFORCES THE (userId, grantPeriod) UNIQUE INDEX, throwing a P2002-shaped error
+     * exactly as Postgres would.
+     *
+     * This is the one place the fake must not be lenient. That index IS the frequency cap —
+     * the Zone 1 endpoint behind this flow applies none of its own — so a fake that quietly
+     * accepted a duplicate would let the cap's tests pass against a fake that does not have
+     * the cap. The error shape matches what the service's `isUniqueViolation` looks for, so
+     * the refusal path under test is the real one.
+     */
+    create: async ({ data }: QueryArgs) => {
+      const row = data as AnyRow;
+      for (const existing of amoeGrants.values()) {
+        if (existing.userId === row.userId && existing.grantPeriod === row.grantPeriod) {
+          throw Object.assign(new Error("Unique constraint failed on the fields: (`userId`,`grantPeriod`)"), {
+            code: "P2002",
+            meta: { target: ["userId", "grantPeriod"] },
+          });
+        }
+        if (existing.userId === row.userId && existing.claimAttemptKey === row.claimAttemptKey) {
+          throw Object.assign(new Error("Unique constraint failed on the fields: (`userId`,`claimAttemptKey`)"), {
+            code: "P2002",
+            meta: { target: ["userId", "claimAttemptKey"] },
+          });
+        }
+        if (existing.operatorTransactionId === row.operatorTransactionId) {
+          throw Object.assign(new Error("Unique constraint failed on the fields: (`operatorTransactionId`)"), {
+            code: "P2002",
+            meta: { target: ["operatorTransactionId"] },
+          });
+        }
+      }
+      const now = new Date();
+      const full: AnyRow = {
+        id: randomUUID(),
+        status: "REQUESTED",
+        ledgerTransactionId: null,
+        claimIp: null,
+        claimJurisdiction: null,
+        failureReason: null,
+        createdAt: now,
+        updatedAt: now,
+        ...row,
+      };
+      amoeGrants.set(full.id as string, full);
+      return { ...full };
+    },
+    update: async ({ where, data }: QueryArgs) => {
+      const row = amoeGrants.get(where?.id as string);
+      if (!row) throw new Error("amoeGrant row not found");
+      applyData(row, data as AnyRow);
+      row.updatedAt = new Date();
+      return { ...row };
+    },
+    /**
+     * Supports the `id` lookup and BOTH compound selectors Prisma generates for this model's
+     * two uniques — `userId_grantPeriod` (the period cap's pre-flight read) and
+     * `userId_claimAttemptKey` (the attempt replay). A fake that answered only one would let
+     * the other's tests pass against a lookup that always returned null.
+     */
+    findUnique: async ({ where }: QueryArgs) => {
+      if (where?.id !== undefined) {
+        const row = amoeGrants.get(where.id as string);
+        return row ? { ...row } : null;
+      }
+      const byPeriod = where?.userId_grantPeriod as { userId: string; grantPeriod: string } | undefined;
+      if (byPeriod) {
+        for (const row of amoeGrants.values()) {
+          if (row.userId === byPeriod.userId && row.grantPeriod === byPeriod.grantPeriod) return { ...row };
+        }
+        return null;
+      }
+      const byAttempt = where?.userId_claimAttemptKey as { userId: string; claimAttemptKey: string } | undefined;
+      if (byAttempt) {
+        for (const row of amoeGrants.values()) {
+          if (row.userId === byAttempt.userId && row.claimAttemptKey === byAttempt.claimAttemptKey) return { ...row };
+        }
+        return null;
+      }
+      return null;
+    },
+    findMany: async ({ where }: QueryArgs) => {
+      return [...amoeGrants.values()]
+        .filter((r) => {
+          if (!where) return true;
+          if (where.userId !== undefined && r.userId !== where.userId) return false;
+          if (where.grantPeriod !== undefined && r.grantPeriod !== where.grantPeriod) return false;
+          if (where.status !== undefined && r.status !== where.status) return false;
+          return true;
+        })
+        .map((r) => ({ ...r }));
+    },
+    count: async ({ where }: QueryArgs) => {
+      let n = 0;
+      for (const r of amoeGrants.values()) {
+        if (where?.userId !== undefined && r.userId !== where.userId) continue;
+        if (where?.grantPeriod !== undefined && r.grantPeriod !== where.grantPeriod) continue;
+        n += 1;
+      }
+      return n;
+    },
+  },
+
   // Interactive transaction: the fake has no real isolation, so it simply runs the callback
   // against itself (ignoring the isolation/timeout options). `txClient()` is referenced (not
   // `prismaFake` directly) to avoid a self-referential-initializer type cycle.
@@ -335,6 +440,7 @@ export function resetDb(): void {
   users.clear();
   journal.clear();
   redemptions.clear();
+  amoeGrants.clear();
 }
 
 /** Every redemption row, newest last. Lets a test assert the orchestration row's lifecycle. */
@@ -392,4 +498,27 @@ export function seedJournalRow(row: AnyRow): void {
 export function getJournal(opTx: string): AnyRow | undefined {
   const row = journalByOpTx(opTx);
   return row ? { ...row } : undefined;
+}
+
+/** Every AMOE grant row, newest last. Lets a test assert the claim's lifecycle. */
+export function getAmoeGrants(): AnyRow[] {
+  return [...amoeGrants.values()].map((r) => ({ ...r }));
+}
+
+/** Seed a prior AMOE grant so the period cap has something to refuse against. */
+export function seedAmoeGrant(row: AnyRow): void {
+  const now = new Date();
+  // Every nullable column defaults to null, as Prisma returns them.
+  const full: AnyRow = {
+    id: row.id ?? randomUUID(),
+    status: "GRANTED",
+    ledgerTransactionId: null,
+    claimIp: null,
+    claimJurisdiction: null,
+    failureReason: null,
+    createdAt: now,
+    updatedAt: now,
+    ...row,
+  };
+  amoeGrants.set(full.id as string, full);
 }

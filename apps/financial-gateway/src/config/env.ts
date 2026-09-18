@@ -68,6 +68,27 @@ const envSchema = z.object({
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
   AUTH_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
 
+  // ── AMOE free-entry claim limiting (per IP AND per account, fail closed) ────────
+  // TWO independent limiters guard POST /api/amoe/claim, because they answer different
+  // questions and either one alone leaves a hole:
+  //
+  //   * PER ACCOUNT — stops one account hammering the route. Deliberately tiny: the period
+  //     cap means a legitimate claimant succeeds on their FIRST attempt and has no reason to
+  //     send a second within the window.
+  //   * PER IP — the multi-accounting signal, and the only control that sees one person
+  //     driving many accounts at all. Higher than the per-account limit because households,
+  //     offices and carrier NAT genuinely share an address, and refusing a statutory free
+  //     entry to everyone behind one NAT gateway would be a compliance problem, not a win.
+  //
+  // Both FAIL CLOSED through lib/rate-limit: if Redis is down the claim is refused with 503
+  // rather than admitted unthrottled. That is the right direction here — the Zone 1 endpoint
+  // behind this route is unbounded, so an unthrottled claim path is an issuance hole, whereas
+  // a brief outage of the free route is a support ticket.
+  AMOE_CLAIM_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(3),
+  AMOE_CLAIM_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(3600),
+  AMOE_CLAIM_IP_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
+  AMOE_CLAIM_IP_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(3600),
+
   // ── Global HTTP rate limiting (@fastify/rate-limit, Redis-backed for cross-pod limits) ──
   // A COARSE per-IP DoS guard applied to every route. The fine-grained, fail-closed auth limiter
   // above still independently protects the brute-force-sensitive auth surface; this is a second,

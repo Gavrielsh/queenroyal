@@ -51,6 +51,9 @@ model User {
   // Back-relation only — adds NO column to `users`. See RedemptionRequest.
   redemptions RedemptionRequest[]
 
+  // Back-relation only — adds NO column to `users`. See AmoeGrant.
+  amoeGrants AmoeGrant[]
+
   // 🚫 FORBIDDEN by architecture: gc_balance, sc_balance, deposits, withdrawals.
 
   @@map("users")
@@ -93,6 +96,7 @@ enum EngineRequestType {
   ROLLBACK
   PLAYER_CREATE
   REDEEM // SC_REDEEMABLE debit at POST /api/v1/store/redeem — the money-OUT intent
+  PROMO_GRANT // no-purchase coin issuance at POST /api/v1/store/promo-grant — the AMOE route
 }
 
 enum EngineRequestStatus {
@@ -246,4 +250,149 @@ enum RedemptionStatus {
   PAID // funds left the building — terminal
   REJECTED // refused by review — terminal
   CANCELLED_BY_PLAYER // withdrawn by the player while still REQUESTED — terminal
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NO PURCHASE NECESSARY — the Alternative Method of Entry
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One free-entry claim: the record that a player asked for, and received, Sweeps Coins
+/// without paying for them.
+///
+/// WHY THIS TABLE IS THE FRAUD CONTROL
+///
+/// The Zone 1 endpoint it dispatches to is deliberately UNBOUNDED — the ledger will issue
+/// whatever an authenticated operator asks it to, because the ledger's job is to record
+/// movements correctly, not to decide who deserves one. That makes frequency capping
+/// entirely Zone 2's responsibility, and this row is where it lives. The
+/// `@@unique([userId, grantPeriod])` below is not an optimisation or a convenience: it is
+/// THE mechanism that makes "one grant per person per period" true, enforced by Postgres
+/// rather than by a read-then-write in application code that two concurrent requests would
+/// both pass.
+///
+/// STATE ORCHESTRATION ONLY — the same posture as RedemptionRequest. This row is an audit
+/// record and a uniqueness anchor. It is NOT an account, it never holds a balance, and
+/// summing `scAmount` over it does not produce one: rows in REQUESTED and FAILED moved no
+/// coins, and the ledger is the only place the truth lives.
+model AmoeGrant {
+  id String @id @default(uuid())
+
+  /// Local identity (User.id). The FK is what makes a grant un-orphanable, and half of the
+  /// uniqueness that caps the frequency.
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// The True Engine's player UUID, copied at claim time for the same reason
+  /// RedemptionRequest.playerId is: a player the engine has never heard of cannot be granted
+  /// anything, and resolving it later would make the row ambiguous if the identity bridge
+  /// were re-pointed.
+  playerId              String
+  /// The canonical period key this claim consumes — e.g. `DAY:2026-09-18`, `WEEK:2026-W38`,
+  /// `MONTH:2026-09`. Derived by `amoePeriodKey` (src/lib/amoe-policy.ts) from the claim
+  /// instant in UTC.
+  ///
+  /// A STRING, AND CARRYING ITS OWN GRANULARITY PREFIX. The prefix is what stops a change to
+  /// the configured period silently colliding with keys written under the old one: `DAY:…`
+  /// and `MONTH:…` can never be mistaken for each other. The cost is that switching the
+  /// granularity lets a player who already claimed in the old period claim once more in the
+  /// new one — which is a policy change taking effect, not a bug, and is stated here so it is
+  /// a decision rather than a surprise.
+  ///
+  /// UTC, always. A period boundary that moved with the player's timezone would hand an extra
+  /// claim to anyone willing to change it.
+  grantPeriod           String
+  status                AmoeGrantStatus @default(REQUESTED)
+  /// Sweeps Coins issued, as a decimal **string** in whole-coin units with at most 4 dp — the
+  /// engine's NUMERIC(18,4) wire format.
+  ///
+  /// A STRING, NOT A NUMERIC COLUMN AND NOT A FLOAT, for exactly the reasons set out on
+  /// RedemptionRequest.amount: Prisma maps `Decimal` to decimal.js and `Float` to an IEEE-754
+  /// double, and both invite arithmetic on money inside Zone 2. TEXT means the value can only
+  /// be forwarded verbatim.
+  ///
+  /// It is an INTENT PARAMETER, not a balance: written once from the configured grant and
+  /// never recomputed. It is kept because the equal-dignity question — did the free entrant
+  /// receive what a purchaser receives — is one an auditor asks of Zone 2's records, and a
+  /// column answers it in one query.
+  scAmount              String
+  /// Gold Coins issued alongside, same contract. "0.0000" when the grant is SC-only, which is
+  /// the ordinary AMOE shape.
+  gcAmount              String
+  /// Deterministic idempotency anchor for the engine credit, derived from `id` and stable
+  /// across every retry. UNIQUE, so a replayed claim collapses onto the same engine call
+  /// rather than opening a second one. Linked to `engine_request_log.operatorTransactionId`
+  /// BY VALUE, not by FK — see the note on RedemptionRequest.operatorTransactionId.
+  operatorTransactionId String          @unique
+  /// The Zone 1 `ledger_transaction_id` for the PROMO_CREDIT, assigned by the engine and null
+  /// until it has committed. UNIQUE: one ledger transaction can back at most one grant, which
+  /// is what makes double-crediting a single claim impossible to represent.
+  ledgerTransactionId   String?         @unique
+
+  /// The operator's reference for the entry this grant answers, forwarded to Zone 1 as
+  /// `channel_reference` and REQUIRED there for the AMOE channel. Derived from this row's id,
+  /// so every claim is traceable from the ledger back to the account that made it.
+  channelReference String
+
+  /// The client-supplied attempt token for this claim.
+  ///
+  /// It answers a question the period cap cannot: a client that submitted a claim and never
+  /// saw the response deserves its ORIGINAL outcome on retry, not a "you already claimed"
+  /// it has no way to distinguish from genuine abuse. Looked up before anything else, so a
+  /// repeat with the same token replays the first answer.
+  ///
+  /// Unique PER USER rather than globally: the token is generated by the client and two
+  /// accounts picking the same string is a collision between strangers, which must not let
+  /// one of them read the other's outcome or block their claim.
+  claimAttemptKey String
+
+  /// Fraud-relevant request context, captured at claim time. NOT identity and NOT financial:
+  /// the coarse signals an investigator needs to spot one person driving many accounts.
+  /// `claimIp` is retained under the same retention sweep as the rest of the journal.
+  ///
+  /// `claimJurisdiction` holds an ISO country-region as the fence resolved it ("US-NJ"), not a
+  /// country — named for what it stores, because a column called `claimCountry` holding
+  /// "US-NJ" is the kind of small lie that a later query quietly believes.
+  claimIp           String?
+  claimJurisdiction String?
+
+  /// Why a claim was refused, when it was. The record a support agent reads back to a player
+  /// who says the free route did not work for them — which, for a statutorily-required entry
+  /// method, is a question the operator must be able to answer.
+  failureReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // 🚫 FORBIDDEN, exactly as in User and RedemptionRequest: any balance, running total, or
+  // "coins granted to date" figure. Ask the engine.
+
+  /// THE FREQUENCY CAP. One grant per person per period, enforced by the database.
+  ///
+  /// At the database level deliberately, and not in the service: two concurrent claims would
+  /// both pass a read-then-write check in application code, and a race that yields a second
+  /// free grant is precisely the abuse this route invites. The service catches the resulting
+  /// P2002 and reports it as a clean refusal.
+  ///
+  /// The row is inserted BEFORE the engine call and kept even when that call fails, so a
+  /// failed dispatch still consumes the period. That is the conservative direction: a player
+  /// whose claim failed can be re-granted by an operator, whereas a period released on failure
+  /// is an unbounded retry loop against an unbounded ledger endpoint.
+  @@unique([userId, grantPeriod])
+  /// The attempt replay lookup — see claimAttemptKey.
+  @@unique([userId, claimAttemptKey])
+  /// A player's own claim history, and the support lookup.
+  @@index([userId, createdAt])
+  /// The fraud review: claims from one address across accounts, newest first.
+  @@index([claimIp, createdAt])
+  /// Unfinished work, for the operational sweep over grants that never reached the ledger.
+  @@index([status, createdAt])
+  @@map("amoe_grants")
+}
+
+/// The AMOE claim lifecycle. Short by design: unlike a redemption there is no review and no
+/// external rail — the coins are issued synchronously or they are not.
+enum AmoeGrantStatus {
+  REQUESTED // the period is consumed and the intent journaled; the engine has not answered
+  GRANTED // PROMO_CREDIT committed in Zone 1 — terminal
+  FAILED // the engine refused, or could not be reached — terminal for this claim
 }

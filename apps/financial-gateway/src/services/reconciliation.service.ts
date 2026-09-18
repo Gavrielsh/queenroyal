@@ -261,6 +261,18 @@ async function dispatch(
       // being retried: the payout. This call moves SC inside the ledger; funds leave the
       // building only under the redemption's own PROCESSING → PAID transition.
       return finalizeReplay(row, await trueEngine().sendRedeem(parsed.data), attempts, maxAttempts);
+    case "PROMO_GRANT":
+      // A crashed AMOE claim is a plain idempotent replay, like BET and REDEEM: the engine
+      // de-duplicates on operator_transaction_id, so this either commits the single credit or
+      // returns the receipt of the one that already committed.
+      //
+      // REPLAYING THIS DOES NOT RE-CONSUME A PERIOD, and it is worth being exact about why.
+      // The frequency cap is the `(userId, grantPeriod)` unique index on amoe_grants, and that
+      // row was written BEFORE the intent was journaled — so by the time a payload can be
+      // replayed from here, the period is already spent and this call cannot spend it again.
+      // The replay resolves whether the player got the coins that period bought them; it can
+      // never issue a second grant.
+      return finalizeReplay(row, await trueEngine().sendPromoGrant(parsed.data), attempts, maxAttempts);
   }
 }
 
@@ -448,7 +460,12 @@ async function compensateWin(row: EngineRequestLog, attempts: number, maxAttempt
 
 function isReplayableType(type: EngineRequestLog["type"]): type is ReplayableEngineRequestType {
   return (
-    type === "BET" || type === "WIN" || type === "DEPOSIT" || type === "ROLLBACK" || type === "REDEEM"
+    type === "BET" ||
+    type === "WIN" ||
+    type === "DEPOSIT" ||
+    type === "ROLLBACK" ||
+    type === "REDEEM" ||
+    type === "PROMO_GRANT"
   );
 }
 

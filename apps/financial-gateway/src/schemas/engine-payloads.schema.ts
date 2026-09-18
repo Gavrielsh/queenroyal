@@ -1,7 +1,14 @@
 import { z } from "zod";
 
 import { moneyString, positiveMoneyString } from "../lib/money";
-import type { BetPayload, PurchasePayload, RedeemPayload, RollbackPayload, WinPayload } from "../types/true-engine";
+import type {
+  BetPayload,
+  PromoGrantPayload,
+  PurchasePayload,
+  RedeemPayload,
+  RollbackPayload,
+  WinPayload,
+} from "../types/true-engine";
 
 /**
  * STRICT runtime validation at the JSONB boundary.
@@ -59,6 +66,29 @@ export const redeemPayloadSchema = z.object({
   metadata: engineMetadata.optional(),
 }) satisfies z.ZodType<RedeemPayload>;
 
+/**
+ * The no-purchase credit body for an AMOE claim.
+ *
+ * `moneyString` rather than `positiveMoneyString` on each leg, because a grant legitimately
+ * has a zero leg — the ordinary AMOE shape is SC-only, so `gc_amount` is "0.0000". The engine
+ * enforces the rule that actually matters (at least one leg positive) under its wallet lock,
+ * and a schema that demanded both be positive here would refuse the very shape this route
+ * exists to send.
+ *
+ * `channel` is the typed union, not a string: a replayed payload whose channel had been
+ * corrupted to something the engine's enum does not hold would fail at the ledger with a
+ * constraint error rather than being caught here as a corrupt row.
+ */
+export const promoGrantPayloadSchema = z.object({
+  operator_transaction_id: z.string().min(1),
+  player_id: z.string().min(1),
+  gc_amount: moneyString.optional(),
+  sc_amount: moneyString.optional(),
+  channel: z.enum(["AMOE", "BONUS", "COMPENSATION"]),
+  channel_reference: z.string().min(1).optional(),
+  metadata: engineMetadata.optional(),
+}) satisfies z.ZodType<PromoGrantPayload>;
+
 /** The ledger credit body issued once a deposit's PSP intent is confirmed `succeeded`. */
 export const purchasePayloadSchema = z.object({
   operator_transaction_id: z.string().min(1),
@@ -83,7 +113,13 @@ export const depositInstructionSchema = z.object({
 export type DepositInstruction = z.infer<typeof depositInstructionSchema>;
 
 /** Engine-request kinds that carry a replayable JSONB payload. */
-export type ReplayableEngineRequestType = "BET" | "WIN" | "DEPOSIT" | "ROLLBACK" | "REDEEM";
+export type ReplayableEngineRequestType =
+  | "BET"
+  | "WIN"
+  | "DEPOSIT"
+  | "ROLLBACK"
+  | "REDEEM"
+  | "PROMO_GRANT";
 
 export type ParsedEnginePayload =
   | { ok: true; type: "BET"; data: BetPayload }
@@ -91,6 +127,7 @@ export type ParsedEnginePayload =
   | { ok: true; type: "ROLLBACK"; data: RollbackPayload }
   | { ok: true; type: "DEPOSIT"; data: DepositInstruction }
   | { ok: true; type: "REDEEM"; data: RedeemPayload }
+  | { ok: true; type: "PROMO_GRANT"; data: PromoGrantPayload }
   | { ok: false; error: string };
 
 /**
@@ -118,6 +155,10 @@ export function parseEngineRequestPayload(type: ReplayableEngineRequestType, pay
     }
     case "REDEEM": {
       const r = redeemPayloadSchema.safeParse(payload);
+      return r.success ? { ok: true, type, data: r.data } : { ok: false, error: formatIssues(r.error) };
+    }
+    case "PROMO_GRANT": {
+      const r = promoGrantPayloadSchema.safeParse(payload);
       return r.success ? { ok: true, type, data: r.data } : { ok: false, error: formatIssues(r.error) };
     }
     default: {
