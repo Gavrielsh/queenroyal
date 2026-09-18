@@ -1,5 +1,11 @@
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 
+import { getKycProvider } from "../lib/kyc";
+import {
+  type KycDecisionEvent,
+  KycProviderNotConfiguredError,
+  KycWebhookSignatureError,
+} from "../lib/kyc/types";
 import { getPaymentProvider } from "../lib/payments";
 import {
   PaymentProviderNotConfiguredError,
@@ -10,12 +16,14 @@ import { errBody, okBody } from "../lib/reply";
 import { type HeaderGetter, verifyProviderWebhook, WebhookVerificationError } from "../lib/webhook-security";
 import { providerRollbackSchema, providerSpinSchema } from "../schemas/game.schema";
 import { processProviderRollback, processProviderSpin } from "../services/game-adapter.service";
+import { handleKycDecisionEvent } from "../services/kyc-webhook.service";
 import { handlePspWebhookEvent } from "../services/psp-webhook.service";
 
 /** Per-request verification context, populated by the preHandler BEFORE the controller runs. */
 interface WebhookCtx {
   providerCode?: string;
   pspEvent?: PspWebhookEvent;
+  kycEvent?: KycDecisionEvent;
 }
 
 declare module "fastify" {
@@ -26,6 +34,11 @@ declare module "fastify" {
 
 // Stripe sends `Stripe-Signature`; accept a generic `X-PSP-Signature` too.
 const PSP_SIGNATURE_HEADERS = ["stripe-signature", "x-psp-signature"];
+
+// KYC vendors each name their signature header differently (Persona, Onfido and Sumsub all
+// differ). A generic `X-KYC-Signature` is accepted alongside so the mock and a future adapter
+// can share one route; the ADAPTER still owns the scheme itself.
+const KYC_SIGNATURE_HEADERS = ["x-kyc-signature", "persona-signature", "x-signature"];
 
 /** Build a single-value header getter from a Fastify request (header names are lowercased). */
 function headerGetter(req: FastifyRequest): HeaderGetter {
@@ -68,6 +81,12 @@ export const webhookRoutes: FastifyPluginAsync = async (app) => {
 
   // ── PSP settlement webhook ────────────────────────────────────────────────────
   app.post("/api/webhooks/psp", { preHandler: verifyPspPerimeter }, pspHandler);
+
+  // ── KYC decision webhook ──────────────────────────────────────────────────────
+  // Same raw-body perimeter: the signature is verified over the exact received bytes, before
+  // any JSON.parse and before the controller. The PROVIDER owns the scheme (see
+  // lib/kyc/types.ts) because every vendor signs differently.
+  app.post("/api/webhooks/kyc", { preHandler: verifyKycPerimeter }, kycHandler);
 };
 
 // ── preHandlers: the zero-trust perimeter (run BEFORE the controller / any JSON parse) ──
@@ -102,6 +121,29 @@ async function verifyPspPerimeter(req: FastifyRequest, reply: FastifyReply) {
       return reply.code(503).send(errBody(err.code, "PSP not configured"));
     }
     req.log.error({ err }, "psp webhook parse error");
+    return reply.code(500).send(errBody("INTERNAL_ERROR", "Unexpected server error"));
+  }
+}
+
+async function verifyKycPerimeter(req: FastifyRequest, reply: FastifyReply) {
+  const getHeader = headerGetter(req);
+  const signature = KYC_SIGNATURE_HEADERS.map((h) => getHeader(h)).find((v): v is string => Boolean(v)) ?? "";
+  try {
+    const event = getKycProvider().parseWebhook(rawBodyOf(req), signature);
+    req.webhookCtx = { kycEvent: event };
+  } catch (err) {
+    if (err instanceof KycWebhookSignatureError) {
+      // Logged WITHOUT the signature, the body, or any reason for the failure. A verifier that
+      // reports which check failed is a signature oracle, and the body of a rejected KYC
+      // webhook can carry a real person's decision data.
+      req.log.warn("kyc webhook signature rejected");
+      return reply.code(401).send(errBody(err.code, "invalid signature"));
+    }
+    if (err instanceof KycProviderNotConfiguredError) {
+      req.log.error({ err }, "kyc provider not configured");
+      return reply.code(503).send(errBody(err.code, "KYC provider not configured"));
+    }
+    req.log.error({ err }, "kyc webhook parse error");
     return reply.code(500).send(errBody("INTERNAL_ERROR", "Unexpected server error"));
   }
 }
@@ -184,6 +226,25 @@ async function pspHandler(req: FastifyRequest, reply: FastifyReply) {
     return reply.code(200).send(okBody({ received: true, ...result }));
   } catch (err) {
     req.log.error({ err, payment_intent_id: event.paymentIntentId }, "psp webhook handling failed");
+    return reply.code(500).send(errBody("INTERNAL_ERROR", "Webhook handling failed"));
+  }
+}
+
+async function kycHandler(req: FastifyRequest, reply: FastifyReply) {
+  const event = req.webhookCtx?.kycEvent;
+  if (!event) {
+    return reply.code(500).send(errBody("INTERNAL_ERROR", "verification context missing"));
+  }
+  try {
+    const result = await handleKycDecisionEvent(event, req.id);
+    // Always 200 once verified and recorded, so the provider stops retrying; the body reports
+    // what was actually done. A 4xx for "we chose not to apply this" would make the vendor
+    // redeliver an event we have already durably absorbed, forever.
+    return reply.code(200).send(okBody({ received: true, ...result }));
+  } catch (err) {
+    // A 500 here is the one case where a retry IS wanted: the event was not durably handled,
+    // so the provider redelivering is exactly the recovery we rely on.
+    req.log.error({ err, provider_event_id: event.id }, "kyc webhook handling failed");
     return reply.code(500).send(errBody("INTERNAL_ERROR", "Webhook handling failed"));
   }
 }

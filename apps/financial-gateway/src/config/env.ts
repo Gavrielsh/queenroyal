@@ -89,6 +89,23 @@ const envSchema = z.object({
   AMOE_CLAIM_IP_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
   AMOE_CLAIM_IP_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(3600),
 
+  // ── KYC / identity verification ─────────────────────────────────────────────────
+  // Shared secret the provider signs its decision webhooks with. Only the mock provider reads
+  // it today; a real vendor's adapter reads its own key and this stays for the mock's sake.
+  //
+  // A default is supplied deliberately: this is NOT a credential that protects anything in
+  // dev, and requiring it would make every test and local boot carry a fake secret in its
+  // env. In production the mock provider is refused outright (lib/kyc/index.ts), so the
+  // default can never be the thing guarding a real webhook.
+  KYC_WEBHOOK_SECRET: z.string().min(8).default("mock-kyc-webhook-secret"),
+
+  // Per-account limit on document-upload tickets. Each one is a presigned write handle to an
+  // identity-document store, so they are minted sparingly: a genuine applicant needs a handful
+  // (a document, maybe a second side, a selfie) and anything beyond that is either a confused
+  // client retrying or someone harvesting URLs. FAIL CLOSED like every other limiter here.
+  KYC_UPLOAD_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
+  KYC_UPLOAD_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(3600),
+
   // ── Global HTTP rate limiting (@fastify/rate-limit, Redis-backed for cross-pod limits) ──
   // A COARSE per-IP DoS guard applied to every route. The fine-grained, fail-closed auth limiter
   // above still independently protects the brute-force-sensitive auth surface; this is a second,

@@ -13,6 +13,7 @@ import { adminRoutes } from "./routes/admin";
 import { amoeRoutes } from "./routes/amoe";
 import { authRoutes } from "./routes/auth";
 import { healthRoutes } from "./routes/health";
+import { kycRoutes } from "./routes/kyc";
 import { spinRoutes } from "./routes/spin";
 import { storeRoutes } from "./routes/store";
 import { walletRoutes } from "./routes/wallet";
@@ -125,6 +126,10 @@ export async function buildApp(): Promise<FastifyInstance> {
   // needs Fastify's normal JSON parsing.
   await app.register(spinRoutes);
   await app.register(walletRoutes);
+  // Identity verification. Registered alongside the player-facing routes and NOT inside the
+  // webhook plugin: that plugin swaps in a raw-body parser for signature verification, and the
+  // upload route needs Fastify's normal JSON parsing.
+  await app.register(kycRoutes);
   await app.register(adminRoutes);
 
   return app;

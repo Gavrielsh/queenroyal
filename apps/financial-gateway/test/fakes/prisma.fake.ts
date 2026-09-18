@@ -36,6 +36,9 @@ const users = new Map<string, AnyRow>();
 const journal = new Map<string, AnyRow>(); // keyed by id
 const redemptions = new Map<string, AnyRow>(); // keyed by id
 const amoeGrants = new Map<string, AnyRow>(); // keyed by id
+const kycVerifications = new Map<string, AnyRow>(); // keyed by id
+const kycDocuments = new Map<string, AnyRow>(); // keyed by id
+const kycWebhookEvents = new Map<string, AnyRow>(); // keyed by id
 
 /**
  * Apply a Prisma-style `data` patch onto a row, honoring atomic numeric ops
@@ -397,6 +400,134 @@ export const prismaFake = {
     },
   },
 
+  kycVerification: {
+    /** Upsert on the provider case ref — the "one row per case" rule the real unique enforces. */
+    upsert: async ({ where, create, update }: QueryArgs) => {
+      const ref = where?.providerCaseRef as string | undefined;
+      const existing = [...kycVerifications.values()].find((r) => r.providerCaseRef === ref);
+      if (existing) {
+        applyData(existing, (update ?? {}) as AnyRow);
+        existing.updatedAt = new Date();
+        return { ...existing };
+      }
+      const now = new Date();
+      const row: AnyRow = {
+        id: randomUUID(),
+        status: "PENDING",
+        decisionReason: null,
+        decidedAt: null,
+        createdAt: now,
+        updatedAt: now,
+        ...(create as AnyRow),
+      };
+      kycVerifications.set(row.id as string, row);
+      return { ...row };
+    },
+    findUnique: async ({ where }: QueryArgs) => {
+      if (where?.id !== undefined) {
+        const row = kycVerifications.get(where.id as string);
+        return row ? { ...row } : null;
+      }
+      if (where?.providerCaseRef !== undefined) {
+        for (const row of kycVerifications.values()) {
+          if (row.providerCaseRef === where.providerCaseRef) return { ...row };
+        }
+      }
+      return null;
+    },
+    update: async ({ where, data }: QueryArgs) => {
+      const row = kycVerifications.get(where?.id as string);
+      if (!row) throw new Error("kycVerification row not found");
+      applyData(row, data as AnyRow);
+      row.updatedAt = new Date();
+      return { ...row };
+    },
+    findMany: async ({ where }: QueryArgs) => {
+      return [...kycVerifications.values()]
+        .filter((r) => (where?.userId === undefined ? true : r.userId === where.userId))
+        .map((r) => ({ ...r }));
+    },
+  },
+
+  kycDocument: {
+    create: async ({ data }: QueryArgs) => {
+      const row = data as AnyRow;
+      for (const existing of kycDocuments.values()) {
+        if (existing.providerUploadRef === row.providerUploadRef) {
+          throw Object.assign(new Error("Unique constraint failed on the fields: (`providerUploadRef`)"), {
+            code: "P2002",
+            meta: { target: ["providerUploadRef"] },
+          });
+        }
+      }
+      const full: AnyRow = { id: randomUUID(), createdAt: new Date(), ...row };
+      kycDocuments.set(full.id as string, full);
+      return { ...full };
+    },
+    findMany: async ({ where }: QueryArgs) => {
+      return [...kycDocuments.values()]
+        .filter((r) => {
+          if (!where) return true;
+          if (where.userId !== undefined && r.userId !== where.userId) return false;
+          if (where.verificationId !== undefined && r.verificationId !== where.verificationId) return false;
+          return true;
+        })
+        .map((r) => ({ ...r }));
+    },
+    count: async ({ where }: QueryArgs) => {
+      let n = 0;
+      for (const r of kycDocuments.values()) {
+        if (where?.userId !== undefined && r.userId !== where.userId) continue;
+        n += 1;
+      }
+      return n;
+    },
+  },
+
+  kycWebhookEvent: {
+    /**
+     * `create` ENFORCES the providerEventId unique, throwing a P2002-shaped error exactly as
+     * Postgres would.
+     *
+     * This is the one place the fake must not be lenient. That unique IS the webhook's
+     * idempotency — there is no status check behind it — so a fake that quietly accepted a
+     * duplicate would let the idempotency tests pass against a fake that has no idempotency.
+     */
+    create: async ({ data }: QueryArgs) => {
+      const row = data as AnyRow;
+      for (const existing of kycWebhookEvents.values()) {
+        if (existing.providerEventId === row.providerEventId) {
+          throw Object.assign(new Error("Unique constraint failed on the fields: (`providerEventId`)"), {
+            code: "P2002",
+            meta: { target: ["providerEventId"] },
+          });
+        }
+      }
+      const full: AnyRow = { id: randomUUID(), receivedAt: new Date(), ...row };
+      kycWebhookEvents.set(full.id as string, full);
+      return { ...full };
+    },
+    findUnique: async ({ where }: QueryArgs) => {
+      if (where?.providerEventId !== undefined) {
+        for (const row of kycWebhookEvents.values()) {
+          if (row.providerEventId === where.providerEventId) return { ...row };
+        }
+      }
+      return null;
+    },
+    update: async ({ where, data }: QueryArgs) => {
+      const ref = where?.providerEventId as string | undefined;
+      for (const row of kycWebhookEvents.values()) {
+        if (row.providerEventId === ref) {
+          applyData(row, data as AnyRow);
+          return { ...row };
+        }
+      }
+      throw new Error("kycWebhookEvent row not found");
+    },
+    findMany: async () => [...kycWebhookEvents.values()].map((r) => ({ ...r })),
+  },
+
   // Interactive transaction: the fake has no real isolation, so it simply runs the callback
   // against itself (ignoring the isolation/timeout options). `txClient()` is referenced (not
   // `prismaFake` directly) to avoid a self-referential-initializer type cycle.
@@ -441,6 +572,9 @@ export function resetDb(): void {
   journal.clear();
   redemptions.clear();
   amoeGrants.clear();
+  kycVerifications.clear();
+  kycDocuments.clear();
+  kycWebhookEvents.clear();
 }
 
 /** Every redemption row, newest last. Lets a test assert the orchestration row's lifecycle. */
@@ -521,4 +655,19 @@ export function seedAmoeGrant(row: AnyRow): void {
     ...row,
   };
   amoeGrants.set(full.id as string, full);
+}
+
+/** Every KYC verification row. Lets a test assert the case's lifecycle. */
+export function getKycVerifications(): AnyRow[] {
+  return [...kycVerifications.values()].map((r) => ({ ...r }));
+}
+
+/** Every KYC document METADATA row — never a file; the model has no column for one. */
+export function getKycDocuments(): AnyRow[] {
+  return [...kycDocuments.values()].map((r) => ({ ...r }));
+}
+
+/** Every processed KYC webhook event. The idempotency ledger. */
+export function getKycWebhookEvents(): AnyRow[] {
+  return [...kycWebhookEvents.values()].map((r) => ({ ...r }));
 }

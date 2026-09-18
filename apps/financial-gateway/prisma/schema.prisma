@@ -54,6 +54,10 @@ model User {
   // Back-relation only — adds NO column to `users`. See AmoeGrant.
   amoeGrants AmoeGrant[]
 
+  // Back-relation only — adds NO column to `users`. See KycVerification.
+  kycVerifications KycVerification[]
+  kycDocuments     KycDocument[]
+
   // 🚫 FORBIDDEN by architecture: gc_balance, sc_balance, deposits, withdrawals.
 
   @@map("users")
@@ -395,4 +399,161 @@ enum AmoeGrantStatus {
   REQUESTED // the period is consumed and the intent journaled; the engine has not answered
   GRANTED // PROMO_CREDIT committed in Zone 1 — terminal
   FAILED // the engine refused, or could not be reached — terminal for this claim
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IDENTITY VERIFICATION (KYC)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One identity-verification case at the provider.
+///
+/// The decision this row carries is what gates redeeming real prizes, the AML controls behind
+/// that, and the age check the licence depends on — so it is compliance data Zone 2 legitimately
+/// owns, and it holds no money and no balance.
+///
+/// `User.kycStatus` stays the field every gate reads (assertKycAllows, the redemption policy,
+/// the AMOE policy). This model is the EVIDENCE behind that field: which provider case decided
+/// it, when, and on what stated grounds. Before it existed, "why is this player verified?" was
+/// answerable only by whoever remembered.
+model KycVerification {
+  id String @id @default(uuid())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// The provider's own case identifier. UNIQUE: one case decides one way, and a second row
+  /// for the same case could hold a contradictory decision with no principled winner.
+  providerCaseRef String @unique
+
+  /// Which provider decided. Stored so a migration between vendors leaves an unambiguous
+  /// record of who verified whom, rather than a pile of refs whose origin is guesswork.
+  provider String
+
+  status KycCaseStatus @default(PENDING)
+
+  /// The provider's stated grounds on a rejection. OPERATOR-FACING: it is shown to staff
+  /// handling an appeal and is never returned to the player verbatim, because a precise
+  /// rejection reason is a free oracle for someone iterating on a forged document.
+  decisionReason String?
+  decidedAt      DateTime?
+
+  documents KycDocument[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // 🚫 FORBIDDEN, as everywhere in this schema: any balance or monetary field. Also
+  // forbidden here specifically: any document bytes. See KycDocument.
+
+  /// A player's own verification history, newest first.
+  @@index([userId, createdAt])
+  /// The operational sweep over cases still awaiting a decision.
+  @@index([status, createdAt])
+  @@map("kyc_verifications")
+}
+
+/// METADATA for one uploaded identity document. Never the document.
+///
+/// ─────────────────────────────────────────────────────────────────────────────
+/// THERE IS NO COLUMN HERE THAT CAN HOLD A FILE, AND THAT IS THE DESIGN
+/// ─────────────────────────────────────────────────────────────────────────────
+/// A passport scan is the most sensitive data this platform will ever touch, and the safest
+/// way to hold it is not to. The client PUTs the file straight to the provider's presigned
+/// URL; this row records only that it happened.
+///
+/// No `Bytes` column, no base64 `String`, no data URI, no "content" field of any name. Not as
+/// a convention — as an absence, so that storing bytes would require a migration somebody has
+/// to write and review rather than a line somebody can add.
+///
+/// The reason is concrete. Document bytes in this database would be in every backup, every
+/// read replica, every logical-replication stream and every `pg_dump` a support engineer has
+/// ever taken. A breach would then be a data-protection incident involving government identity
+/// documents rather than a list of email addresses. Keeping them at the provider confines that
+/// risk to a vendor whose whole business is holding it.
+model KycDocument {
+  id String @id @default(uuid())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  verificationId String
+  verification   KycVerification @relation(fields: [verificationId], references: [id], onDelete: Restrict)
+
+  documentType KycDocumentType
+
+  /// The provider's reference for the upload slot. A POINTER, and the only link between this
+  /// row and the file — which lives at the provider and nowhere else.
+  providerUploadRef String @unique
+
+  /// The declared MIME type, kept so an operator can see what was asked for without fetching
+  /// anything. Not trusted for anything: the provider constrains the presigned PUT.
+  contentType String
+
+  /// When the presigned URL stops working. Kept so "the link expired" is answerable without
+  /// calling the provider — the single most common support question on this flow.
+  uploadExpiresAt DateTime
+
+  createdAt DateTime @default(now())
+
+  /// A case's documents, and the player's own list.
+  @@index([verificationId, createdAt])
+  @@index([userId, createdAt])
+  @@map("kyc_documents")
+}
+
+/// The webhook idempotency anchor: one row per provider event this gateway has processed.
+///
+/// ─────────────────────────────────────────────────────────────────────────────
+/// WHY A TABLE RATHER THAN A STATUS CHECK
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Every real provider redelivers. Webhooks are retried on timeout, on a 5xx, and often just
+/// because the vendor's queue is at-least-once — so the SAME decision arrives two, five, fifty
+/// times, sometimes out of order and sometimes concurrently.
+///
+/// Inferring "have I seen this?" from the case's current status does not survive that: two
+/// redeliveries racing each other both read the old status, both decide to act, and both act.
+/// Inserting THIS row first turns the question into a unique-constraint violation, which
+/// Postgres answers correctly no matter how the deliveries interleave.
+///
+/// It also records what the decision WAS, which a status check cannot: a later
+/// `verification.rejected` arriving after an `approved` is a real event the operator must be
+/// able to see, not a no-op to be swallowed because the row already existed.
+model KycWebhookEvent {
+  id String @id @default(uuid())
+
+  /// The PROVIDER's event id. UNIQUE — this is the whole idempotency mechanism. A provider
+  /// that cannot supply a stable event id cannot be made idempotent here, which is why the
+  /// adapter contract requires one (see lib/kyc/types.ts).
+  providerEventId String @unique
+
+  provider  String
+  eventType String
+  caseRef   String
+
+  /// What the gateway DID with it: applied, or ignored and why. The record that distinguishes
+  /// "we never got the decision" from "we got it and declined to act", which are very
+  /// different conversations to have with a regulator.
+  outcome String
+
+  receivedAt DateTime @default(now())
+
+  /// The operational read: recent events for a case, newest first.
+  @@index([caseRef, receivedAt])
+  @@map("kyc_webhook_events")
+}
+
+/// Case status at the provider. Deliberately the same three values as KycStatus, which is what
+/// User.kycStatus holds — a decision maps across without a translation table that could drift.
+enum KycCaseStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum KycDocumentType {
+  PASSPORT
+  DRIVERS_LICENSE
+  NATIONAL_ID
+  PROOF_OF_ADDRESS
+  SELFIE
 }
