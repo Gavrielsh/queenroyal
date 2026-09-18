@@ -1,4 +1,5 @@
 import type { AmoeGrantPeriod, AmoePolicy } from "../lib/amoe-policy";
+import { isMoneyString, isPositiveMoneyString } from "../lib/money";
 
 /**
  * The free-entry offer — THE DATA, kept out of the policy that applies it.
@@ -46,8 +47,66 @@ const AMOE_OFFER: AmoeOffer = {
   period: "DAY",
 };
 
+/**
+ * The active offer, VALIDATED on the way out.
+ *
+ * The amounts above are hand-edited literals — that is the whole point of keeping them in
+ * config, where a compliance reviewer can change them in one diff — and a hand-edited money
+ * string is exactly the kind that arrives as `"5"` or `"5.00001"`. Neither is caught anywhere
+ * else on the outbound path: the engine-payload schema guards only the RECONCILER's replay of
+ * a journaled payload, so a first-attempt dispatch carries whatever this file says.
+ *
+ * What the two bad shapes actually cost is worth being concrete about, because neither looks
+ * like a crash:
+ *
+ *   "5.00001" — more precision than NUMERIC(18,4) holds. The engine refuses it, so every free
+ *               entry fails with an opaque 400 and the statutory route is closed until someone
+ *               reads a log.
+ *   "5"       — accepted by the engine and stored as 5.0000, while the AmoeGrant row keeps the
+ *               literal "5". The money is identical and the two records no longer compare
+ *               equal as strings, which silently breaks the one query the equal-dignity claim
+ *               rests on: free grant versus purchased promo. This is the shape the shared
+ *               `isMoneyString` permits, so the check below is deliberately stricter than it.
+ *
+ * So it is checked here, at the source, where the error can name the field. Throwing is the
+ * right failure: a misconfigured free-entry amount must stop the route, not quietly issue the
+ * wrong thing — and because these are constants, a bad edit fails on the first claim after
+ * deploy rather than intermittently.
+ */
 export function getAmoeOffer(): AmoeOffer {
+  assertMoneyField("scAmount", AMOE_OFFER.scAmount);
+  assertMoneyField("gcAmount", AMOE_OFFER.gcAmount);
+  // A grant of nothing is not a grant — the same rule the engine enforces under its wallet
+  // lock, applied here so a zeroed-out config is a loud startup-shaped failure rather than a
+  // free route that silently hands out nothing.
+  if (!isPositiveMoneyString(AMOE_OFFER.scAmount) && !isPositiveMoneyString(AMOE_OFFER.gcAmount)) {
+    throw new Error("AMOE offer misconfigured: scAmount and gcAmount are both zero; a grant must issue something");
+  }
   return AMOE_OFFER;
+}
+
+/**
+ * Stricter than `isMoneyString`, deliberately.
+ *
+ * The shared helper permits 0–4 decimal places because that is the engine's wire contract —
+ * NUMERIC(18,4) accepts "5" perfectly well, and every other money field in the gateway is
+ * right to allow it. This field is not like the others: its value is written into the
+ * AmoeGrant row AND sent to the ledger, and the equal-dignity query compares that stored
+ * string against a purchase's. "5" and "5.0000" are the same money and different strings, so
+ * only the CANONICAL 4-dp form is acceptable here.
+ *
+ * Requiring it at the source is what makes the guard match its own claim. A check that
+ * accepted "5" would leave the exact failure this function is documented as preventing.
+ */
+const CANONICAL_MONEY = /^\d{1,14}\.\d{4}$/;
+
+function assertMoneyField(field: string, value: string): void {
+  if (!isMoneyString(value) || !CANONICAL_MONEY.test(value)) {
+    throw new Error(
+      `AMOE offer misconfigured: ${field} must be a canonical decimal string with exactly 4 decimal ` +
+        `places (e.g. "5.0000"), got ${JSON.stringify(value)}`,
+    );
+  }
 }
 
 /**

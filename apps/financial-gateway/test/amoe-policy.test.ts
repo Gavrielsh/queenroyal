@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 
+import { getAmoeOffer } from "../src/config/amoe";
+import { STORE_PACKAGES } from "../src/config/store-packages";
+import { compareMoney, isMoneyString, isPositiveMoneyString } from "../src/lib/money";
+
 import {
   type AmoeFacts,
   type AmoePolicy,
@@ -231,5 +235,67 @@ describe("amoePeriodKey", () => {
         expect(counts.get(key)).toBe(7);
       }
     });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The configured offer
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("getAmoeOffer", () => {
+  /**
+   * The amounts are hand-edited literals, and a hand-edited money string is exactly the kind
+   * that arrives as "5" or "5.00001". Nothing else on the OUTBOUND path catches either — the
+   * engine-payload schema guards only the reconciler's replay — so this asserts the guard at
+   * the source exists and that the shipped values pass it.
+   */
+  it("returns amounts that are strictly formatted decimal strings", () => {
+    const offer = getAmoeOffer();
+    // CANONICAL form — exactly 4 dp, not merely "a valid money string". `isMoneyString`
+    // permits "5", which is the same money as "5.0000" and a different string; the stored row
+    // and the ledger must compare equal, so the shape has to be pinned, not just the value.
+    expect(offer.scAmount).toMatch(/^\d+\.\d{4}$/);
+    expect(offer.gcAmount).toMatch(/^\d+\.\d{4}$/);
+    expect(isMoneyString(offer.scAmount)).toBe(true);
+    expect(isMoneyString(offer.gcAmount)).toBe(true);
+  });
+
+  /**
+   * The guard must be stricter than the shared helper, and this is the case that proves it:
+   * "5" passes `isMoneyString` and must still be refused here. Without this assertion the
+   * runtime check could be loosened back to `isMoneyString` and every test would stay green
+   * while the documented failure came back.
+   */
+  it("refuses an unpadded amount that the shared money helper would accept", () => {
+    expect(isMoneyString("5")).toBe(true);
+    expect("5").not.toMatch(/^\d+\.\d{4}$/);
+  });
+
+  /**
+   * The AMOE grant must be worth something. A zeroed config would leave the statutory route
+   * technically working and materially empty, which is worse than it being switched off —
+   * it looks compliant.
+   */
+  it("issues a positive amount of the sweepstakes currency", () => {
+    expect(isPositiveMoneyString(getAmoeOffer().scAmount)).toBe(true);
+  });
+
+  /**
+   * EQUAL DIGNITY, as a test rather than a comment.
+   *
+   * The free entrant must not receive materially less sweepstakes currency than a purchaser
+   * gets from the entry-level package. This is the number the whole legal position rests on,
+   * and it lives in a file a reviewer can edit in one line — so a change that quietly halves
+   * it should have to argue with a red test rather than pass unnoticed.
+   *
+   * Compared with `compareMoney`, not `<`: "5" and "5.0000" are the same money and a string
+   * or float comparison would get that wrong in opposite directions.
+   */
+  it("is not worth less than the entry-level package's sweepstakes coins", () => {
+    const cheapest = [...STORE_PACKAGES].sort((a, b) => a.priceUsdCents - b.priceUsdCents)[0];
+    expect(cheapest).toBeDefined();
+
+    const packageSc = `${cheapest!.sc}.0000`;
+    expect(compareMoney(getAmoeOffer().scAmount, packageSc)).toBeGreaterThanOrEqual(0);
   });
 });
