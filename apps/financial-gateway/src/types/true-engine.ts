@@ -216,6 +216,35 @@ export interface CreatePlayerPayload {
   status?: string;
 }
 
+/**
+ * POST /api/v1/kyc/decision — relay a terminal identity-verification decision (Task C4).
+ *
+ * `external_id` is our local `User.id`, the SAME value already sent as `external_id` on
+ * `CreatePlayerPayload` — Zone 1 addresses the player by it directly, so no lookup of the
+ * engine's own `player_id` is needed to dispatch this call.
+ *
+ * `decided_at` is the PROVIDER's decision instant (RFC3339), never the receipt time: it is
+ * the value Zone 1's own out-of-order resolution compares against its stored baseline.
+ */
+export interface KycDecisionPayload {
+  external_id: string;
+  event_id: string; // the provider's event id — Zone 1's idempotency anchor for this decision
+  decision: "VERIFIED" | "REJECTED";
+  decided_at: string; // RFC3339
+  reason?: string;
+}
+
+/** The `result` object inside a successful /api/v1/kyc/decision envelope. */
+export interface KycDecisionResult {
+  player_id: string;
+  event_id: string;
+  decision: "VERIFIED" | "REJECTED";
+  /** Whether THIS decision changed the engine's player status — false when Zone 1's own
+   * out-of-order check found it superseded by an already-applied newer decision. */
+  applied: boolean;
+  reason?: string;
+}
+
 export type EngineTxStatus = "PROCESSED" | "CACHED" | "GHOST_RECOVERED";
 
 /** The `result` object inside a successful bet/win/purchase/rollback envelope. */

@@ -162,12 +162,14 @@ export class MockKycProvider implements KycProvider {
    * rather than bypassing it. The mirror of MockPaymentProvider.buildSignedWebhook.
    *
    * `eventId` is settable because webhook idempotency is keyed on the provider's event id, and
-   * a test that cannot re-send the SAME id cannot prove a redelivery is absorbed.
+   * a test that cannot re-send the SAME id cannot prove a redelivery is absorbed. `decidedAt`
+   * is settable for the same reason: out-of-order resolution is keyed on it, and two decisions
+   * built back-to-back in a test can otherwise land in the same millisecond.
    */
   buildSignedWebhook(
     caseRef: string,
     status: KycCaseStatus,
-    opts: { eventId?: string; reason?: string; userRef?: string } = {},
+    opts: { eventId?: string; reason?: string; userRef?: string; decidedAt?: Date } = {},
   ): { rawBody: string; signature: string; eventId: string } {
     const kase = this.cases.get(caseRef);
     const eventId = opts.eventId ?? `kyc_evt_${randomUUID()}`;
@@ -178,7 +180,7 @@ export class MockKycProvider implements KycProvider {
       user_ref: opts.userRef ?? kase?.userRef ?? "",
       status,
       ...(opts.reason ? { reason: opts.reason } : {}),
-      decided_at: new Date().toISOString(),
+      decided_at: (opts.decidedAt ?? new Date()).toISOString(),
     };
     const rawBody = JSON.stringify(body);
     const signature = createHmac("sha256", this.webhookSecret).update(rawBody, "utf8").digest("hex");

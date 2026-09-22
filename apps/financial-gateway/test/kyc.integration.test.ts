@@ -13,6 +13,7 @@ import { signAccessToken } from "../src/lib/jwt";
 import { MockKycProvider, setKycProvider } from "../src/lib/kyc";
 import { handleKycDecisionEvent } from "../src/services/kyc-webhook.service";
 import { requestDocumentUpload } from "../src/services/kyc.service";
+import { type Directive, engineCalls, resetEngine, setEngineHandler } from "./fakes/engine.fake";
 import {
   getKycDocuments,
   getKycVerifications,
@@ -35,6 +36,18 @@ import {
 const JWT_SECRET = "test-jwt-secret-0123456789abcdef";
 const KYC_SECRET = "test-kyc-webhook-secret-0123";
 const REDIS_URL = process.env.REDIS_TEST_URL ?? "redis://127.0.0.1:6380";
+
+const unexpected: Directive = { ok: false, status: 500, body: { code: "UNEXPECTED" } };
+
+/** The default True Engine response to a relayed approval: applied, as a fresh decision would be. */
+function approvedByEngine(call: { body: unknown }): Directive {
+  const body = call.body as { external_id: string; event_id: string; decision: string };
+  return {
+    ok: true,
+    status: 200,
+    body: { code: "OK", result: { player_id: body.external_id, event_id: body.event_id, decision: body.decision, applied: true } },
+  };
+}
 
 const USER_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const OTHER_USER_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
@@ -102,6 +115,8 @@ afterAll(async () => {
 
 beforeEach(async () => {
   resetDb();
+  resetEngine();
+  setEngineHandler((call) => (call.path === "/api/v1/kyc/decision" ? approvedByEngine(call) : unexpected));
   provider = new MockKycProvider(KYC_SECRET);
   setKycProvider(provider);
   seedUser({ id: USER_ID, email: "kyc@example.test", kycStatus: "PENDING", trueEnginePlayerId: "engine-kyc" });
@@ -398,7 +413,13 @@ describe("webhook idempotency", () => {
   it("applies a later rejection that reverses an earlier approval", async () => {
     const caseRef = await openCase();
 
-    const approve = provider.buildSignedWebhook(caseRef, "APPROVED", { userRef: USER_ID });
+    // Explicit, ordered decidedAt: two decisions built back-to-back must not land in the
+    // same millisecond, or C4's out-of-order guard would (correctly) treat the second as
+    // stale rather than as the reversal this test means to exercise.
+    const approve = provider.buildSignedWebhook(caseRef, "APPROVED", {
+      userRef: USER_ID,
+      decidedAt: new Date("2026-01-01T00:00:00Z"),
+    });
     await app.inject({
       method: "POST",
       url: "/api/webhooks/kyc",
@@ -406,7 +427,11 @@ describe("webhook idempotency", () => {
       payload: approve.rawBody,
     });
 
-    const reject = provider.buildSignedWebhook(caseRef, "REJECTED", { userRef: USER_ID, reason: "document expired" });
+    const reject = provider.buildSignedWebhook(caseRef, "REJECTED", {
+      userRef: USER_ID,
+      reason: "document expired",
+      decidedAt: new Date("2026-01-02T00:00:00Z"),
+    });
     const res = await app.inject({
       method: "POST",
       url: "/api/webhooks/kyc",
@@ -662,15 +687,177 @@ describe("the decision reaches the gate", () => {
     await requestDocumentUpload(claims(), { documentType: "PASSPORT", contentType: "image/jpeg" });
     const caseRef = getKycVerifications()[0]!.providerCaseRef as string;
 
-    const approve = provider.buildSignedWebhook(caseRef, "APPROVED", { userRef: USER_ID });
+    const approve = provider.buildSignedWebhook(caseRef, "APPROVED", {
+      userRef: USER_ID,
+      decidedAt: new Date("2026-01-01T00:00:00Z"),
+    });
     await handleKycDecisionEvent(provider.parseWebhook(approve.rawBody, approve.signature));
 
     const { prismaFake } = await import("./fakes/prisma.fake");
     expect((await prismaFake.user.findUnique({ where: { id: USER_ID } }))!.kycStatus).toBe("VERIFIED");
 
-    const reject = provider.buildSignedWebhook(caseRef, "REJECTED", { userRef: USER_ID, reason: "expired" });
+    const reject = provider.buildSignedWebhook(caseRef, "REJECTED", {
+      userRef: USER_ID,
+      reason: "expired",
+      decidedAt: new Date("2026-01-02T00:00:00Z"),
+    });
     await handleKycDecisionEvent(provider.parseWebhook(reject.rawBody, reject.signature));
 
     expect((await prismaFake.user.findUnique({ where: { id: USER_ID } }))!.kycStatus).toBe("REJECTED");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Zone 1 relay (Task C4) — the approval crosses the boundary, and only the approval
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("relaying an approval to Zone 1 (C4)", () => {
+  async function openCase(): Promise<string> {
+    await requestDocumentUpload(claims(), { documentType: "PASSPORT", contentType: "image/jpeg" });
+    return getKycVerifications()[0]!.providerCaseRef as string;
+  }
+
+  /** Sign an event whose `decided_at` is caller-chosen, for the out-of-order tests below. */
+  function signedEventAt(
+    caseRef: string,
+    status: "APPROVED" | "REJECTED",
+    decidedAt: Date,
+    opts: { eventId?: string; reason?: string } = {},
+  ): { rawBody: string; signature: string; eventId: string } {
+    const eventId = opts.eventId ?? `kyc_evt_${decidedAt.getTime()}_${Math.random().toString(36).slice(2)}`;
+    const body = {
+      id: eventId,
+      type: status === "APPROVED" ? "verification.approved" : "verification.rejected",
+      case_ref: caseRef,
+      user_ref: USER_ID,
+      status,
+      ...(opts.reason ? { reason: opts.reason } : {}),
+      decided_at: decidedAt.toISOString(),
+    };
+    const rawBody = JSON.stringify(body);
+    return { rawBody, signature: provider.sign(rawBody), eventId };
+  }
+
+  it("dispatches the approval to Zone 1 with only identity and decision fields — no balances", async () => {
+    const caseRef = await openCase();
+    const { rawBody, signature, eventId } = provider.buildSignedWebhook(caseRef, "APPROVED", { userRef: USER_ID });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/webhooks/kyc",
+      headers: { "content-type": "application/json", "x-kyc-signature": signature },
+      payload: rawBody,
+    });
+
+    expect(res.statusCode).toBe(200);
+    const calls = engineCalls.filter((c) => c.path === "/api/v1/kyc/decision");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.body).toMatchObject({
+      external_id: USER_ID,
+      event_id: eventId,
+      decision: "VERIFIED",
+    });
+    // The No-Float Law: nothing balance-shaped travels with a KYC decision.
+    for (const forbidden of ["amount", "balance", "gc", "sc", "currency", "gc_amount", "sc_amount"]) {
+      expect(Object.keys(calls[0]!.body as object).map((k) => k.toLowerCase())).not.toContain(forbidden);
+    }
+  });
+
+  it("does not dispatch to Zone 1 for a rejection", async () => {
+    const caseRef = await openCase();
+    const { rawBody, signature } = provider.buildSignedWebhook(caseRef, "REJECTED", { userRef: USER_ID, reason: "bad doc" });
+
+    await app.inject({
+      method: "POST",
+      url: "/api/webhooks/kyc",
+      headers: { "content-type": "application/json", "x-kyc-signature": signature },
+      payload: rawBody,
+    });
+
+    expect(engineCalls.filter((c) => c.path === "/api/v1/kyc/decision")).toHaveLength(0);
+  });
+
+  /**
+   * Out-of-order absorption: a redelivered or late-arriving decision that predates the case's
+   * CURRENT decidedAt must be recorded but never relayed — relaying it would ask Zone 1 to
+   * reconsider a player it has already resolved from a newer decision.
+   */
+  it("absorbs a stale, out-of-order approval without a second Zone 1 dispatch", async () => {
+    const caseRef = await openCase();
+    const newer = signedEventAt(caseRef, "APPROVED", new Date("2026-01-02T00:00:00Z"));
+    const first = await app.inject({
+      method: "POST",
+      url: "/api/webhooks/kyc",
+      headers: { "content-type": "application/json", "x-kyc-signature": newer.signature },
+      payload: newer.rawBody,
+    });
+    expect(first.json().data).toMatchObject({ handled: true, outcome: "approved" });
+    expect(engineCalls.filter((c) => c.path === "/api/v1/kyc/decision")).toHaveLength(1);
+
+    const stale = signedEventAt(caseRef, "APPROVED", new Date("2026-01-01T00:00:00Z"));
+    const second = await app.inject({
+      method: "POST",
+      url: "/api/webhooks/kyc",
+      headers: { "content-type": "application/json", "x-kyc-signature": stale.signature },
+      payload: stale.rawBody,
+    });
+
+    expect(second.statusCode).toBe(200);
+    expect(second.json().data).toMatchObject({ handled: false, outcome: "stale_superseded" });
+    // Recorded for the audit trail, but the second (older) decision never reached Zone 1.
+    expect(engineCalls.filter((c) => c.path === "/api/v1/kyc/decision")).toHaveLength(1);
+    expect(getKycWebhookEvents()).toHaveLength(2);
+    expect(getKycVerifications()[0]!.status).toBe("APPROVED");
+  });
+
+  /** An equal decidedAt is stale too — "strictly newer" is the bar, matching Zone 1's own check. */
+  it("treats an equal decidedAt as stale, not as newer", async () => {
+    const caseRef = await openCase();
+    const at = new Date("2026-01-01T00:00:00Z");
+    const first = signedEventAt(caseRef, "APPROVED", at);
+    await app.inject({
+      method: "POST",
+      url: "/api/webhooks/kyc",
+      headers: { "content-type": "application/json", "x-kyc-signature": first.signature },
+      payload: first.rawBody,
+    });
+
+    const second = signedEventAt(caseRef, "APPROVED", at);
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/webhooks/kyc",
+      headers: { "content-type": "application/json", "x-kyc-signature": second.signature },
+      payload: second.rawBody,
+    });
+
+    expect(res.json().data).toMatchObject({ handled: false, outcome: "stale_superseded" });
+    expect(engineCalls.filter((c) => c.path === "/api/v1/kyc/decision")).toHaveLength(1);
+  });
+
+  /**
+   * A dispatch failure must surface as a failure, not a silent partial sync: the webhook event
+   * is left in "received" (never reaches "approved") so the provider's redelivery is exactly
+   * the recovery this depends on, and `User.kycStatus` has already moved by the time this is
+   * hit — Zone 2's own state and Zone 1's are momentarily inconsistent until the retry lands,
+   * which is why Zone 1 remains the final arbiter of `applied` rather than trusting Zone 2's.
+   */
+  it("surfaces a Zone 1 dispatch failure as a 500 and leaves the event unresolved", async () => {
+    setEngineHandler(() => ({ ok: false, status: 503, body: { code: "ENGINE_UNAVAILABLE", message: "down" } }));
+    const caseRef = await openCase();
+    const { rawBody, signature, eventId } = provider.buildSignedWebhook(caseRef, "APPROVED", { userRef: USER_ID });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/webhooks/kyc",
+      headers: { "content-type": "application/json", "x-kyc-signature": signature },
+      payload: rawBody,
+    });
+
+    expect(res.statusCode).toBe(500);
+    const events = getKycWebhookEvents();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.providerEventId).toBe(eventId);
+    expect(events[0]!.outcome).toBe("received");
   });
 });

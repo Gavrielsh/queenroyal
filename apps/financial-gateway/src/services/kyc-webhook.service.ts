@@ -1,6 +1,7 @@
 import { getKycProvider, type KycCaseStatus, type KycDecisionEvent } from "../lib/kyc";
 import { childLogger } from "../lib/logger";
 import { getPrisma } from "../lib/prisma";
+import { trueEngine } from "../lib/true-engine";
 
 /**
  * KYC decision intake — the path that decides whether a player may ever redeem.
@@ -134,6 +135,21 @@ export async function handleKycDecisionEvent(event: KycDecisionEvent, traceId?: 
 
   const decidedAt = event.decidedAt ?? new Date();
 
+  // Out-of-order resolution (Task C4, requirement 3). Compared against the case's OWN
+  // previously-recorded decidedAt, never against wall-clock receipt time: a provider
+  // redelivering an old decision after a newer one has already landed must be recorded for
+  // the audit trail but must never downgrade — or redundantly re-apply — a player already
+  // resolved by that newer decision. An equal timestamp is treated as stale (not "strictly
+  // newer"), matching Zone 1's own out-of-order check (internal/repository/kyc.go).
+  if (verification.decidedAt && decidedAt <= verification.decidedAt) {
+    await finish(event.id, "stale_superseded");
+    log.warn(
+      { incoming_decided_at: decidedAt, current_decided_at: verification.decidedAt },
+      "kyc decision predates the case's current decision; recorded but NOT applied",
+    );
+    return { handled: false, outcome: "stale_superseded" };
+  }
+
   // The case row and the player's status move together. A verification marked APPROVED whose
   // user is still PENDING — or the reverse — is the inconsistency every gate downstream would
   // read differently depending on which it happened to consult.
@@ -151,6 +167,32 @@ export async function handleKycDecisionEvent(event: KycDecisionEvent, traceId?: 
       data: { kycStatus: STATUS_TO_KYC[event.status] },
     });
   });
+
+  // Zone 1 (the True Engine) is the single source of truth for player status, so an approval
+  // is relayed to transition KYC_PENDING → ACTIVE there too. NO FINANCIAL STATE crosses this
+  // boundary — external_id and a decision are the entire payload; nothing balance-shaped is
+  // read, computed, or forwarded (the No-Float Law). Zone 1 independently re-derives `applied`
+  // from ITS OWN out-of-order baseline rather than trusting the check just performed above, so
+  // it remains the final arbiter even if the two zones' views of "current" ever diverge.
+  //
+  // Left UNCAUGHT deliberately: a dispatch failure must surface to the route as a failure
+  // (500) rather than a silent partial sync, and the webhook-event row is left in "received"
+  // (never reaches `finish`) rather than falsely marked "approved" — the same crash-recovery
+  // posture already used for the insert-before-act idempotency barrier above.
+  if (event.status === "APPROVED") {
+    const dispatch = await trueEngine().sendKycDecision({
+      external_id: verification.userId,
+      event_id: event.id,
+      decision: "VERIFIED",
+      decided_at: decidedAt.toISOString(),
+      ...(event.reason ? { reason: event.reason } : {}),
+    });
+    if (!dispatch.ok) {
+      log.error({ engine_error: dispatch.error }, "failed to relay approved kyc decision to True Engine");
+      throw new Error(`True Engine KYC dispatch failed: ${dispatch.error.code}`);
+    }
+    log.info({ engine_applied: dispatch.data.applied }, "kyc approval relayed to True Engine");
+  }
 
   await finish(event.id, event.status === "APPROVED" ? "approved" : "rejected");
 

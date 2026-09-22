@@ -7,6 +7,8 @@ import type {
   CreatePlayerResult,
   EngineSuccessEnvelope,
   EngineTxResult,
+  KycDecisionPayload,
+  KycDecisionResult,
   PromoGrantPayload,
   PurchasePayload,
   RedeemPayload,
@@ -49,6 +51,7 @@ const ENGINE_ENDPOINTS = {
   redemptionRefund: "/api/v1/store/redeem/refund",
   createPlayer: "/api/v1/player/create",
   session: "/api/v1/session",
+  kycDecision: "/api/v1/kyc/decision",
 } as const;
 
 export class TrueEngineClient {
@@ -167,6 +170,20 @@ export class TrueEngineClient {
    */
   getBalances(payload: SessionPayload): Promise<TrueEngineResult<SessionBalancesResult>> {
     return this.post<SessionBalancesResult>(ENGINE_ENDPOINTS.session, payload);
+  }
+
+  /**
+   * Relay a terminal KYC decision (Task C4). Zone 1 is the single source of truth for the
+   * resulting player status: it independently re-evaluates `decided_at` against its own
+   * out-of-order baseline rather than trusting this gateway's resolution, so `applied` in the
+   * response may legitimately come back `false` even for a decision this gateway just applied.
+   *
+   * SAFE TO RETRY. `event_id` is the engine's idempotency anchor — the same provider event id
+   * already used to de-duplicate this webhook delivery on the gateway side — so a redelivered
+   * decision collapses onto the SAME audit row rather than creating a second one.
+   */
+  sendKycDecision(payload: KycDecisionPayload): Promise<TrueEngineResult<KycDecisionResult>> {
+    return this.postTx<KycDecisionResult>(ENGINE_ENDPOINTS.kycDecision, payload);
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────────
