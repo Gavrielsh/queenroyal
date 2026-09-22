@@ -143,7 +143,7 @@ jobs:
           node -e '
             const fs = require("fs");
             const expected = {
-              "Zone 3 (src/)":  { file: "zone3.json",                        files: 18, tests: 274 },
+              "Zone 3 (src/)":  { file: "zone3.json",                        files: 20, tests: 281 },
               "gateway":        { file: "apps/financial-gateway/gateway.json", files: 29, tests: 383 },
             };
             let failed = false;

@@ -1,5 +1,35 @@
 import Link from "next/link";
 
+import { CandyIcon, type CandyIconName } from "@/components/art/CandyIcon";
+import { QueenMascot } from "@/components/art/QueenMascot";
+
+/**
+ * The three-currency explainer. Copy is sweepstakes legal framing (see the Footer): Gold Coins
+ * are valueless entertainment currency, Sweeps Coins are promotional with free entry, and
+ * redemptions are prize fulfillment. Card surfaces are chosen so the white body copy stays
+ * at or above 4.5:1 on the lightest stop of each gradient.
+ */
+const EXPLAINERS: ReadonlyArray<{ icon: CandyIconName; title: string; body: string; surface: string }> = [
+  {
+    icon: "coin",
+    title: "Gold Coins",
+    body: "The entertainment currency. Spin and play purely for fun — Gold Coins never have monetary value.",
+    surface: "bg-gradient-to-br from-[#b45309] to-[#7c2d12]",
+  },
+  {
+    icon: "sc",
+    title: "Sweeps Coins",
+    body: "Promotional coins granted free with purchases and free methods of entry. Play them through — no purchase ever necessary.",
+    surface: "bg-gradient-to-br from-[#047857] to-[#064e3b]",
+  },
+  {
+    icon: "trophy",
+    title: "Prize Redemptions",
+    body: "Eligible Sweeps Coins winnings become redeemable for real prizes once played through, straight from the ledger.",
+    surface: "bg-gradient-to-br from-[#6d28d9] to-[#3b0764]",
+  },
+];
+
 /**
  * Landing page (Zone 3, server-rendered, static). Pure presentation: brand hero, the
  * sweepstakes-model explainer, and the compliance strip. All money verbiage is display copy
@@ -9,88 +39,60 @@ export default function HomePage() {
   return (
     <main className="relative overflow-hidden">
       {/* Hero */}
-      <section className="relative mx-auto w-full max-w-6xl px-4 pb-20 pt-24 text-center sm:pt-32">
-        {/* Ambient glow behind the crown — pure decoration. */}
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-x-0 top-0 mx-auto h-80 max-w-3xl rounded-full bg-gc/10 blur-3xl"
-        />
+      <section className="mx-auto w-full max-w-6xl px-4 pb-16 pt-10 sm:pt-14">
+        <div className="relative grid items-center gap-6 overflow-hidden rounded-[2rem] border-2 border-white/10 bg-[radial-gradient(circle_at_50%_88%,#a855f7_0%,#7c3aed_24%,#4c1d95_52%,#2e1065_100%)] md:bg-[radial-gradient(circle_at_78%_70%,#a855f7_0%,#7c3aed_24%,#4c1d95_52%,#2e1065_100%)] px-6 pt-8 shadow-glow-brand md:grid-cols-[1.05fr_1fr] md:px-10 md:pt-10">
+          <div className="relative z-10 pb-8 text-center md:pb-12 md:text-left">
+            <span className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-black/25 py-1 pl-1.5 pr-3 text-sm font-extrabold text-ink">
+              <CandyIcon name="crown" className="h-6 w-6" />
+              The social sweepstakes casino
+            </span>
+            <h1 className="mt-4 font-display text-5xl font-semibold leading-none tracking-tight text-ink sm:text-7xl">
+              Queen<span className="text-gc">Royal</span>
+            </h1>
+            <p className="mx-auto mt-5 max-w-xl text-base font-semibold leading-relaxed text-[#ede4ff] sm:text-lg md:mx-0">
+              The social sweepstakes casino floor. Spin for fun with Gold Coins, play promotional
+              Sweeps Coins free of charge — and redeem eligible winnings for real prizes.
+            </p>
 
-        <span
-          aria-hidden="true"
-          className="relative inline-block bg-gradient-to-b from-gc to-gc-deep bg-clip-text text-6xl text-transparent drop-shadow-[0_0_25px_rgba(245,182,46,0.35)]"
-        >
-          ♛
-        </span>
-        <h1 className="relative mt-4 bg-gradient-to-r from-gc via-yellow-200 to-gc bg-clip-text text-5xl font-black tracking-tight text-transparent sm:text-7xl">
-          QueenRoyal
-        </h1>
-        <p className="relative mx-auto mt-5 max-w-2xl text-base leading-relaxed text-ink-mute sm:text-lg">
-          The social sweepstakes casino floor. Spin for fun with Gold Coins, play promotional
-          Sweeps Coins free of charge — and redeem eligible winnings for real prizes.
-        </p>
+            <div className="mt-8 flex flex-wrap items-center justify-center gap-4 md:justify-start">
+              <Link href="/casino" className="btn-candy btn-gold px-7 py-4 text-lg">
+                <CandyIcon name="slot" className="-my-2 h-8 w-8" />
+                Enter the Casino Floor
+              </Link>
+              <a
+                href="#how-it-works"
+                className="inline-flex min-h-11 items-center rounded-control border-2 border-white/25 px-6 py-3 font-display text-base font-medium text-ink transition hover:border-white/50"
+              >
+                How it works
+              </a>
+            </div>
 
-        <div className="relative mt-9 flex flex-wrap items-center justify-center gap-4">
-          <Link
-            href="/casino"
-            className="rounded-control bg-gradient-to-r from-gc via-yellow-400 to-gc px-8 py-4 text-sm font-black uppercase tracking-widest text-surface-0 shadow-glow-gc transition hover:brightness-110 active:scale-[0.98]"
-          >
-            Enter the Casino Floor
-          </Link>
-          <a
-            href="#how-it-works"
-            className="rounded-control border border-edge px-6 py-4 text-sm font-bold uppercase tracking-widest text-ink-mute transition hover:border-edge-strong hover:text-ink"
-          >
-            How it works
-          </a>
+            <p className="mt-6 text-xs font-bold uppercase tracking-wider text-[#ede4ff]">
+              18+ · No purchase necessary · Void where prohibited
+            </p>
+          </div>
+
+          <QueenMascot className="relative mx-auto w-full max-w-md self-end" />
         </div>
-
-        <p className="relative mt-6 text-xs font-semibold uppercase tracking-wider text-ink-faint">
-          18+ · No purchase necessary · Void where prohibited
-        </p>
       </section>
 
       {/* Sweepstakes-model explainer */}
       <section id="how-it-works" className="mx-auto w-full max-w-6xl px-4 pb-24">
+        <h2 className="mb-6 text-center font-display text-3xl font-semibold text-ink">How it works</h2>
         <div className="grid gap-5 md:grid-cols-3">
-          <article className="rounded-card border border-edge bg-surface-1 p-7">
-            <p className="text-2xl" aria-hidden="true">
-              🪙
-            </p>
-            <h2 className="mt-3 text-sm font-black uppercase tracking-widest text-gc">
-              Gold Coins
-            </h2>
-            <p className="mt-2 text-sm leading-relaxed text-ink-mute">
-              The entertainment currency. Spin and play purely for fun — Gold Coins never have
-              monetary value.
-            </p>
-          </article>
-
-          <article className="rounded-card border border-edge bg-surface-1 p-7">
-            <p className="text-2xl" aria-hidden="true">
-              🎟️
-            </p>
-            <h2 className="mt-3 text-sm font-black uppercase tracking-widest text-sc-unplayed">
-              Sweeps Coins
-            </h2>
-            <p className="mt-2 text-sm leading-relaxed text-ink-mute">
-              Promotional coins granted free with purchases and free methods of entry. Play them
-              through — no purchase ever necessary.
-            </p>
-          </article>
-
-          <article className="rounded-card border border-edge bg-surface-1 p-7">
-            <p className="text-2xl" aria-hidden="true">
-              🏆
-            </p>
-            <h2 className="mt-3 text-sm font-black uppercase tracking-widest text-sc-redeemable">
-              Prize Redemptions
-            </h2>
-            <p className="mt-2 text-sm leading-relaxed text-ink-mute">
-              Eligible Sweeps Coins winnings become redeemable for real prizes once played
-              through, straight from the ledger.
-            </p>
-          </article>
+          {EXPLAINERS.map((card) => (
+            <article
+              key={card.title}
+              className={`group rounded-card border-2 border-white/10 p-7 shadow-lift ${card.surface}`}
+            >
+              <CandyIcon
+                name={card.icon}
+                className="h-16 w-16 drop-shadow-[0_6px_8px_rgba(0,0,0,0.35)] group-hover:animate-wiggle"
+              />
+              <h3 className="mt-4 font-display text-xl font-semibold text-ink">{card.title}</h3>
+              <p className="mt-2 text-sm font-semibold leading-relaxed text-ink">{card.body}</p>
+            </article>
+          ))}
         </div>
 
         {/* Trust strip — honest engineering claims only. Every line here must name
@@ -107,7 +109,7 @@ export default function HomePage() {
             false claim this page could carry: a player at risk could choose the product
             BECAUSE of it. Restore the line only when the tools ship and are reachable
             from the UI — not when they are merely planned. */}
-        <div className="mt-10 grid gap-4 rounded-card border border-edge bg-surface-1/60 p-6 text-center sm:grid-cols-2">
+        <div className="mt-10 grid gap-4 rounded-card border-2 border-edge bg-surface-1/70 p-6 text-center sm:grid-cols-2">
           <p className="text-xs font-semibold uppercase tracking-wider text-ink-faint">
             Double-entry ledger accuracy
           </p>
