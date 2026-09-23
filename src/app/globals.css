@@ -1,7 +1,11 @@
 @import "tailwindcss";
 
 /**
- * QueenRoyal design tokens — Tailwind 4 CSS-first theme (M3-T2).
+ * QueenRoyal design tokens — Tailwind 4 CSS-first theme (M3-T2, "royal candy" refresh).
+ *
+ * Look: friendly, illustrated social casino — deep royal purple surfaces, chunky pill
+ * buttons with a pressed-in bottom edge, rounded display type (Fredoka) over a soft body
+ * face (Nunito). Brand accents are violet + candy pink; money colors are unchanged in role.
  *
  * DARK-ONLY BY DESIGN: this is a casino floor; there is no light theme and none is planned.
  * `color-scheme: dark` is declared globally so form controls/scrollbars follow.
@@ -11,57 +15,72 @@
  *   SC Unplayed            → --color-sc-unplayed  (emerald)
  *   SC Redeemable          → --color-sc-redeemable (sky)
  *
- * Text tokens are contrast-locked against the darkest surfaces (--color-surface-0/1):
- *   --color-ink        ≈ 17.9:1   primary copy
- *   --color-ink-mute   ≈  7.7:1   secondary copy
- *   --color-ink-faint  ≈  4.6:1   microcopy floor (the WCAG AA 4.5:1 minimum, verified)
- * (Ratios computed against #0b0b10; see the M3-T2 task report for the full table.)
+ * Text tokens are contrast-locked against every surface (--color-surface-0…3):
+ *   --color-ink        ≥ 12.1:1   primary copy
+ *   --color-ink-mute   ≥  7.7:1   secondary copy
+ *   --color-ink-faint  ≥  4.5:1   microcopy floor (the WCAG AA minimum, on surface-3)
+ * (WCAG 2.1 ratios; surface-1 #1d0b3c: ink 16.5, mute 10.5, faint 6.1.)
  */
 @theme {
   /* ── Typography ─────────────────────────────────────────────────────────── */
-  /* --font-manrope is injected by next/font in layout.tsx (self-hosted, display:swap). */
+  /* --font-nunito / --font-fredoka are injected by next/font in layout.tsx (self-hosted,
+     display:swap). Body copy is Nunito; headings, numbers-as-hero and buttons use Fredoka. */
   --font-sans:
-    var(--font-manrope), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    var(--font-nunito), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
+  --font-display: var(--font-fredoka), var(--font-nunito), ui-rounded, system-ui, sans-serif;
 
   /* ── Surfaces (dark-only elevation scale) ───────────────────────────────── */
-  --color-surface-0: #050507; /* page depth */
-  --color-surface-1: #0b0b10; /* card base */
-  --color-surface-2: #14141b; /* raised panel */
-  --color-surface-3: #1d1d27; /* highest elevation */
-  --color-edge: #26262f; /* hairline borders */
-  --color-edge-strong: #3a3a46;
+  --color-surface-0: #14062b; /* page depth */
+  --color-surface-1: #1d0b3c; /* card base */
+  --color-surface-2: #2a1458; /* raised panel */
+  --color-surface-3: #3a1c72; /* highest elevation */
+  --color-edge: #4a2a8a; /* hairline borders */
+  --color-edge-strong: #6b46c1;
+
+  /* ── Brand ──────────────────────────────────────────────────────────────── */
+  --color-brand: #7c3aed; /* royal violet — white text on it is 5.7:1 */
+  --color-brand-hi: #a78bfa;
+  --color-brand-deep: #4c1d95;
+  --color-candy: #ff4fa3; /* candy pink — badges, hot highlights */
+  --color-gold-hi: #ffe08a;
 
   /* ── Text (contrast-locked, see header) ─────────────────────────────────── */
-  --color-ink: #f4f4f6;
-  --color-ink-mute: #a9a9b4;
-  --color-ink-faint: #7d7d8a;
+  --color-ink: #f7f3ff;
+  --color-ink-mute: #cdbef2;
+  --color-ink-faint: #a08cd0;
 
   /* ── Currency families ──────────────────────────────────────────────────── */
-  --color-gc: #f5b62e;
-  --color-gc-deep: #b97f0a;
-  --color-sc-unplayed: #34d399;
-  --color-sc-unplayed-deep: #0f9b6c;
+  --color-gc: #ffc83d;
+  --color-gc-deep: #e08e0b;
+  --color-sc-unplayed: #3be39b;
+  --color-sc-unplayed-deep: #17a36a;
   --color-sc-redeemable: #38bdf8;
   --color-sc-redeemable-deep: #0284c7;
 
   /* ── Global semantics ───────────────────────────────────────────────────── */
-  --color-success: #34d399;
-  --color-danger: #f87171;
+  --color-success: #3be39b;
+  --color-danger: #ff8a8a;
   --color-warning: #fbbf24;
   /* Distinct state accents for money-flow UI (stale ≠ error; pending ≠ loading). */
   --color-stale: #fbbf24;
-  --color-pending: #a78bfa;
-  --color-focus: #7dd3fc;
+  --color-pending: #f0abfc; /* fuchsia: must not read as the violet brand */
+  --color-focus: #ffe08a; /* gold ring — the one color every purple surface contrasts with */
 
   /* ── Radii ───────────────────────────────────────────────────────────────── */
-  --radius-card: 1.5rem; /* window shells */
-  --radius-control: 0.875rem; /* buttons */
-  --radius-chip: 0.75rem; /* balance chips, badges */
+  --radius-card: 1.75rem; /* window shells */
+  --radius-control: 9999px; /* buttons are pills */
+  --radius-chip: 1rem; /* balance chips, badges */
 
   /* ── Glows (brand shadows) ──────────────────────────────────────────────── */
-  --shadow-glow-gc: 0 0 60px -15px rgb(245 182 46 / 0.4);
-  --shadow-glow-sc: 0 0 60px -15px rgb(52 211 153 / 0.4);
+  --shadow-glow-gc: 0 0 60px -15px rgb(255 200 61 / 0.45);
+  --shadow-glow-sc: 0 0 60px -15px rgb(59 227 155 / 0.4);
+  --shadow-glow-brand: 0 0 70px -18px rgb(167 139 250 / 0.55);
+  /* "Candy" buttons: a solid darker bottom edge that the :active state presses into. */
+  --shadow-candy-gold: 0 4px 0 #b86a00, 0 10px 22px -8px rgb(255 200 61 / 0.55);
+  --shadow-candy-green: 0 4px 0 #0f7a4d, 0 10px 22px -8px rgb(59 227 155 / 0.45);
+  --shadow-candy-violet: 0 4px 0 #3b1480, 0 10px 22px -8px rgb(124 58 237 / 0.5);
+  --shadow-candy-pressed: 0 1px 0 rgb(0 0 0 / 0.35);
   --shadow-glow-danger: 0 0 50px -15px rgb(248 113 113 / 0.45);
   --shadow-lift: 0 10px 30px -12px rgb(0 0 0 / 0.7);
 
@@ -76,6 +95,13 @@
   --animate-pulse-glow: pulse-glow 1.4s var(--ease-settle) 1;
   --animate-settle-pop: settle-pop 600ms var(--ease-settle) both;
   --animate-reel-spin: reel-spin 240ms var(--ease-reel) infinite;
+  --ease-bounce: cubic-bezier(0.3, 1.6, 0.5, 1);
+  --animate-reel-land: reel-land 520ms var(--ease-bounce) both;
+  --animate-float: float 3.2s ease-in-out infinite;
+  --animate-wiggle: wiggle 0.5s ease;
+  --animate-tier-pop: tier-pop 650ms var(--ease-bounce) both;
+  --animate-rays: rays 18s linear infinite;
+  --animate-twinkle: twinkle 1.6s ease-in-out infinite;
 
   /* Skeleton/loading sweep for money placeholders (consumed via animate-shimmer +
      a gradient background sized 200%). */
@@ -116,6 +142,65 @@
     }
   }
 
+  /* A reel landing on its settled symbol: drops in from above and overshoots a touch. */
+  @keyframes reel-land {
+    0% {
+      transform: translateY(-40%) scale(0.9);
+      opacity: 0.2;
+    }
+    100% {
+      transform: none;
+      opacity: 1;
+    }
+  }
+
+  /* Idle hover for illustrations and hero art. */
+  @keyframes float {
+    0%,
+    100% {
+      transform: translateY(0);
+    }
+    50% {
+      transform: translateY(-8px);
+    }
+  }
+
+  /* One-shot icon wiggle on hover. */
+  @keyframes wiggle {
+    25% {
+      transform: rotate(-10deg) scale(1.08);
+    }
+    75% {
+      transform: rotate(8deg) scale(1.08);
+    }
+  }
+
+  /* Win-tier headline slam (BIG / MEGA / EPIC). */
+  @keyframes tier-pop {
+    0% {
+      transform: scale(2.2);
+      opacity: 0;
+    }
+    100% {
+      transform: none;
+      opacity: 1;
+    }
+  }
+
+  /* Slow sunburst rotation behind celebrations and the hero mascot. */
+  @keyframes rays {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @keyframes twinkle {
+    50% {
+      transform: scale(0.4);
+      opacity: 0.3;
+    }
+  }
+
   /* Reel blur-cycle while a spin is in flight. */
   @keyframes reel-spin {
     0% {
@@ -145,9 +230,23 @@
     overflow-x: clip;
   }
 
+  /* Royal backdrop: two soft brand glows over the page depth color. */
+  body {
+    background-image:
+      radial-gradient(1100px 600px at 85% -10%, rgb(124 58 237 / 0.45), transparent 60%),
+      radial-gradient(900px 500px at -10% 105%, rgb(255 79 163 / 0.14), transparent 60%);
+    background-attachment: fixed;
+  }
+
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-display);
+  }
+
   /* Brand selection color (gold on deep surface). */
   ::selection {
-    background-color: rgb(245 182 46 / 0.3);
+    background-color: rgb(255 200 61 / 0.3);
     color: var(--color-ink);
   }
 
@@ -184,5 +283,306 @@
       transition-duration: 0.01ms !important;
       scroll-behavior: auto !important;
     }
+  }
+}
+
+/* Chunky "candy" buttons. Color comes from a variant class; every variant shares the pill
+   shape, the display face, and the pressed-in bottom edge on :active. */
+@layer components {
+  .btn-candy {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-radius: var(--radius-control);
+    font-family: var(--font-display);
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    transition:
+      transform 120ms ease,
+      filter 120ms ease,
+      box-shadow 120ms ease;
+  }
+  .btn-candy:enabled:hover,
+  a.btn-candy:hover {
+    filter: brightness(1.07);
+    transform: translateY(-1px);
+  }
+  .btn-candy:enabled:active,
+  a.btn-candy:active {
+    transform: translateY(3px);
+    box-shadow: var(--shadow-candy-pressed);
+  }
+  .btn-candy:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+  .btn-gold {
+    color: #3a1400; /* 10.6:1 on the gold face */
+    background-image: linear-gradient(180deg, var(--color-gold-hi), var(--color-gc) 60%);
+    box-shadow: var(--shadow-candy-gold);
+  }
+  .btn-green {
+    color: #05361f; /* 8.1:1 on the green face */
+    background-image: linear-gradient(180deg, #8cf7c4, var(--color-sc-unplayed) 60%);
+    box-shadow: var(--shadow-candy-green);
+  }
+  .btn-violet {
+    color: #fff;
+    background-image: linear-gradient(180deg, var(--color-brand-hi), var(--color-brand) 60%);
+    box-shadow: var(--shadow-candy-violet);
+  }
+}
+
+/* Mascot motion (QueenMascot.tsx). SVG parts animate around their own boxes. */
+@layer components {
+  .qr-mascot {
+    overflow: visible;
+  }
+  .qr-mascot .qr-rays {
+    transform-origin: 180px 170px;
+    animation: var(--animate-rays);
+  }
+  .qr-mascot .qr-body {
+    transform-origin: 180px 320px;
+    animation: qr-bounce 2.4s ease-in-out infinite;
+  }
+  .qr-mascot .qr-arm-l {
+    transform-origin: 146px 214px;
+    animation: qr-wave-l 1.2s ease-in-out infinite alternate;
+  }
+  .qr-mascot .qr-arm-r {
+    transform-origin: 214px 214px;
+    animation: qr-wave-r 1.2s ease-in-out infinite alternate;
+  }
+  .qr-mascot .qr-bill {
+    animation: qr-fall 4.5s linear infinite;
+    transform-box: fill-box;
+    transform-origin: center;
+    opacity: 0;
+  }
+  .qr-mascot .qr-bob {
+    animation: qr-bob 2.2s ease-in-out infinite;
+    transform-box: fill-box;
+    transform-origin: center;
+  }
+  .qr-mascot .qr-twinkle {
+    animation: var(--animate-twinkle);
+    transform-box: fill-box;
+    transform-origin: center;
+  }
+  @keyframes qr-bounce {
+    50% {
+      transform: translateY(-6px) scale(1.01, 0.99);
+    }
+  }
+  @keyframes qr-wave-l {
+    to {
+      transform: rotate(-7deg);
+    }
+  }
+  @keyframes qr-wave-r {
+    to {
+      transform: rotate(7deg);
+    }
+  }
+  @keyframes qr-fall {
+    0% {
+      transform: translateY(-60px) rotate(0);
+      opacity: 0;
+    }
+    10%,
+    90% {
+      opacity: 1;
+    }
+    100% {
+      transform: translateY(320px) rotate(260deg);
+      opacity: 0;
+    }
+  }
+  @keyframes qr-bob {
+    50% {
+      transform: translateY(-10px) rotate(8deg);
+    }
+  }
+}
+
+/* Coin rain inside the big-win celebration (WinCelebration.tsx). */
+@keyframes qr-coin-rain {
+  0% {
+    transform: translateY(0) rotateY(0);
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(110vh) rotateY(720deg);
+    opacity: 1;
+  }
+}
+
+/* Confetti burst (Confetti.tsx): each piece flies to its own --qr-x/--qr-y and fades. */
+@keyframes qr-confetti {
+  0% {
+    transform: translate(0, 0) rotate(0);
+    opacity: 1;
+  }
+  80% {
+    opacity: 1;
+  }
+  100% {
+    transform: translate(var(--qr-x), calc(var(--qr-y) + 80px)) rotate(var(--qr-r));
+    opacity: 0;
+  }
+}
+
+/* Sunburst behind overlays (wheel, chest, level-up). */
+@layer components {
+  .qr-sunburst {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 1000px;
+    height: 1000px;
+    margin: -500px 0 0 -500px;
+    border-radius: 9999px;
+    pointer-events: none;
+    background: repeating-conic-gradient(rgb(255 200 61 / 0.16) 0deg 8deg, transparent 8deg 22.5deg);
+    mask-image: radial-gradient(circle, #000 12%, transparent 60%);
+    animation: var(--animate-rays);
+  }
+}
+
+/* Wheel pointer flick on each slice boundary (DailyWheel.tsx). */
+@keyframes qr-tick {
+  40% {
+    transform: rotate(-18deg);
+  }
+}
+
+/* Treasure chest (ChestReveal.tsx). */
+@keyframes qr-wobble {
+  0%,
+  40%,
+  100% {
+    transform: none;
+  }
+  8% {
+    transform: rotate(-5deg);
+  }
+  16% {
+    transform: rotate(5deg);
+  }
+  24% {
+    transform: rotate(-3deg);
+  }
+  32% {
+    transform: rotate(2deg);
+  }
+}
+@keyframes qr-shake {
+  10%,
+  50%,
+  90% {
+    transform: translateX(-7px) rotate(-3deg);
+  }
+  30%,
+  70% {
+    transform: translateX(7px) rotate(3deg);
+  }
+}
+@keyframes qr-pop {
+  0% {
+    opacity: 1;
+    transform: translate(0, 0) scale(0.4);
+  }
+  70% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translate(var(--qr-x), var(--qr-y)) scale(1.1);
+  }
+}
+
+/* VIP level-up crest swap (LevelUpCelebration.tsx). */
+@keyframes qr-crest-out {
+  0% {
+    transform: none;
+  }
+  55% {
+    transform: scale(1.25) rotate(25deg);
+  }
+  100% {
+    transform: scale(0) rotate(220deg);
+    opacity: 0;
+  }
+}
+@keyframes qr-crest-in {
+  0% {
+    opacity: 0;
+    transform: scale(0) rotate(-30deg);
+  }
+  100% {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes qr-flash {
+  0% {
+    opacity: 0;
+    transform: scale(0.3);
+  }
+  30% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.4);
+  }
+}
+@keyframes qr-rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Recent-wins marquee (MetaCards.tsx): the track holds the list twice and slides one copy. */
+@keyframes qr-marquee {
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+/* Game launch loader (GameLobby.tsx). */
+@keyframes qr-spin-y {
+  to {
+    transform: rotateY(360deg);
+  }
+}
+@keyframes qr-load {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+/* Entrance splash (EntranceIntro.tsx). */
+@keyframes qr-drop {
+  from {
+    transform: translateY(-120px) rotate(-20deg);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
   }
 }

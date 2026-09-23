@@ -8,7 +8,7 @@
  */
 export function Footer() {
   return (
-    <footer className="border-t border-edge bg-surface-1/60">
+    <footer className="border-t border-edge bg-surface-0/70">
       <div className="mx-auto w-full max-w-6xl space-y-6 px-4 py-10">
         {/* Headline compliance strip */}
         <div className="flex flex-wrap items-center gap-3">

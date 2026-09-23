@@ -418,3 +418,68 @@ describe("MockGameWindow — unmount aborts the in-flight read", () => {
     expect(() => render(<MockGameWindow />)).toThrowError(/QueryClient/);
   });
 });
+
+describe("MockGameWindow — win celebration (presentation driven by the outcome record)", () => {
+  it("opens the EPIC celebration for three CROWNs and shows the engine's win string verbatim", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    routeGateway({
+      wallet: [() => jsonResponse(walletEnvelope("1000.0000")), () => jsonResponse(walletEnvelope("1399.0000"))],
+      spin: [() => jsonResponse(spinEnvelope())],
+    });
+
+    renderWithClient(<MockGameWindow />);
+    await mountSynced();
+    await clickSpinAndSettle();
+
+    // Reels land first; the celebration only opens once the last one has settled.
+    expect(screen.queryByTestId("win-celebration")).not.toBeInTheDocument();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(700);
+    });
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveTextContent("BIG WIN");
+
+    // BIG → MEGA → EPIC, then the amount — the engine's "400.0000", formatted as a string.
+    for (const expected of ["MEGA WIN", "EPIC WIN"]) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(800);
+      });
+      expect(dialog).toHaveTextContent(expected);
+    }
+    expect(dialog).toHaveTextContent("400 GC");
+
+    fireEvent.click(screen.getByRole("button", { name: "Awesome!" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("keeps small wins in the window: a two-of-a-kind never opens the celebration", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    routeGateway({
+      wallet: [() => jsonResponse(walletEnvelope("1000.0000")), () => jsonResponse(walletEnvelope("1001.0000"))],
+      spin: [
+        () =>
+          jsonResponse(
+            spinEnvelope({
+              reels: ["CROWN", "CROWN", "BELL"],
+              line: "TWO_OF_A_KIND",
+              winSymbol: "CROWN",
+              winAmount: "15.0000",
+              multiplier: "15",
+            }),
+          ),
+      ],
+    });
+
+    renderWithClient(<MockGameWindow />);
+    await mountSynced();
+    await clickSpinAndSettle();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent("you won 15.0000 GC");
+    expect(screen.queryByTestId("win-celebration")).not.toBeInTheDocument();
+  });
+});

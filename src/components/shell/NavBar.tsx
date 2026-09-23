@@ -1,6 +1,9 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
 
+import { CandyIcon } from "@/components/art/CandyIcon";
+import { SoundToggle } from "@/components/shell/SoundToggle";
+
 /**
  * Global top bar (server component — zero client JS of its own).
  *
@@ -17,23 +20,20 @@ export function NavBar({ walletSlot }: { walletSlot?: ReactNode }) {
           className="group flex min-h-11 items-center gap-2.5 rounded-control px-1 py-1"
           aria-label="QueenRoyal home"
         >
-          <span
-            aria-hidden="true"
-            className="bg-gradient-to-b from-gc to-gc-deep bg-clip-text text-2xl leading-none text-transparent transition group-hover:brightness-125"
-          >
-            ♛
-          </span>
-          <span className="text-lg font-black tracking-[0.18em] text-ink">
-            QUEEN<span className="text-gc">ROYAL</span>
+          <CandyIcon
+            name="crown"
+            className="h-9 w-9 drop-shadow-[0_0_10px_rgba(255,200,61,0.45)] transition group-hover:animate-wiggle"
+          />
+          <span className="font-display text-xl font-semibold tracking-tight text-ink sm:text-2xl">
+            Queen<span className="text-gc">Royal</span>
           </span>
         </Link>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2 sm:gap-3">
           {walletSlot}
-          <Link
-            href="/casino"
-            className="flex min-h-11 items-center rounded-control border border-edge bg-surface-2 px-4 text-xs font-bold uppercase tracking-widest text-ink-mute transition hover:border-edge-strong hover:text-ink"
-          >
+          <SoundToggle />
+          <Link href="/casino" className="btn-candy btn-violet min-h-11 px-4 text-sm sm:px-5">
+            <CandyIcon name="slot" className="-my-1 hidden h-7 w-7 sm:block" />
             Casino Floor
           </Link>
         </div>

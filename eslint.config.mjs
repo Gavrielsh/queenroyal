@@ -33,6 +33,8 @@ export default tseslint.config(
       // Vendored skills library — 1365 third-party files that are not Zone 2 or Zone 3
       // application code. Linting them would bury 20 real findings under 369 imported ones.
       ".agents/**",
+      // Same for the Claude Code skills (ui-ux-pro-max and friends): vendored scripts, not app code.
+      ".claude/**",
     ],
   },
 

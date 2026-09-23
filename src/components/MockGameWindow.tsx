@@ -3,11 +3,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ActionNotice, useActionNotice, type Notice } from "@/components/feedback/ActionNotice";
+import { SlotSymbol } from "@/components/game/SlotSymbol";
+import { WinCelebration } from "@/components/game/WinCelebration";
 import { BalanceChip } from "@/components/wallet/BalanceChip";
 import { WalletStatusBanner } from "@/components/wallet/WalletStatusBanner";
 import { useSpinMutation, type SpinFailure } from "@/hooks/useSpinMutation";
 import { useWalletQuery } from "@/hooks/useWalletQuery";
 import type { SpinCurrency, SpinResultDto } from "@/lib/apiClient";
+import { playSound } from "@/lib/sound";
+import { winTierFor, type WinTier } from "@/lib/winTier";
 
 /**
  * The player-facing slot window, wired to the SERVER-AUTHORITATIVE spin.
@@ -26,7 +30,9 @@ import type { SpinCurrency, SpinResultDto } from "@/lib/apiClient";
  * shown a result the ledger did not produce.
  *
  * Motion is CSS-only (the @theme keyframes): the 80ms symbol shuffle supplies CONTENT while
- * `animate-reel-spin` supplies MOTION; the settle pop is a class swap driven by isSpinning.
+ * `animate-reel-spin` supplies MOTION; on settle each reel lands in turn (`animate-reel-land`,
+ * staggered) with a thud. A three-of-a-kind on a high symbol opens the full-screen
+ * WinCelebration — its tier comes from the engine's line + symbol, never from the amount.
  */
 
 /**
@@ -42,36 +48,31 @@ const CURRENCY: SpinCurrency = "GC";
 /** The stake, as a validated decimal string. Never a number — guardrail G2. */
 const BET_AMOUNT = "1.0000";
 
-/** Reel faces while the round is in flight. Presentation only — never a recorded outcome. */
-const SHUFFLE_GLYPHS = ["🍒", "💎", "7️⃣", "🔔", "👑", "🍋"] as const;
-
 /**
- * Engine symbol id → glyph. Ids are the audit record (they are written into the ledger
- * transaction's metadata); the glyph is pure decoration. An unmapped id renders a neutral
- * placeholder rather than throwing — a new symbol shipped by the engine must never break the
- * window that has to display it.
+ * Reel faces while the round is in flight. Presentation only — never a recorded outcome. They
+ * are drawn with a `~` prefix so the in-flight DOM can never be mistaken for engine symbol
+ * ids (the settled reels carry the bare ids).
  */
-const SYMBOL_GLYPHS: Readonly<Record<string, string>> = {
-  CHERRY: "🍒",
-  LEMON: "🍋",
-  BELL: "🔔",
-  DIAMOND: "💎",
-  SEVEN: "7️⃣",
-  CROWN: "👑",
-};
-const UNKNOWN_GLYPH = "❔";
+const SHUFFLE_SYMBOLS = ["CHERRY", "DIAMOND", "SEVEN", "BELL", "CROWN", "LEMON"] as const;
+const SHUFFLE_PREFIX = "~";
 
 const INITIAL_REELS: readonly string[] = ["CROWN", "CROWN", "CROWN"];
 
-function glyphFor(symbol: string): string {
-  return SYMBOL_GLYPHS[symbol] ?? UNKNOWN_GLYPH;
-}
+/** Reel stagger: each reel lands this long after the one to its left. */
+const LAND_STAGGER_MS = 140;
 
 function randomShuffleReels(length: number): string[] {
   return Array.from(
     { length },
-    () => SHUFFLE_GLYPHS[Math.floor(Math.random() * SHUFFLE_GLYPHS.length)] ?? "👑",
+    () =>
+      SHUFFLE_PREFIX +
+      (SHUFFLE_SYMBOLS[Math.floor(Math.random() * SHUFFLE_SYMBOLS.length)] ?? "CROWN"),
   );
+}
+
+/** Screen-reader name for a settled symbol id ("DIAMOND" → "Diamond"). */
+function symbolLabel(symbol: string): string {
+  return symbol.charAt(0) + symbol.slice(1).toLowerCase();
 }
 
 /**
@@ -137,6 +138,11 @@ export function MockGameWindow() {
   const { spin, isPending, isCoolingDown, isBlocked } = useSpinMutation();
 
   const [reels, setReels] = useState<readonly string[]>(INITIAL_REELS);
+  const [celebration, setCelebration] = useState<{
+    tier: WinTier;
+    amount: string;
+    family: string;
+  } | null>(null);
   /** True only while glyphs are shuffling — i.e. the rendered reels are NOT an outcome. */
   const [isShuffling, setIsShuffling] = useState(false);
 
@@ -161,6 +167,7 @@ export function MockGameWindow() {
     // leaves a fabricated outcome on screen.
     const settledReels = reels;
 
+    playSound("spin");
     setIsShuffling(true);
     const shuffle = setInterval(() => {
       setReels(randomShuffleReels(settledReels.length));
@@ -176,8 +183,24 @@ export function MockGameWindow() {
 
       if (outcome.status === "settled") {
         // The ONLY place reels are set from data: the engine's own record of the round.
-        setReels(outcome.result.outcome.reels);
-        showNotice(settledNotice(outcome.result, outcome.walletSynced));
+        const { result } = outcome;
+        setReels(result.outcome.reels);
+        showNotice(settledNotice(result, outcome.walletSynced));
+
+        // Sound + celebration, both derived from the outcome record (never from the amount).
+        result.outcome.reels.forEach((_, i) => {
+          setTimeout(() => playSound("reelStop"), i * LAND_STAGGER_MS);
+        });
+        const landedMs = result.outcome.reels.length * LAND_STAGGER_MS;
+        const tier = winTierFor(result.outcome.line, result.outcome.winSymbol);
+        if (tier) {
+          setTimeout(
+            () => setCelebration({ tier, amount: result.winAmount, family: result.family }),
+            landedMs + 200,
+          );
+        } else if (result.outcome.line !== "NONE") {
+          setTimeout(() => playSound("win"), landedMs);
+        }
         return;
       }
 
@@ -197,13 +220,13 @@ export function MockGameWindow() {
       : `SPIN · ${BET_AMOUNT} ${CURRENCY}`;
 
   return (
-    <div className="relative w-full max-w-md rounded-card border border-gc/30 bg-gradient-to-b from-surface-1 via-surface-0 to-black p-6 shadow-glow-gc">
+    <div className="relative w-full max-w-md rounded-card border-2 border-gc/40 bg-gradient-to-b from-surface-2 via-surface-1 to-surface-0 p-6 shadow-glow-brand">
       {/* Header */}
       <div className="mb-6 text-center">
-        <h2 className="bg-gradient-to-r from-gc via-yellow-200 to-gc bg-clip-text text-2xl font-black tracking-widest text-transparent">
+        <h2 className="font-display text-3xl font-semibold tracking-wide text-gc drop-shadow-[0_3px_0_rgba(0,0,0,0.35)]">
           QUEEN&nbsp;ROYAL
         </h2>
-        <p className="mt-1 text-[10px] uppercase tracking-[0.3em] text-ink-faint">
+        <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.3em] text-ink-faint">
           Server-drawn · {GAME_ID}
         </p>
       </div>
@@ -225,23 +248,30 @@ export function MockGameWindow() {
       {/* Reels — engine symbols once settled; shuffled glyphs only while in flight. */}
       <div
         aria-label="Reels"
-        className="mb-6 flex justify-center gap-3 rounded-card border border-edge bg-surface-1/80 p-4"
+        className="mb-7 grid grid-cols-3 gap-2 rounded-[1.4rem] bg-gradient-to-b from-gold-hi to-gc-deep p-2.5 shadow-candy-gold"
       >
         {reels.map((symbol, i) => (
           <div
             key={i}
             data-testid="reel"
             data-symbol={symbol}
-            style={isShuffling ? { animationDelay: `${i * 90}ms` } : undefined}
-            className={`flex h-20 w-20 items-center justify-center rounded-chip border text-4xl shadow-inner ${
-              isShuffling
-                ? "animate-reel-spin border-edge-strong bg-gradient-to-b from-surface-3 to-surface-1"
-                : `border-edge bg-gradient-to-b from-surface-3 to-surface-1 ${
-                    justSettled ? "animate-settle-pop border-gc/50" : ""
-                  }`
-            }`}
+            role="img"
+            aria-label={isShuffling ? "Spinning" : symbolLabel(symbol)}
+            className="flex aspect-square items-center justify-center overflow-hidden rounded-2xl bg-gradient-to-b from-surface-0 via-surface-3 to-surface-0"
           >
-            {isShuffling ? symbol : glyphFor(symbol)}
+            <SlotSymbol
+              symbol={symbol.startsWith(SHUFFLE_PREFIX) ? symbol.slice(SHUFFLE_PREFIX.length) : symbol}
+              className={`h-[72%] w-[72%] drop-shadow-[0_4px_4px_rgba(0,0,0,0.35)] ${
+                isShuffling ? "animate-reel-spin" : justSettled ? "animate-reel-land" : ""
+              }`}
+              style={
+                isShuffling
+                  ? { animationDelay: `${i * 90}ms` }
+                  : justSettled
+                    ? { animationDelay: `${i * LAND_STAGGER_MS}ms` }
+                    : undefined
+              }
+            />
           </div>
         ))}
       </div>
@@ -251,7 +281,7 @@ export function MockGameWindow() {
         type="button"
         onClick={() => void handleSpin()}
         disabled={isBlocked}
-        className="relative w-full overflow-hidden rounded-control bg-gradient-to-r from-gc via-yellow-400 to-gc py-4 text-lg font-black tracking-widest text-surface-0 shadow-glow-gc transition active:scale-[0.98] enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+        className="btn-candy btn-gold relative w-full overflow-hidden py-4 text-xl tracking-wide"
       >
         {isPending && (
           <span
@@ -263,6 +293,15 @@ export function MockGameWindow() {
       </button>
 
       <ActionNotice notice={notice} onDismiss={dismissNotice} />
+
+      {celebration && (
+        <WinCelebration
+          tier={celebration.tier}
+          amount={celebration.amount}
+          family={celebration.family}
+          onClose={() => setCelebration(null)}
+        />
+      )}
     </div>
   );
 }

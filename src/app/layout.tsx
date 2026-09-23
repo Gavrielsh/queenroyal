@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Manrope } from "next/font/google";
+import { Fredoka, Nunito } from "next/font/google";
 import type { ReactNode } from "react";
 
 import { Footer } from "@/components/shell/Footer";
@@ -9,14 +9,20 @@ import "./globals.css";
 import { Providers } from "./providers";
 
 /**
- * Brand face — self-hosted at build time by next/font (zero runtime CDN requests),
- * `display: swap` so text never blocks on the font, exposed as --font-manrope which the
- * design tokens fold into --font-sans (globals.css).
+ * Brand faces — self-hosted at build time by next/font (zero runtime CDN requests),
+ * `display: swap` so text never blocks on a font. Nunito is the body face (--font-sans);
+ * Fredoka is the rounded display face for headings and buttons (--font-display). Both are
+ * folded into the design tokens in globals.css.
  */
-const manrope = Manrope({
+const nunito = Nunito({
   subsets: ["latin"],
   display: "swap",
-  variable: "--font-manrope",
+  variable: "--font-nunito",
+});
+const fredoka = Fredoka({
+  subsets: ["latin"],
+  display: "swap",
+  variable: "--font-fredoka",
 });
 
 export const metadata: Metadata = {
@@ -32,7 +38,7 @@ export const metadata: Metadata = {
  */
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en" className={manrope.variable}>
+    <html lang="en" className={`${nunito.variable} ${fredoka.variable}`}>
       <body className="flex min-h-screen flex-col bg-surface-0 text-ink antialiased">
         {/*
           React Query cache provider. Mounted here in the root layout — ABOVE the page-level
