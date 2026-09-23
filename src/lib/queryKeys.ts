@@ -14,3 +14,11 @@ export const walletKeys = {
 export const metaKeys = {
   dailyBonus: () => ["meta", "dailyBonus"] as const,
 } as const;
+
+/**
+ * Redemption history + policy (cash-out eligibility, caps, remaining amounts). Never a wallet
+ * balance in itself — SC_REDEEMABLE stays under walletKeys; this is the cashier's own view.
+ */
+export const redemptionKeys = {
+  overview: () => ["redemption", "overview"] as const,
+} as const;

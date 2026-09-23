@@ -142,3 +142,14 @@ export function sumMoney(...values: string[]): string {
   }
   return out;
 }
+
+/**
+ * `a - b`, floored at zero. For "how much of a cap is left to spend" — a period's spend can
+ * reach the cap exactly, and a display value must never go negative even if it briefly could
+ * (a race between the read and a concurrent debit landing).
+ */
+export function subtractMoneyFloor0(a: string, b: string): string {
+  const ua = moneyUnits(a);
+  const ub = moneyUnits(b);
+  return moneyFromUnits(ua > ub ? ua - ub : 0n);
+}

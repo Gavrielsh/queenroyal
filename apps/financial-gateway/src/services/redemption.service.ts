@@ -56,7 +56,7 @@ export type RedemptionOutcome =
  * CANCELLED_BY_PLAYER are excluded because no money moved for them — counting a refused
  * request against a cap would punish a player for an operator's decision.
  */
-const CAP_COUNTING_STATUSES = ["REQUESTED", "UNDER_REVIEW", "APPROVED", "PROCESSING", "PAID"] as const;
+export const CAP_COUNTING_STATUSES = ["REQUESTED", "UNDER_REVIEW", "APPROVED", "PROCESSING", "PAID"] as const;
 
 /** Engine refusal codes that mean the same thing as one of the policy's own refusals. */
 const ENGINE_REFUSAL_TO_POLICY: Readonly<Record<string, RedemptionRefusal>> = {

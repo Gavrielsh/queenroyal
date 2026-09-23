@@ -7,6 +7,7 @@ import type { AuthClaims } from "../lib/jwt";
 import { errBody, okBody } from "../lib/reply";
 import { redeemSchema } from "../schemas/redeem.schema";
 import { mockConfirmSchema, purchaseSchema } from "../schemas/store.schema";
+import { getRedemptionOverview } from "../services/redemption-history.service";
 import { requestRedemption } from "../services/redemption.service";
 import { confirmMockDeposit, purchasePackage } from "../services/store.service";
 
@@ -44,6 +45,10 @@ export const storeRoutes: FastifyPluginAsync = async (app) => {
   // DEV-ONLY: stands in for the Stripe.js card confirmation + `succeeded` webhook when the
   // mock PSP is active. Responds 409 MOCK_PSP_ONLY under a real provider (see the service).
   app.post("/api/store/purchase/mock-confirm", { preHandler: requireAuthPreHandler }, mockConfirmHandler);
+  // Read-only, own-requests-only. NOT jurisdiction-fenced: this never moves money (the fence
+  // guards money movement, same reasoning as the KYC upload route), and fencing a page read
+  // behind a fail-closed geo lookup would strand a legitimate player's own history view.
+  app.get("/api/store/redemptions", { preHandler: requireAuthPreHandler }, redemptionsHandler);
 };
 
 async function requireAuthPreHandler(req: FastifyRequest, reply: FastifyReply): Promise<void> {
@@ -147,6 +152,22 @@ async function mockConfirmHandler(req: FastifyRequest, reply: FastifyReply): Pro
     await reply.code(200).send(okBody(outcome.data));
   } catch (err) {
     req.log.error({ err, user_id: user.sub }, "unexpected error processing mock confirmation");
+    await reply.code(500).send(errBody("INTERNAL_ERROR", "Unexpected server error"));
+  }
+}
+
+async function redemptionsHandler(req: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const user = req.authClaims;
+  if (!user) {
+    await reply.code(401).send(errBody("UNAUTHORIZED", "Authentication required"));
+    return;
+  }
+
+  try {
+    const overview = await getRedemptionOverview(user.sub);
+    await reply.code(200).send(okBody(overview));
+  } catch (err) {
+    req.log.error({ err, user_id: user.sub }, "unexpected error loading redemption history");
     await reply.code(500).send(errBody("INTERNAL_ERROR", "Unexpected server error"));
   }
 }

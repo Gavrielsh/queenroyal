@@ -32,6 +32,14 @@ export function NavBar({ walletSlot }: { walletSlot?: ReactNode }) {
 
         <div className="flex items-center gap-1.5 sm:gap-3">
           {walletSlot}
+          {/* Phone width is already spoken for by the logo, sound, account and Play Floor
+              button (see the comment on that button below) — Redeem joins the nav sm: up. */}
+          <Link
+            href="/redeem"
+            className="hidden min-h-11 items-center whitespace-nowrap rounded-control px-2 py-1 text-sm font-semibold text-ink-mute transition hover:text-ink sm:flex sm:px-3"
+          >
+            Redeem
+          </Link>
           <SoundToggle />
           <AccountMenu />
           <Link href="/casino" className="btn-candy btn-violet min-h-11 whitespace-nowrap px-4 text-sm sm:px-5">
