@@ -54,7 +54,7 @@ Engine routes today (`True/internal/api/router.go`): `/api/v1/spin`, `/bet`, `/w
 | # | Item | Layers | Exists | Missing |
 |---|---|---|---|---|
 | 1 | Login & registration | G W | Register/login/refresh/logout, sign-up with 18+, state and terms checks (queenroyal#17) | `[x]` done. Only the Step 0 deploy items remain. |
-| 2 | **Legal pages** | W | Nothing. The sign-up checkbox and footer link to pages that don't exist. | Terms of Service, Official Sweepstakes Rules, Privacy Policy, Responsible Gaming page. Static, versioned, linked from footer and sign-up. |
+| 2 | **Legal pages** | W | Terms of Service, Official Sweepstakes Rules, Privacy Policy, Responsible Gaming page (`/terms`, `/rules`, `/privacy`, `/responsible-gaming`) rendered from versioned `content/legal/*.md`; footer and sign-up checkbox link to them; a gateway test fails if `TERMS_VERSION` drifts from the markdown. | `[x]` done. |
 | 3 | **Redemption (cash out SC)** | E G W | Engine `/store/redeem`, gateway service + worker, admin approve/reject | Player redemption screen (eligibility, min amount, daily cap, status history). A real payout provider behind the `PaymentProvider` seam; only a fake one exists. |
 | 4 | **Free entry (AMOE)** | W | Gateway `/api/amoe` | Public page with the free-entry rules and the request form. |
 | 5 | **KYC** | G W | Data model, webhook, fake provider, engine `/kyc/decision` | Real provider adapter (Persona / Veriff / Jumio) and a player document-upload flow. |
