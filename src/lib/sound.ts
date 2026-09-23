@@ -10,7 +10,19 @@
  * else depends on, so a storage failure simply falls back to "sound on".
  */
 
-export type SoundName = "click" | "spin" | "reelStop" | "win" | "bigWin" | "tier" | "purchase";
+export type SoundName =
+  | "click"
+  | "spin"
+  | "reelStop"
+  | "win"
+  | "bigWin"
+  | "tier"
+  | "purchase"
+  | "tick"
+  | "coin"
+  | "creak"
+  | "open"
+  | "levelUp";
 
 const STORAGE_KEY = "qr-sound-muted";
 
@@ -97,6 +109,24 @@ const RECIPES: Readonly<Record<SoundName, (ctx: AudioContext) => void>> = {
   tier: (ctx) => {
     tone(ctx, 784, 0, 0.12, "square", 0.06);
     tone(ctx, 1175, 0.09, 0.35, "triangle", 0.14);
+  },
+  tick: (ctx) => {
+    tone(ctx, 2000, 0, 0.02, "square", 0.035);
+    vibrate(6);
+  },
+  coin: (ctx) => {
+    tone(ctx, 1480, 0, 0.08, "triangle", 0.09);
+    tone(ctx, 2220, 0.035, 0.12, "triangle", 0.06);
+  },
+  creak: (ctx) => tone(ctx, 150, 0, 0.45, "sawtooth", 0.04, 70),
+  open: (ctx) => {
+    tone(ctx, 220, 0, 0.2, "sine", 0.18, 700);
+    [1046, 1318, 1568, 2093].forEach((f, i) => tone(ctx, f, 0.2 + i * 0.07, 0.35, "triangle", 0.09));
+  },
+  levelUp: (ctx) => {
+    [523, 659, 784, 1046, 1318, 1568, 2093].forEach((f, i) => tone(ctx, f, i * 0.07, 0.45, "triangle", 0.11));
+    tone(ctx, 2093, 0.55, 1.3, "sine", 0.07);
+    vibrate([20, 30, 20, 30, 60]);
   },
   purchase: (ctx) => {
     [0, 1, 2].forEach((i) => {

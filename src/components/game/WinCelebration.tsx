@@ -70,7 +70,7 @@ export function WinCelebration({ tier, amount, family, onClose }: WinCelebration
       aria-modal="true"
       aria-labelledby="win-celebration-title"
       data-testid="win-celebration"
-      className="fixed inset-0 z-[60] grid place-items-center overflow-hidden bg-[#0e0420]/90 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-[80] grid place-items-center overflow-hidden bg-[#0e0420]/90 p-4 backdrop-blur-sm"
       onClick={(event) => {
         if (event.target === event.currentTarget) onClose();
       }}

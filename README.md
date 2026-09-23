@@ -114,6 +114,22 @@ Required env (gateway fails closed without them): `DATABASE_URL`, `JWT_SECRET`,
 `ENGINE_OPERATOR_CODE`, and `REDIS_URL` for the fail-closed limiter / sessions / reconciler.
 See `.env.example`.
 
+## Meta-game UI preview (daily wheel, missions, VIP, lobby…)
+
+The meta-game screens (`src/components/meta/`) are built ahead of their gateway endpoints
+(ROADMAP Phases 1.2 and 3). They are **off** by default and cannot turn on in a production
+build. To review them locally with canned preview data:
+
+```bash
+NEXT_PUBLIC_META_DEMO=1 npm run dev
+# /casino    — casino floor with entrance splash, Daily Wheel, lobby, missions, VIP, tournament
+# /dev/meta  — every component on one page, with buttons to replay each moment
+```
+
+Preview data is labelled "Preview" on screen and never touches the wallet cache — the balance
+chips still show only what the ledger reports. A feature goes live by shipping its endpoint
+and client and listing it in `LIVE_READY` in `src/lib/meta/features.ts`.
+
 ## Error envelope
 
 ```json

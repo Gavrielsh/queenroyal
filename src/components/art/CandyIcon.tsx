@@ -7,7 +7,18 @@ import { useId, type ReactElement } from "react";
  * carries information the adjacent text does not. Gradient ids come from `useId`, so two
  * copies of the same icon on one page never share (or break) each other's gradients.
  */
-export type CandyIconName = "crown" | "coin" | "sc" | "trophy" | "gift" | "stack" | "slot" | "gem";
+export type CandyIconName =
+  | "crown"
+  | "coin"
+  | "sc"
+  | "trophy"
+  | "gift"
+  | "stack"
+  | "slot"
+  | "gem"
+  | "wheel"
+  | "chest"
+  | "fire";
 
 export interface CandyIconProps {
   name: CandyIconName;
@@ -147,7 +158,54 @@ const ICONS: Readonly<Record<CandyIconName, Paint>> = {
       />
     </>
   ),
+  wheel: () => (
+    <>
+      <circle cx="20" cy="21" r="18" fill="#B86A00" />
+      <circle cx="20" cy="20" r="18" fill="#FFC83D" />
+      {WHEEL_SLICES.map((slice) => (
+        <path key={slice.d} d={slice.d} fill={slice.fill} />
+      ))}
+      <circle cx="20" cy="20" r="4.5" fill="#fff" stroke="#E08E0B" strokeWidth="2" />
+      <path d="M20 1l4 6h-8z" fill="#fff" stroke="#E08E0B" strokeWidth="1.2" />
+    </>
+  ),
+  chest: (id) => (
+    <>
+      <defs>
+        <Linear id={id("wood")} from="#B7793F" to="#7A4516" />
+        <Linear id={id("gold")} from="#FFE58F" to="#F2A60C" />
+      </defs>
+      <path d="M5 17c0-8 30-8 30 0z" fill={`url(#${id("wood")})`} />
+      <rect x="5" y="17" width="30" height="18" rx="3" fill={`url(#${id("wood")})`} />
+      <rect x="5" y="17" width="30" height="4" fill={`url(#${id("gold")})`} />
+      <rect x="17" y="19" width="6" height="8" rx="2" fill={`url(#${id("gold")})`} stroke="#B86A00" />
+      <rect x="5" y="31" width="30" height="4" rx="2" fill="#5A3210" />
+    </>
+  ),
+  fire: (id) => (
+    <>
+      <defs>
+        <Linear id={id("g")} from="#FFE066" to="#FF4D2E" />
+      </defs>
+      <path
+        d="M20 3c2 7 11 11 11 21a11 11 0 0 1-22 0c0-6 4-9 5-13 2 3 2 5 4 6 1-5 0-9 2-14z"
+        fill={`url(#${id("g")})`}
+      />
+      <path d="M20 20c1 4 6 5 6 10a6 6 0 0 1-12 0c0-3 3-5 3-8 1 1 2 2 3 2z" fill="#FFF3B0" />
+    </>
+  ),
 };
+
+/** Eight alternating slices for the wheel icon, precomputed once. */
+const WHEEL_SLICES = ["#FF4FA3", "#FFC83D", "#7C3AED", "#3BE39B"].flatMap((_, i, colors) =>
+  [0, 4].map((offset) => {
+    const k = i + offset;
+    const a0 = ((k * 45 - 90) * Math.PI) / 180;
+    const a1 = (((k + 1) * 45 - 90) * Math.PI) / 180;
+    const p = (a: number) => `${(20 + 15 * Math.cos(a)).toFixed(2)} ${(20 + 15 * Math.sin(a)).toFixed(2)}`;
+    return { d: `M20 20L${p(a0)}A15 15 0 0 1 ${p(a1)}z`, fill: colors[i] ?? "#FFC83D" };
+  }),
+);
 
 export function CandyIcon({ name, className, title }: CandyIconProps) {
   const base = useId();
