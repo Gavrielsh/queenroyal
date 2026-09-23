@@ -31,3 +31,6 @@ playwright.json
 
 # misc
 .DS_Store
+
+# Local Redis snapshots (a redis-server started inside the repo for tests)
+dump.rdb

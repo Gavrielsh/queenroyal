@@ -45,6 +45,15 @@ model User {
   // addresses the player by THIS id, never by our local `id`.
   trueEnginePlayerId String? @unique
 
+  // Declared at registration (lib/registration-policy.ts), proven later by KYC. Nullable only
+  // for accounts that predate the sign-up form; every new registration writes all four.
+  dateOfBirth     DateTime? @db.Date
+  /// USPS state code of declared residence ("NJ").
+  residenceState  String?   @db.VarChar(2)
+  /// TERMS_VERSION the player accepted, and when.
+  termsVersion    String?
+  termsAcceptedAt DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

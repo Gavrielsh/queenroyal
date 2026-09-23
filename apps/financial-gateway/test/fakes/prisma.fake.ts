@@ -170,6 +170,27 @@ export const prismaFake = {
       users.set(row.id, row);
       return { ...row };
     },
+    // Registration. ENFORCES the unique email index with a P2002-shaped error, as Postgres does.
+    create: async ({ data }: QueryArgs) => {
+      if ([...users.values()].some((u) => u.email === data.email)) {
+        throw Object.assign(new Error("Unique constraint failed on the fields: (`email`)"), {
+          code: "P2002",
+          meta: { target: ["email"] },
+        });
+      }
+      const now = new Date();
+      const row: AnyRow = {
+        id: randomUUID(),
+        kycStatus: "PENDING",
+        vipLevel: 0,
+        trueEnginePlayerId: null,
+        createdAt: now,
+        updatedAt: now,
+        ...data,
+      };
+      users.set(row.id, row);
+      return { ...row };
+    },
     update: async ({ where, data }: QueryArgs) => {
       const u = users.get(where.id);
       if (!u) throw new Error(`user ${where.id} not found`);
@@ -774,4 +795,8 @@ export function getKycDocuments(): AnyRow[] {
 /** Every processed KYC webhook event. The idempotency ledger. */
 export function getKycWebhookEvents(): AnyRow[] {
   return [...kycWebhookEvents.values()].map((r) => ({ ...r }));
+}
+
+export function getUsers(): AnyRow[] {
+  return [...users.values()].map((u) => ({ ...u }));
 }
