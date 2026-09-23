@@ -7,6 +7,7 @@ import { Confetti } from "@/components/meta/Confetti";
 import { MetaOverlay, PreviewBadge } from "@/components/meta/MetaOverlay";
 import { formatBalance } from "@/lib/format";
 import { compactAmount } from "@/lib/meta/compactAmount";
+import { WheelClaimError } from "@/lib/meta/dailyBonusClient";
 import type { DailyBonusClaim, DailyBonusStatus, WheelSegment } from "@/lib/meta/types";
 import { sliceUnderPointer, wheelTargetRotation } from "@/lib/meta/wheel";
 import { playSound } from "@/lib/sound";
@@ -101,6 +102,7 @@ export function DailyWheel({ status, onClaim, onClose, preview }: DailyWheelProp
   const [rotation, setRotation] = useState(0);
   const [phase, setPhase] = useState<"ready" | "spinning" | "won" | "failed">("ready");
   const [claim, setClaim] = useState<DailyBonusClaim | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
   const wheelRef = useRef<HTMLDivElement>(null);
   const spinButtonRef = useRef<HTMLButtonElement>(null);
@@ -148,7 +150,10 @@ export function DailyWheel({ status, onClaim, onClose, preview }: DailyWheelProp
     let result: DailyBonusClaim;
     try {
       result = await onClaim();
-    } catch {
+    } catch (err) {
+      // A WheelClaimError carries copy that is honest about what is known (e.g. "if it went
+      // through, it will appear in your balance"); anything else gets the generic line.
+      setFailure(err instanceof WheelClaimError ? err.message : null);
       setPhase("failed");
       return;
     }
@@ -251,7 +256,7 @@ export function DailyWheel({ status, onClaim, onClose, preview }: DailyWheelProp
         )}
         {phase === "failed" && (
           <p role="alert" className="text-sm font-bold text-danger">
-            The wheel could not be spun right now. Nothing was claimed — try again shortly.
+            {failure ?? "The wheel could not be spun right now. Nothing was claimed — try again shortly."}
           </p>
         )}
         {!status.canClaim && phase === "ready" && (

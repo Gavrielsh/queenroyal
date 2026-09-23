@@ -9,3 +9,8 @@ export const walletKeys = {
   /** The authoritative balances snapshot. */
   balances: () => ["wallet", "balances"] as const,
 } as const;
+
+/** Meta-game reads (Daily Wheel status, …). Never money truth — the wallet is walletKeys. */
+export const metaKeys = {
+  dailyBonus: () => ["meta", "dailyBonus"] as const,
+} as const;

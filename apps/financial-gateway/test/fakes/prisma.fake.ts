@@ -36,6 +36,7 @@ const users = new Map<string, AnyRow>();
 const journal = new Map<string, AnyRow>(); // keyed by id
 const redemptions = new Map<string, AnyRow>(); // keyed by id
 const amoeGrants = new Map<string, AnyRow>(); // keyed by id
+const dailyBonusClaims = new Map<string, AnyRow>(); // keyed by id
 const kycVerifications = new Map<string, AnyRow>(); // keyed by id
 const kycDocuments = new Map<string, AnyRow>(); // keyed by id
 const kycWebhookEvents = new Map<string, AnyRow>(); // keyed by id
@@ -293,6 +294,79 @@ export const prismaFake = {
         for (const k of Object.keys(select)) if (select[k]) out[k] = r[k];
         return out;
       });
+    },
+  },
+
+  dailyBonusClaim: {
+    /**
+     * `create` ENFORCES `(userId, gamingDate)` — the daily cap — and `(userId, claimAttemptKey)`
+     * and `operatorTransactionId`, throwing P2002 exactly as Postgres would. Same rule as the
+     * amoeGrant fake: a lenient fake would let the cap's tests pass without a cap.
+     */
+    create: async ({ data }: QueryArgs) => {
+      const row = data as AnyRow;
+      for (const existing of dailyBonusClaims.values()) {
+        const clash =
+          existing.userId === row.userId && existing.gamingDate === row.gamingDate
+            ? ["userId", "gamingDate"]
+            : existing.userId === row.userId && existing.claimAttemptKey === row.claimAttemptKey
+              ? ["userId", "claimAttemptKey"]
+              : existing.operatorTransactionId === row.operatorTransactionId
+                ? ["operatorTransactionId"]
+                : null;
+        if (clash) {
+          throw Object.assign(new Error(`Unique constraint failed on the fields: (${clash.join(",")})`), {
+            code: "P2002",
+            meta: { target: clash },
+          });
+        }
+      }
+      const now = new Date();
+      const full: AnyRow = {
+        id: randomUUID(),
+        status: "REQUESTED",
+        ledgerTransactionId: null,
+        claimIp: null,
+        claimJurisdiction: null,
+        failureReason: null,
+        createdAt: now,
+        updatedAt: now,
+        ...row,
+      };
+      dailyBonusClaims.set(full.id as string, full);
+      return { ...full };
+    },
+    update: async ({ where, data }: QueryArgs) => {
+      const row = dailyBonusClaims.get(where?.id as string);
+      if (!row) throw new Error("dailyBonusClaim row not found");
+      applyData(row, data as AnyRow);
+      row.updatedAt = new Date();
+      return { ...row };
+    },
+    findUnique: async ({ where }: QueryArgs) => {
+      if (where?.id !== undefined) {
+        const row = dailyBonusClaims.get(where.id as string);
+        return row ? { ...row } : null;
+      }
+      const byDay = where?.userId_gamingDate as { userId: string; gamingDate: string } | undefined;
+      const byAttempt = where?.userId_claimAttemptKey as { userId: string; claimAttemptKey: string } | undefined;
+      for (const row of dailyBonusClaims.values()) {
+        if (byDay && row.userId === byDay.userId && row.gamingDate === byDay.gamingDate) return { ...row };
+        if (byAttempt && row.userId === byAttempt.userId && row.claimAttemptKey === byAttempt.claimAttemptKey) {
+          return { ...row };
+        }
+      }
+      return null;
+    },
+    findMany: async ({ where }: QueryArgs) => {
+      const since = (where?.createdAt as { gte?: Date } | undefined)?.gte;
+      return [...dailyBonusClaims.values()]
+        .filter((r) => {
+          if (where?.userId !== undefined && r.userId !== where.userId) return false;
+          if (since && (r.createdAt as Date) < since) return false;
+          return true;
+        })
+        .map((r) => ({ ...r }));
     },
   },
 
@@ -572,6 +646,7 @@ export function resetDb(): void {
   journal.clear();
   redemptions.clear();
   amoeGrants.clear();
+  dailyBonusClaims.clear();
   kycVerifications.clear();
   kycDocuments.clear();
   kycWebhookEvents.clear();
@@ -655,6 +730,35 @@ export function seedAmoeGrant(row: AnyRow): void {
     ...row,
   };
   amoeGrants.set(full.id as string, full);
+}
+
+/** Every Daily Wheel claim row. */
+export function getDailyBonusClaims(): AnyRow[] {
+  return [...dailyBonusClaims.values()].map((r) => ({ ...r }));
+}
+
+/** Seed a prior Daily Wheel claim (streak history / today's cap). */
+export function seedDailyBonusClaim(row: AnyRow): void {
+  const now = new Date();
+  const id = (row.id as string | undefined) ?? randomUUID();
+  const full: AnyRow = {
+    id,
+    status: "GRANTED",
+    segmentId: "s1",
+    gcAmount: "5000",
+    scAmount: "0",
+    operatorTransactionId: `bonus:daily:${id}`,
+    ledgerTransactionId: null,
+    channelReference: `BONUS-${id}`,
+    claimAttemptKey: `seed-${id}`,
+    claimIp: null,
+    claimJurisdiction: null,
+    failureReason: null,
+    createdAt: now,
+    updatedAt: now,
+    ...row,
+  };
+  dailyBonusClaims.set(id, full);
 }
 
 /** Every KYC verification row. Lets a test assert the case's lifecycle. */

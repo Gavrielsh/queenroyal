@@ -2,12 +2,15 @@
  * Feature switches for the meta-game UI.
  *
  * Every meta feature has three possible modes:
- *   "off"  — not rendered at all. The default everywhere, and the ONLY mode a production
- *            build can reach today, because none of these features has a gateway endpoint.
+ *   "off"  — not rendered at all. The default everywhere. A production build reaches only
+ *            "off" or "live" — never "demo".
  *   "demo" — rendered with the canned preview data in `demo.ts`, clearly labelled as a
  *            preview. Development builds only, opt-in with NEXT_PUBLIC_META_DEMO=1.
- *   "live" — rendered from the real gateway. Reserved: a feature becomes live by adding its
- *            client to `LIVE_READY` below in the same change that ships its endpoint.
+ *   "live" — rendered from the real gateway. Needs BOTH: the feature's client exists
+ *            (`LIVE_CAPABLE` below — added in the change that ships its endpoint), AND the
+ *            operator switched it on with NEXT_PUBLIC_META_LIVE (comma-separated feature names,
+ *            e.g. "dailyWheel,streak,entrance") once the gateway and engine are deployed.
+ *            Live wins over demo; it is the only mode that may render in production.
  *
  * Why the production lock: G4 forbids fabricated balances "not even in dev fixtures", and the
  * landing page's trust strip was already stripped of claims the product could not back. A
@@ -42,23 +45,36 @@ export const META_FEATURES: readonly MetaFeature[] = [
 ];
 
 /**
- * Features whose gateway endpoint and client exist. Empty today — add a feature here only in
- * the change that ships its endpoint, its wire parser, and its tests.
+ * Features whose gateway endpoint, wire parser and tests exist. Add a feature here only in the
+ * change that ships all three. The entrance splash shows no data, so it needs no endpoint.
+ *   dailyWheel + streak — GET /api/bonus/daily, POST /api/bonus/daily/claim (dailyBonusClient)
  */
-const LIVE_READY: ReadonlySet<MetaFeature> = new Set<MetaFeature>([]);
+const LIVE_CAPABLE: ReadonlySet<MetaFeature> = new Set<MetaFeature>(["entrance", "dailyWheel", "streak"]);
 
 export interface FeatureEnv {
   nodeEnv: string | undefined;
   metaDemo: string | undefined;
+  metaLive?: string | undefined;
 }
 
 function currentEnv(): FeatureEnv {
   // Literal `process.env.X` reads so Next.js inlines them at build time.
-  return { nodeEnv: process.env.NODE_ENV, metaDemo: process.env.NEXT_PUBLIC_META_DEMO };
+  return {
+    nodeEnv: process.env.NODE_ENV,
+    metaDemo: process.env.NEXT_PUBLIC_META_DEMO,
+    metaLive: process.env.NEXT_PUBLIC_META_LIVE,
+  };
+}
+
+function liveSwitched(feature: MetaFeature, env: FeatureEnv): boolean {
+  return (env.metaLive ?? "")
+    .split(",")
+    .map((name) => name.trim())
+    .includes(feature);
 }
 
 export function featureMode(feature: MetaFeature, env: FeatureEnv = currentEnv()): FeatureMode {
-  if (LIVE_READY.has(feature)) return "live";
+  if (LIVE_CAPABLE.has(feature) && liveSwitched(feature, env)) return "live";
   if (env.nodeEnv !== "production" && env.metaDemo === "1") return "demo";
   return "off";
 }

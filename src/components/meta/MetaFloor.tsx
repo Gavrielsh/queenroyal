@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { MockGameWindow } from "@/components/MockGameWindow";
 import { StoreWindow } from "@/components/StoreWindow";
@@ -17,6 +17,7 @@ import {
   TournamentCard,
   VipCard,
 } from "@/components/meta/MetaCards";
+import { useDailyWheel } from "@/hooks/useDailyWheel";
 import { formatBalance } from "@/lib/format";
 import {
   demoCatalog,
@@ -43,28 +44,43 @@ import type { DailyBonusStatus, Mission } from "@/lib/meta/types";
  * In demo mode the data is lib/meta/demo, every surface wears a Preview badge, and nothing is
  * written to the wallet cache: the balance chips keep showing only what the ledger reported.
  *
- * Going live, per feature: add its gateway client (parse the wire into lib/meta/types), swap
- * the demo value/handler below for it, re-read the wallet after any grant with
- * `invalidateWalletBalances(queryClient, …)`, and list it in LIVE_READY.
+ * Live today: the Daily Wheel + streak (useDailyWheel → gateway /api/bonus/daily), switched on
+ * with NEXT_PUBLIC_META_LIVE. In live mode the claim is the server's draw, credited in the
+ * ledger, and the wallet is re-read afterwards — no preview badge, no demo data.
+ *
+ * Going live, per other feature: add its gateway client (parse the wire into lib/meta/types),
+ * swap the demo value/handler below for it, re-read the wallet after any grant with
+ * `invalidateWalletBalances(queryClient, …)`, and list it in LIVE_CAPABLE.
  */
 export function MetaFloor() {
   const mode = (feature: MetaFeature) => featureMode(feature);
   const on = (feature: MetaFeature) => mode(feature) !== "off";
   const preview = (feature: MetaFeature) => mode(feature) === "demo";
 
-  const [bonus, setBonus] = useState<DailyBonusStatus>(demoDailyBonus);
+  const wheelLive = mode("dailyWheel") === "live";
+  const liveWheel = useDailyWheel(wheelLive);
+  const [demoBonus, setDemoBonus] = useState<DailyBonusStatus>(demoDailyBonus);
+  const bonus: DailyBonusStatus | undefined = wheelLive ? liveWheel.status : demoBonus;
+  const [autoOpenPending, setAutoOpenPending] = useState(false);
   const [missions, setMissions] = useState<readonly Mission[]>(demoMissions);
   const [wheelOpen, setWheelOpen] = useState(false);
   const [chestFor, setChestFor] = useState<Mission | null>(null);
   const [levelUpOpen, setLevelUpOpen] = useState(false);
 
+  // After the entrance splash, open the wheel if today's spin is available. In live mode the
+  // status may still be loading when the splash ends, so the request waits for it.
   const openWheelAfterEntrance = useCallback(() => {
-    if (featureMode("dailyWheel") !== "off" && demoDailyBonus.canClaim) setWheelOpen(true);
+    if (featureMode("dailyWheel") !== "off") setAutoOpenPending(true);
   }, []);
+  useEffect(() => {
+    if (!autoOpenPending || !bonus) return;
+    setAutoOpenPending(false);
+    if (bonus.canClaim) setWheelOpen(true);
+  }, [autoOpenPending, bonus]);
 
-  const claimWheel = async () => {
+  const claimDemoWheel = async () => {
     const claim = demoDraw();
-    setBonus((current) => ({
+    setDemoBonus((current) => ({
       ...current,
       canClaim: false,
       streak: current.streak.map((day) => (day.state === "today" ? { ...day, state: "claimed" } : day)),
@@ -109,7 +125,7 @@ export function MetaFloor() {
           </div>
 
           <aside aria-label="Rewards" className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4 lg:sticky lg:top-20">
-            {on("dailyWheel") && (
+            {on("dailyWheel") && bonus && (
               <StreakCard
                 streak={bonus.streak}
                 streakDay={bonus.streakDay}
@@ -140,10 +156,10 @@ export function MetaFloor() {
         </div>
       </main>
 
-      {wheelOpen && (
+      {wheelOpen && bonus && (
         <DailyWheel
           status={bonus}
-          onClaim={claimWheel}
+          onClaim={wheelLive ? liveWheel.claim : claimDemoWheel}
           onClose={() => setWheelOpen(false)}
           preview={preview("dailyWheel")}
         />

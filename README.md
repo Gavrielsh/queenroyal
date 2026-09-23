@@ -127,8 +127,18 @@ NEXT_PUBLIC_META_DEMO=1 npm run dev
 ```
 
 Preview data is labelled "Preview" on screen and never touches the wallet cache — the balance
-chips still show only what the ledger reports. A feature goes live by shipping its endpoint
-and client and listing it in `LIVE_READY` in `src/lib/meta/features.ts`.
+chips still show only what the ledger reports.
+
+**Going live.** A feature renders from the real gateway when its client exists (`LIVE_CAPABLE`
+in `src/lib/meta/features.ts`) **and** the operator switches it on. Today that is the Daily
+Wheel and its streak (plus the data-free entrance splash):
+
+```bash
+NEXT_PUBLIC_META_LIVE=entrance,dailyWheel,streak
+```
+
+Switch it on only after the gateway (`GET /api/bonus/daily`, `POST /api/bonus/daily/claim`)
+and the engine with `POST /api/v1/store/promo-grant` (True migration `000010`) are deployed.
 
 ## Error envelope
 

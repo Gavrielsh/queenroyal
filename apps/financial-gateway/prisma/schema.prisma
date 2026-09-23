@@ -53,6 +53,7 @@ model User {
 
   // Back-relation only — adds NO column to `users`. See AmoeGrant.
   amoeGrants AmoeGrant[]
+  dailyBonusClaims DailyBonusClaim[]
 
   // Back-relation only — adds NO column to `users`. See KycVerification.
   kycVerifications KycVerification[]
@@ -395,6 +396,70 @@ model AmoeGrant {
 
 /// The AMOE claim lifecycle. Short by design: unlike a redemption there is no review and no
 /// external rail — the coins are issued synchronously or they are not.
+/// One Daily Wheel spin — a discretionary marketing grant (engine channel BONUS), never the
+/// statutory free entry (that is AmoeGrant). Same shape and the same order of operations as
+/// AmoeGrant, for the same reason: the Zone 1 promo-grant endpoint applies no cap of its own.
+///
+/// THE CAP IS `@@unique([userId, gamingDate])`: one spin per player per gaming day. The row is
+/// taken BEFORE the engine is called, so two concurrent claims cannot both be granted.
+///
+/// NOT FINANCIAL STATE. `gcAmount` / `scAmount` are TEXT intent parameters — the slice the
+/// server drew, forwarded verbatim — and never a balance. REQUESTED and FAILED rows moved no
+/// coins; the ledger in Zone 1 is the only place the truth lives.
+model DailyBonusClaim {
+  id String @id @default(uuid())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// The True Engine player UUID, copied at claim time (see AmoeGrant.playerId).
+  playerId String
+
+  /// The gaming day this claim consumes, "YYYY-MM-DD" in the configured gaming timezone
+  /// (America/New_York by default — the day resets at 00:00 ET, as the UI says). Derived by
+  /// `gamingDateKey` (src/lib/daily-bonus-policy.ts) from the server clock, never the client.
+  gamingDate String
+
+  /// The wheel slice the SERVER drew (config/daily-bonus.ts). The client never chooses it.
+  segmentId String
+
+  status DailyBonusStatus @default(REQUESTED)
+
+  /// Decimal strings, verbatim from the drawn slice ("0" when that currency is not granted).
+  gcAmount String
+  scAmount String
+
+  /// `bonus:daily:<id>` — deterministic engine anchor, stable across every retry.
+  operatorTransactionId String  @unique
+  /// Zone 1 ledger transaction id of the PROMO_CREDIT; null until the engine committed.
+  ledgerTransactionId   String? @unique
+
+  /// Forwarded to Zone 1 as `channel_reference` ("BONUS-<id>").
+  channelReference String
+
+  /// Client attempt token: a retried claim replays its ORIGINAL outcome (per user, see AmoeGrant).
+  claimAttemptKey String
+
+  claimIp           String?
+  claimJurisdiction String?
+  failureReason     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, gamingDate])
+  @@unique([userId, claimAttemptKey])
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@map("daily_bonus_claims")
+}
+
+enum DailyBonusStatus {
+  REQUESTED // the day is consumed and the intent journaled; the engine has not answered
+  GRANTED // PROMO_CREDIT committed in Zone 1 — terminal
+  FAILED // the engine refused, or could not be reached — terminal for this claim
+}
+
 enum AmoeGrantStatus {
   REQUESTED // the period is consumed and the intent journaled; the engine has not answered
   GRANTED // PROMO_CREDIT committed in Zone 1 — terminal
