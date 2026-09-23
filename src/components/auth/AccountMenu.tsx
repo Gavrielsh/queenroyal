@@ -52,9 +52,16 @@ export function AccountMenu() {
         type="button"
         onClick={() => void onLogout()}
         disabled={leaving}
-        className="inline-flex min-h-11 items-center whitespace-nowrap rounded-control border-2 border-edge-strong px-3 font-display text-sm font-medium text-ink transition hover:border-gc disabled:opacity-60"
+        className="inline-flex min-h-11 min-w-11 items-center justify-center whitespace-nowrap rounded-control border-2 border-edge-strong font-display text-sm font-medium text-ink transition hover:border-gc disabled:opacity-60 sm:px-3"
       >
-        {leaving ? "Logging out…" : "Log out"}
+        {/* Phone width: a door icon keeps the bar from overflowing; the label is still the
+            button's accessible name. */}
+        <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 sm:hidden" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round">
+          <path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4" />
+          <path d="M9 16l-4-4 4-4" />
+          <path d="M5 12h11" />
+        </svg>
+        <span className="sr-only sm:not-sr-only">{leaving ? "Logging out…" : "Log out"}</span>
       </button>
     </div>
   );

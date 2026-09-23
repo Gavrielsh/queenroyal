@@ -25,7 +25,7 @@ export function NavBar({ walletSlot }: { walletSlot?: ReactNode }) {
             name="crown"
             className="h-8 w-8 drop-shadow-[0_0_10px_rgba(255,200,61,0.45)] transition group-hover:animate-wiggle sm:h-9 sm:w-9"
           />
-          <span className="font-display text-xl font-semibold tracking-tight text-ink max-[359px]:hidden sm:text-2xl">
+          <span className="font-display text-xl font-semibold tracking-tight text-ink max-[374px]:hidden sm:text-2xl">
             Queen<span className="text-gc">Royal</span>
           </span>
         </Link>
