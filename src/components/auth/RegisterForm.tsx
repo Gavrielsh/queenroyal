@@ -145,7 +145,25 @@ export function RegisterForm() {
               className="mt-0.5 h-5 w-5 shrink-0 accent-[#ffc83d]"
             />
             <span>
-              I am {MIN_AGE} or older and I accept the Terms of Service and the Official Sweepstakes Rules.
+              I am {MIN_AGE} or older and I accept the{" "}
+              <Link
+                href="/terms"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-extrabold text-gc hover:underline"
+              >
+                Terms of Service
+              </Link>{" "}
+              and the{" "}
+              <Link
+                href="/rules"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-extrabold text-gc hover:underline"
+              >
+                Official Sweepstakes Rules
+              </Link>
+              .
             </span>
           </label>
           {errors.acceptTerms ? (
