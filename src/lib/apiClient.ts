@@ -6,15 +6,13 @@
  * error normalization so feature code never touches raw `fetch`.
  */
 
+import { clearAccessToken, readAccessToken, tokenIsLive, writeAccessToken } from "@/lib/auth/token";
 import { type AttemptToken, peekAttemptToken } from "@/lib/purchaseIntent";
 import { type SpinAttemptToken } from "@/lib/spinIntent";
 
 const GATEWAY_BASE_URL = (
   process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:4000/api"
 ).replace(/\/+$/, "");
-
-/** localStorage key + cookie name under which the gateway session token lives. */
-const ACCESS_TOKEN_KEY = "qr_access_token";
 
 /** Normalized failure raised for any non-2xx gateway response. */
 export class ApiError extends Error {
@@ -79,17 +77,9 @@ export interface RequestOptions {
   signal?: AbortSignal;
 }
 
-function readAccessToken(): string | null {
-  // Guard for SSR/prerender — the token only exists in the browser.
-  if (typeof window === "undefined") return null;
-
-  const fromStorage = window.localStorage.getItem(ACCESS_TOKEN_KEY);
-  if (fromStorage) return fromStorage;
-
-  const cookie = document.cookie
-    .split("; ")
-    .find((c) => c.startsWith(`${ACCESS_TOKEN_KEY}=`));
-  return cookie ? decodeURIComponent(cookie.slice(ACCESS_TOKEN_KEY.length + 1)) : null;
+/** Auth routes carry the HttpOnly refresh cookie; every other route authenticates by bearer. */
+function isAuthPath(path: string): boolean {
+  return path.startsWith("/auth/");
 }
 
 async function request<TResponse>(
@@ -97,6 +87,7 @@ async function request<TResponse>(
   path: string,
   body?: unknown,
   opts?: RequestOptions,
+  retried = false,
 ): Promise<TResponse> {
   const headers = new Headers({ Accept: "application/json" });
   if (body !== undefined) headers.set("Content-Type", "application/json");
@@ -110,8 +101,9 @@ async function request<TResponse>(
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
-      // The gateway authenticates via the bearer header; cookies stay out of it.
-      credentials: "omit",
+      // Only /auth/* needs the refresh cookie (it is path-scoped there by the gateway anyway);
+      // everything else authenticates via the bearer header and keeps cookies out of it.
+      credentials: isAuthPath(path) ? "include" : "omit",
       signal: opts?.signal,
     });
   } catch (cause) {
@@ -121,6 +113,14 @@ async function request<TResponse>(
       throw new ApiError(0, "ABORTED", "Request aborted", { cause });
     }
     throw new ApiError(0, "NETWORK_ERROR", "Could not reach the gateway", { cause });
+  }
+
+  // An expired or revoked token: rotate it once through the refresh cookie and replay the SAME
+  // request. Replaying is safe because every money route is idempotent on the key in its body
+  // (G3), and the body is re-sent byte-for-byte. Only a request that CARRIED a token is
+  // retried — with no token there is no session to refresh, and the caller decides.
+  if (response.status === 401 && token && !retried && !isAuthPath(path)) {
+    if (await refreshAccessToken()) return request<TResponse>(method, path, body, opts, true);
   }
 
   if (!response.ok) {
@@ -162,30 +162,40 @@ export const apiClient = {
     request<TResponse>("DELETE", path, undefined, opts),
 } as const;
 
-// ── Dev-only session bootstrap ───────────────────────────────────────────────
-
-/**
- * Check the access token's `exp` with a plain base64url decode — NO signature verification
- * (the gateway is the only verifier; this is purely a UX freshness probe so we know when to
- * re-login). 30s of slack treats a token about to lapse mid-flow as already dead.
- */
-function tokenIsLive(token: string): boolean {
-  const payload = token.split(".")[1];
-  if (!payload) return false;
-  try {
-    const decoded = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/"))) as {
-      exp?: number;
-    };
-    return typeof decoded.exp === "number" && decoded.exp * 1000 > Date.now() + 30_000;
-  } catch {
-    return false;
-  }
-}
+// ── Session ──────────────────────────────────────────────────────────────────
 
 /** True when a non-expired gateway access token is present in the browser. */
 export function hasLiveSession(): boolean {
   const token = readAccessToken();
   return token !== null && tokenIsLive(token);
+}
+
+let refreshInFlight: Promise<boolean> | null = null;
+
+/**
+ * Exchange the HttpOnly refresh cookie for a new access token (the gateway rotates the cookie
+ * too). Single-flight: concurrent 401s share ONE refresh, because the refresh token is
+ * single-use and a second rotation with the same cookie would be refused and sign the player
+ * out. Resolves false — never throws — when there is no session to refresh.
+ */
+export function refreshAccessToken(): Promise<boolean> {
+  refreshInFlight ??= (async () => {
+    try {
+      const res = await apiClient.post<unknown>("/auth/refresh", {});
+      const token = (res as { data?: { accessToken?: unknown } } | undefined)?.data?.accessToken;
+      if (typeof token !== "string" || token === "") return false;
+      writeAccessToken(token);
+      return true;
+    } catch (err) {
+      // The gateway refused the cookie: the session is over, so drop the dead access token and
+      // let the UI show signed-out. A network fault proves nothing — keep the token.
+      if (err instanceof ApiError && err.status === 401) clearAccessToken();
+      return false;
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+  return refreshInFlight;
 }
 
 interface MockLoginEnvelope {
@@ -200,11 +210,11 @@ interface MockLoginEnvelope {
  * DEV-ONLY: obtain a session from the gateway's mock-login route and store the access token
  * where every other request reads it. The route does not exist in production builds of the
  * gateway (404), so this can never become a production login path. Throws ApiError on
- * failure — the caller (DevAutoLogin) owns the degraded-UX decision.
+ * failure — the caller (AuthGate) owns the degraded-UX decision.
  */
 export async function mockDevLogin(): Promise<void> {
   const res = await apiClient.post<MockLoginEnvelope>("/auth/mock-login", {});
-  window.localStorage.setItem(ACCESS_TOKEN_KEY, res.data.accessToken);
+  writeAccessToken(res.data.accessToken);
 }
 
 // ── Wallet mirror ────────────────────────────────────────────────────────────

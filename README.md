@@ -63,7 +63,7 @@ All bodies are JSON; the uniform envelope is `{ success, data }` / `{ success, e
 | Method + path | Auth | Purpose |
 | --- | --- | --- |
 | `GET /api/health` | — | Dependency-free liveness probe. |
-| `POST /api/auth/register` · `POST /api/auth/login` | Redis rate-limit (fail-closed) | Create / authenticate an account; returns `{ user, accessToken }` and sets the HttpOnly refresh cookie. |
+| `POST /api/auth/register` · `POST /api/auth/login` | Redis rate-limit (fail-closed) | Create / authenticate an account; returns `{ user, accessToken }` and sets the HttpOnly refresh cookie. Registration requires `dateOfBirth` (18+), `residenceState` (a US state not in `BLOCKED_REGIONS`) and `acceptTerms: true`; refusals are `403 UNDERAGE` / `403 STATE_NOT_ELIGIBLE`. |
 | `POST /api/auth/refresh` | refresh cookie | Rotate the single-use refresh token, mint a fresh access token. |
 | `POST /api/auth/logout` | refresh cookie | Revoke the refresh session; clears the cookie (idempotent). |
 | `POST /api/store/purchase` | Bearer access token | Open a PSP PaymentIntent (no capture) → journal a `PENDING` deposit → return `clientSecret`; the ledger is credited asynchronously by the verified PSP webhook. |
@@ -113,6 +113,22 @@ Required env (gateway fails closed without them): `DATABASE_URL`, `JWT_SECRET`,
 `ENGINE_BASE_URL`, `ENGINE_SECRET_KEY` (`ENGINE_SECRET` accepted as an alias),
 `ENGINE_OPERATOR_CODE`, and `REDIS_URL` for the fail-closed limiter / sessions / reconciler.
 See `.env.example`.
+
+## Player accounts (Zone 3)
+
+`/register` and `/login` sign players in against the gateway's `/api/auth/*`. The browser keeps
+only the 15-minute access token; the refresh token is the gateway's HttpOnly cookie. A request
+that gets a `401` refreshes once (single-flight) and replays; a refused refresh signs the player
+out. Signed-in areas are wrapped in `AuthGate` (`src/components/auth/`), which sends a
+signed-out visitor to `/login?next=…`.
+
+The browser must be able to send that cookie to the gateway: in production, serve the gateway on
+the same site as the web app (e.g. `api.example.com` beside `www.example.com`) and list the web
+origin in `CORS_ALLOWED_ORIGINS`.
+
+For local development without registering, set `NEXT_PUBLIC_DEV_AUTO_LOGIN=1` for the web app
+and `ENABLE_DEV_MOCK_LOGIN=true` for the gateway: `AuthGate` then falls back to the gateway's
+dev-only mock login on first load. Neither exists in a production build.
 
 ## Meta-game UI preview (daily wheel, missions, VIP, lobby…)
 

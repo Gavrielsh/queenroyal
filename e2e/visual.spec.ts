@@ -55,12 +55,14 @@ test("03 — casino floor: ledger-synced (both windows, one snapshot)", async ({
   assertIsolated(gateway);
 });
 
-test("04 — casino floor: unauthorized wallet read (log-in state)", async ({ page, context }, testInfo) => {
+test("04 — casino floor: session rejected and not refreshable → back to login", async ({ page, context }, testInfo) => {
   const gateway = await installGateway(context, { wallet: "unauthorized" });
 
   await page.goto("/casino");
-  // Waits out the app's React Query retry backoff before the error phase lands.
-  await expect(page.getByText("log in to see your wallet")).toHaveCount(2);
+  // The wallet read's 401 triggers one refresh; the gateway refuses it, the dead token is
+  // dropped, and the gate sends the player to log in — returning them here afterwards.
+  await expect(page).toHaveURL(/\/login\?next=%2Fcasino$/);
+  await expect(page.getByRole("heading", { name: "Welcome back" })).toBeVisible();
 
   await capture(page, testInfo, "04-casino-unauthorized");
   assertIsolated(gateway);

@@ -82,7 +82,8 @@ backoff, opaque payload-free events. It has no server.*
       list a game the engine will reject
 - [ ] `/casino` lobby grid: categories, search, recently played, "hot" merchandising
 - [ ] Game detail / launch route; move the KYC gate to launch time (settlement-time is a backstop)
-- [ ] Real login + registration UI (today the only path is `DevAutoLogin` → `mock-login`)
+- [x] Real login + registration UI — `/login`, `/register` (18+, eligible state, terms accepted),
+      silent token refresh, `AuthGate`, account menu. Dev mock login is opt-in only
 
 ---
 

@@ -42,7 +42,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
       <body className="flex min-h-screen flex-col bg-surface-0 text-ink antialiased">
         {/*
           React Query cache provider. Mounted here in the root layout — ABOVE the page-level
-          DevAutoLogin auth gate — so the gate and every query it gates share one client. The
+          AuthGate — so the gate and every query it gates share one client. The
           shell (NavBar/Footer) sits inside it too: the NavBar's wallet slot consumes the same
           cache once M3-T4 wires it.
         */}

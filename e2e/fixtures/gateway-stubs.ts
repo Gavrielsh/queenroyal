@@ -11,7 +11,11 @@ import type { BrowserContext, Route } from "@playwright/test";
  *   - GET /api/wallet   → routes/wallet.ts (verbatim engine decimal STRINGS, 4 dp)
  *   - POST /api/store/purchase → store.service.ts `PurchaseInitiated`
  *   - POST /api/store/purchase/mock-confirm → store.service.ts `MockDepositSettled`
- *   - POST /api/auth/mock-login → the dev session bootstrap consumed by DevAutoLogin
+ *   - POST /api/auth/mock-login → the dev session bootstrap AuthGate falls back to
+ *     (NEXT_PUBLIC_DEV_AUTO_LOGIN=1, set by playwright.config.ts)
+ *   - POST /api/auth/refresh    → routes/auth.ts: 401 NO_REFRESH_TOKEN (the browser holds no
+ *     refresh cookie in these scenarios), so AuthGate proceeds to the dev login
+ *   - POST /api/auth/login | register → routes/auth.ts `{ user, accessToken }` (auth scenarios)
  *
  * ISOLATION: `installGateway` registers a catch-all FIRST (Playwright matches routes in
  * reverse registration order, so it matches LAST): requests to the Next dev server pass
@@ -40,7 +44,7 @@ function b64url(value: object): string {
 }
 
 /**
- * DevAutoLogin stores this token, and the client's session probe decodes its `exp` claim
+ * AuthGate stores this token, and the client's session probe decodes its `exp` claim
  * with a plain base64url parse (NO signature verification — the gateway is the only
  * verifier). The stub token therefore just needs three parts and a far-future exp.
  */
@@ -168,11 +172,30 @@ export interface GatewayStubOptions {
   purchase?: PurchaseScenario;
   spin?: SpinScenario;
   login?: "ok" | "unavailable";
+  /** How the real sign-in routes answer (auth.spec.ts). Unset: they are not stubbed. */
+  auth?: AuthScenario;
+  /** Stub `POST /api/auth/logout` → 200 `{ loggedOut: true }` (routes/auth.ts). */
+  logout?: boolean;
+}
+
+/**
+ * `POST /api/auth/login` and `/api/auth/register`:
+ *   ok                 → 200/201 with a session
+ *   invalid-credentials→ 401 INVALID_CREDENTIALS
+ *   state-not-eligible → 403 STATE_NOT_ELIGIBLE (register only; login answers ok)
+ */
+export type AuthScenario = "ok" | "invalid-credentials" | "state-not-eligible";
+
+export interface AuthCalls {
+  login: unknown[];
+  register: unknown[];
 }
 
 export interface InstalledGateway {
   /** Aborted requests that no stub covered — the spec asserts this stays EMPTY. */
   violations: string[];
+  /** Bodies the browser posted to the sign-in routes, in order. */
+  authCalls: AuthCalls;
 }
 
 export async function installGateway(
@@ -192,6 +215,37 @@ export async function installGateway(
     violations.push(`${route.request().method()} ${route.request().url()}`);
     await route.abort();
   });
+
+  await context.route(`${GATEWAY_ORIGIN}/api/auth/refresh`, async (route) => {
+    await fulfillJson(route, errBody("NO_REFRESH_TOKEN", "Missing refresh token"), 401);
+  });
+
+  const authCalls: AuthCalls = { login: [], register: [] };
+  if (opts.auth) {
+    const auth = opts.auth;
+    await context.route(`${GATEWAY_ORIGIN}/api/auth/login`, async (route) => {
+      authCalls.login.push(route.request().postDataJSON());
+      if (auth === "invalid-credentials") {
+        await fulfillJson(route, errBody("INVALID_CREDENTIALS", "Invalid email or password"), 401);
+        return;
+      }
+      await fulfillJson(route, mockLoginEnvelope());
+    });
+    await context.route(`${GATEWAY_ORIGIN}/api/auth/register`, async (route) => {
+      authCalls.register.push(route.request().postDataJSON());
+      if (auth === "state-not-eligible") {
+        await fulfillJson(route, errBody("STATE_NOT_ELIGIBLE", "QueenRoyal is not available in your state"), 403);
+        return;
+      }
+      await fulfillJson(route, mockLoginEnvelope(), 201);
+    });
+  }
+
+  if (opts.logout) {
+    await context.route(`${GATEWAY_ORIGIN}/api/auth/logout`, async (route) => {
+      await fulfillJson(route, okBody({ loggedOut: true }));
+    });
+  }
 
   await context.route(`${GATEWAY_ORIGIN}/api/auth/mock-login`, async (route) => {
     if ((opts.login ?? "ok") === "ok") {
@@ -270,5 +324,5 @@ export async function installGateway(
     });
   }
 
-  return { violations };
+  return { violations, authCalls };
 }

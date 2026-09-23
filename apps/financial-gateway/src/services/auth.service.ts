@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 
 import bcrypt from "bcryptjs";
 
+import { getEnv } from "../config/env";
 import { signAccessToken, type AuthClaims } from "../lib/jwt";
+import { ageOn, isEligibleResidence, MIN_REGISTRATION_AGE, TERMS_VERSION } from "../lib/registration-policy";
 import { log } from "../lib/logger";
 import { getPrisma } from "../lib/prisma";
 import type { LoginInput, RegisterInput } from "../schemas/auth.schema";
@@ -95,7 +97,24 @@ async function issue(user: SafeUser): Promise<AuthResult> {
   return { user, accessToken, refreshToken };
 }
 
-export async function register(input: RegisterInput): Promise<AuthResult> {
+export interface RegisterDeps {
+  now: () => Date;
+}
+
+export async function register(
+  input: RegisterInput,
+  deps: RegisterDeps = { now: () => new Date() },
+): Promise<AuthResult> {
+  // Eligibility before anything is written or hashed: an ineligible sign-up leaves no row.
+  const now = deps.now();
+  const age = ageOn(input.dateOfBirth, now);
+  if (age === null || age < MIN_REGISTRATION_AGE) {
+    throw new AuthError("UNDERAGE", `You must be ${MIN_REGISTRATION_AGE} or older to play`, 403);
+  }
+  if (!isEligibleResidence(input.residenceState, getEnv().BLOCKED_REGIONS)) {
+    throw new AuthError("STATE_NOT_ELIGIBLE", "QueenRoyal is not available in your state", 403);
+  }
+
   const prisma = getPrisma();
   const existing = await prisma.user.findUnique({ where: { email: input.email } });
   if (existing) {
@@ -103,9 +122,25 @@ export async function register(input: RegisterInput): Promise<AuthResult> {
   }
 
   const passwordHash = await bcrypt.hash(input.password, BCRYPT_ROUNDS);
-  const user = await prisma.user.create({
-    data: { email: input.email, passwordHash },
-  });
+  let user;
+  try {
+    user = await prisma.user.create({
+      data: {
+        email: input.email,
+        passwordHash,
+        dateOfBirth: new Date(`${input.dateOfBirth}T00:00:00Z`),
+        residenceState: input.residenceState,
+        termsVersion: TERMS_VERSION,
+        termsAcceptedAt: now,
+      },
+    });
+  } catch (err) {
+    // Two sign-ups for one email can both pass the read above; the unique index decides.
+    if ((err as { code?: unknown }).code === "P2002") {
+      throw new AuthError("EMAIL_TAKEN", "An account with this email already exists", 409);
+    }
+    throw err;
+  }
 
   // Provision the player in the True Engine and persist its player_id. Non-fatal: the account
   // is created and `resolveTransactingPlayer()` will lazily (idempotently) provision on first
