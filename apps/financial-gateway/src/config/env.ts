@@ -89,6 +89,15 @@ const envSchema = z.object({
   AMOE_CLAIM_IP_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(10),
   AMOE_CLAIM_IP_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(3600),
 
+  // ── Daily Wheel claim limiting (per IP AND per account, fail closed) ────────────
+  // Same two limiters and the same fail-closed direction as AMOE, for the same reason: the
+  // promo-grant endpoint behind POST /api/bonus/daily/claim is uncapped in Zone 1. The daily
+  // unique index is the cap; these stop hammering and multi-account farming before it.
+  DAILY_BONUS_CLAIM_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(5),
+  DAILY_BONUS_CLAIM_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(3600),
+  DAILY_BONUS_CLAIM_IP_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
+  DAILY_BONUS_CLAIM_IP_RATE_LIMIT_WINDOW_SECONDS: z.coerce.number().int().positive().default(3600),
+
   // ── KYC / identity verification ─────────────────────────────────────────────────
   // Shared secret the provider signs its decision webhooks with. Only the mock provider reads
   // it today; a real vendor's adapter reads its own key and this stays for the mock's sake.

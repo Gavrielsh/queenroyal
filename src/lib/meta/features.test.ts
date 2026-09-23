@@ -20,4 +20,19 @@ describe("featureMode", () => {
     for (const feature of META_FEATURES) expect(featureMode(feature, env)).toBe("off");
     expect(anyMetaFeatureOn(env)).toBe(false);
   });
+
+  it("goes live only for a live-capable feature the operator switched on — in any build", () => {
+    const env = { nodeEnv: "production", metaDemo: undefined, metaLive: "dailyWheel, streak,jackpot" };
+    expect(featureMode("dailyWheel", env)).toBe("live");
+    expect(featureMode("streak", env)).toBe("live");
+    // Listed, but no endpoint exists: it stays off rather than rendering invented data.
+    expect(featureMode("jackpot", env)).toBe("off");
+    expect(featureMode("vip", env)).toBe("off");
+  });
+
+  it("prefers live over demo for a switched-on feature in development", () => {
+    const env = { nodeEnv: "development", metaDemo: "1", metaLive: "dailyWheel" };
+    expect(featureMode("dailyWheel", env)).toBe("live");
+    expect(featureMode("missions", env)).toBe("demo");
+  });
 });

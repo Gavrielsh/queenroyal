@@ -22,6 +22,8 @@ export interface WheelSegment {
   sc: MoneyString;
   /** The rare top slice; drawn in gold. */
   featured?: boolean;
+  /** Relative draw weight, published so the odds can be disclosed. */
+  weight?: number;
 }
 
 export interface StreakDay {
@@ -44,8 +46,9 @@ export interface DailyBonusStatus {
 
 /**
  * The server's draw. The wheel animates to `segmentId`; it never picks a slice itself. The
- * grant has already been written to the ledger when this arrives (`POST /store/purchase`
- * under a `bonus:daily:<user>:<date>` anchor, per ROADMAP Phase 3).
+ * grant has already been written to the ledger when this arrives: the gateway credits it
+ * through the engine's `POST /api/v1/store/promo-grant` on the BONUS channel, anchored
+ * `bonus:daily:<claim id>` (gateway: services/daily-bonus.service.ts).
  */
 export interface DailyBonusClaim {
   segmentId: string;

@@ -132,7 +132,7 @@ export interface RedemptionRefundPayload {
 
 /**
  * The no-purchase route a grant came through. Mirrors the engine's `promo_grant_channel`
- * enum (migration 000014) exactly.
+ * enum (engine migration 000010) exactly.
  *
  * A typed union rather than a free string because the distinction is the whole of the AMOE
  * defense: `AMOE` is the statutorily-required free entry method, `BONUS` is discretionary
