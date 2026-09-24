@@ -8,7 +8,7 @@
 > date: it still lists redemption, AMOE, engine CI, the suspended-player check and the
 > Daily Wheel as open, and they are built.
 
-Last updated: 2026-09-23
+Last updated: 2026-09-24
 
 ## Who owns what
 
@@ -20,7 +20,8 @@ Last updated: 2026-09-23
 
 Engine routes today (`True/internal/api/router.go`): `/api/v1/spin`, `/bet`, `/win`,
 `/rollback`, `/session`, `/player/create`, `/store/purchase`, `/store/redeem`,
-`/store/promo-grant`, `/kyc/decision`, plus `/healthz` and `/metrics`.
+`/store/promo-grant`, `/kyc/decision`, `/player/limits`, `/player/limits/query`,
+`/player/limits/check-purchase`, plus `/healthz` and `/metrics`.
 
 ### Rules that never bend
 - **queenroyal:** `.claude-instructions` (G1–G4). The gateway holds no balances; money is a
@@ -39,7 +40,8 @@ Engine routes today (`True/internal/api/router.go`): `/api/v1/spin`, `/bet`, `/w
 ---
 
 ## Step 0 — Put what already exists live (ops, no code)
-- [ ] Deploy the engine from `True` master (runs migration `000010_promo_grants`).
+- [ ] Deploy the engine from `True` master (runs migrations `000010_promo_grants`,
+  `000011_responsible_gaming`).
 - [ ] Deploy the gateway (Prisma migration adds `daily_bonus_claims` and the 4 new `users`
       columns from the sign-up work).
 - [ ] Serve the gateway on the same site as the web app (e.g. `api.` next to `www.`) and list
@@ -58,7 +60,7 @@ Engine routes today (`True/internal/api/router.go`): `/api/v1/spin`, `/bet`, `/w
 | 3 | **Redemption (cash out SC)** | E G W | Engine `/store/redeem`, gateway service + worker, admin approve/reject, `GET /api/store/redemptions` (policy + history), player redemption screen (`/redeem`: eligibility, min/per-request/daily/monthly caps, remaining today/this month, KYC gate, status history) | A real payout provider behind the `PaymentProvider` seam; only a fake one exists. |
 | 4 | **Free entry (AMOE)** | W | Gateway `/api/amoe` | Public page with the free-entry rules and the request form. |
 | 5 | **KYC** | G W | Data model, webhook, fake provider, engine `/kyc/decision` | Real provider adapter (Persona / Veriff / Jumio) and a player document-upload flow. |
-| 6 | **Responsible gaming** | E G W | Nothing | Self-exclusion, deposit / loss / session limits, cool-off, reality checks. Engine enforces (refuses spins/purchases), gateway stores settings, web exposes them. |
+| 6 | **Responsible gaming** | E G W | `[x]` **E**: migration `000011_responsible_gaming`, engine guards self-exclusion / cool-off / loss limit / deposit limit inside the wallet-locked transaction for `/spin`, `/bet`, `/win`, `/rollback`, `/store/purchase`; signed `POST /player/limits` (set/lift), `/player/limits/query`, and the pre-charge `/player/limits/check-purchase` (True#21). Known gap: the loss limit also counts GC; it must count SC only. | Session limits, reality-check reminders. Gateway: store settings, call `/player/limits/check-purchase` before charging a card, refund if `/store/purchase`'s backstop ever refuses. Web: `/account/limits` page. |
 | 7 | **Fraud & AML** | E G | Nothing | Velocity rules, device & IP fingerprinting, multi-account detection, bonus-abuse checks, redemption reporting. |
 
 ## Step 2 — The product players see
