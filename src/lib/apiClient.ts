@@ -8,6 +8,7 @@
 
 import { clearAccessToken, readAccessToken, tokenIsLive, writeAccessToken } from "@/lib/auth/token";
 import { type AttemptToken, peekAttemptToken } from "@/lib/purchaseIntent";
+import { type RedemptionAttemptToken } from "@/lib/redemptionIntent";
 import { type SpinAttemptToken } from "@/lib/spinIntent";
 
 const GATEWAY_BASE_URL = (
@@ -602,4 +603,177 @@ export async function submitSpin(request: SpinRequestDto): Promise<SpinResultDto
     gameId: request.gameId,
   });
   return parseSpinEnvelope(payload);
+}
+
+// ── Cashier (redemption) ──────────────────────────────────────────────────────
+
+/** Every value `RedemptionStatus` can hold (apps/financial-gateway/prisma/schema.prisma). */
+export const REDEMPTION_STATUSES = [
+  "REQUESTED",
+  "UNDER_REVIEW",
+  "APPROVED",
+  "PROCESSING",
+  "PAID",
+  "REJECTED",
+  "CANCELLED_BY_PLAYER",
+] as const;
+export type RedemptionStatus = (typeof REDEMPTION_STATUSES)[number];
+
+function isRedemptionStatus(value: unknown): value is RedemptionStatus {
+  return typeof value === "string" && (REDEMPTION_STATUSES as readonly string[]).includes(value);
+}
+
+/** One row of the player's own redemption history (redemption-history.service.ts). */
+export interface RedemptionHistoryEntryDto {
+  id: string;
+  /** Verbatim engine decimal string — rendered, never arithmetic. */
+  amount: string;
+  status: RedemptionStatus;
+  createdAt: string;
+  statusChangedAt: string;
+}
+
+/**
+ * The policy the /redeem screen renders around. A closed jurisdiction carries no cap figures —
+ * there is nothing to display a minimum or a cap against.
+ */
+export type RedemptionPolicyDto =
+  | {
+      jurisdictionPermitted: true;
+      minimumAmount: string;
+      maximumPerRequest: string;
+      dailyCap: string;
+      monthlyCap: string;
+      remainingToday: string;
+      remainingThisMonth: string;
+    }
+  | { jurisdictionPermitted: false };
+
+export interface RedemptionOverviewDto {
+  /** From the `users` row, fetched fresh on every call — never the (potentially stale) JWT. */
+  kycStatus: string;
+  /** Newest first, capped server-side at 50. */
+  requests: RedemptionHistoryEntryDto[];
+  policy: RedemptionPolicyDto;
+}
+
+function parseRedemptionPolicy(policy: unknown, malformed: (field: string) => ApiError): RedemptionPolicyDto {
+  if (typeof policy !== "object" || policy === null) throw malformed("data.policy");
+  const record = policy as Record<string, unknown>;
+
+  if (record.jurisdictionPermitted === false) return { jurisdictionPermitted: false };
+  if (record.jurisdictionPermitted !== true) throw malformed("data.policy.jurisdictionPermitted");
+
+  const minimumAmount = record.minimumAmount;
+  if (!isMoneyString(minimumAmount)) throw malformed("data.policy.minimumAmount");
+  const maximumPerRequest = record.maximumPerRequest;
+  if (!isMoneyString(maximumPerRequest)) throw malformed("data.policy.maximumPerRequest");
+  const dailyCap = record.dailyCap;
+  if (!isMoneyString(dailyCap)) throw malformed("data.policy.dailyCap");
+  const monthlyCap = record.monthlyCap;
+  if (!isMoneyString(monthlyCap)) throw malformed("data.policy.monthlyCap");
+  const remainingToday = record.remainingToday;
+  if (!isMoneyString(remainingToday)) throw malformed("data.policy.remainingToday");
+  const remainingThisMonth = record.remainingThisMonth;
+  if (!isMoneyString(remainingThisMonth)) throw malformed("data.policy.remainingThisMonth");
+
+  return {
+    jurisdictionPermitted: true,
+    minimumAmount,
+    maximumPerRequest,
+    dailyCap,
+    monthlyCap,
+    remainingToday,
+    remainingThisMonth,
+  };
+}
+
+/**
+ * Validate the `GET /api/store/redemptions` envelope — BEFORE any value can reach React
+ * state. A payload that fails shape or money-format validation becomes an `ApiError` with
+ * code "MALFORMED_REDEMPTION_OVERVIEW". Same rule as every other gate in this file: failure
+ * messages name the offending FIELD but never echo its value.
+ */
+export function parseRedemptionOverview(payload: unknown): RedemptionOverviewDto {
+  const malformed = (field: string): ApiError =>
+    new ApiError(0, "MALFORMED_REDEMPTION_OVERVIEW", `Redemption overview failed validation at ${field}`);
+
+  if (typeof payload !== "object" || payload === null) throw malformed("(root)");
+  const envelope = payload as Record<string, unknown>;
+  if (envelope.success !== true) throw malformed("success");
+
+  const data = envelope.data;
+  if (typeof data !== "object" || data === null) throw malformed("data");
+  const record = data as Record<string, unknown>;
+
+  const kycStatus = record.kycStatus;
+  if (typeof kycStatus !== "string" || kycStatus.length === 0) throw malformed("data.kycStatus");
+
+  const requestsRaw = record.requests;
+  if (!Array.isArray(requestsRaw)) throw malformed("data.requests");
+  const requests: RedemptionHistoryEntryDto[] = requestsRaw.map((row, index) => {
+    if (typeof row !== "object" || row === null) throw malformed(`data.requests[${index}]`);
+    const r = row as Record<string, unknown>;
+    if (!isNonEmptyString(r.id)) throw malformed(`data.requests[${index}].id`);
+    if (!isMoneyString(r.amount)) throw malformed(`data.requests[${index}].amount`);
+    if (!isRedemptionStatus(r.status)) throw malformed(`data.requests[${index}].status`);
+    if (!isNonEmptyString(r.createdAt)) throw malformed(`data.requests[${index}].createdAt`);
+    if (!isNonEmptyString(r.statusChangedAt)) throw malformed(`data.requests[${index}].statusChangedAt`);
+    return { id: r.id, amount: r.amount, status: r.status, createdAt: r.createdAt, statusChangedAt: r.statusChangedAt };
+  });
+
+  return { kycStatus, requests, policy: parseRedemptionPolicy(record.policy, malformed) };
+}
+
+/**
+ * Fetch the player's own redemption history + the policy the /redeem screen renders around.
+ * Read-only: no idempotency token involved, and — like the wallet read — this NEVER writes to
+ * the shared wallet cache (G1). Pass React Query's `signal` so a superseded read cancels.
+ */
+export async function fetchRedemptionOverview(opts?: RequestOptions): Promise<RedemptionOverviewDto> {
+  const payload = await apiClient.get<unknown>("/store/redemptions", opts);
+  return parseRedemptionOverview(payload);
+}
+
+/** Gateway envelope for POST /api/store/redeem (redemption.service.ts `RedemptionAccepted`). */
+interface RedemptionAcceptedEnvelope {
+  success: true;
+  data: {
+    status: "UNDER_REVIEW";
+    redemptionId: string;
+    operatorTransactionId: string;
+    ledgerTransactionId: string;
+    amount: string;
+  };
+}
+
+export interface RedemptionAcceptedDto {
+  redemptionId: string;
+  amount: string;
+}
+
+/** What the browser is allowed to say about a redemption request. */
+export interface RedemptionRequestDto {
+  /** A validated, positive decimal string. Never a number — see guardrail G2. */
+  amount: string;
+  /** The RETAINED attempt token (the gateway's idempotency anchor for `redeem:<token>`). */
+  attemptToken: RedemptionAttemptToken;
+}
+
+/**
+ * Request a prize payout. The debit — if the engine accepts it — commits synchronously in
+ * this same request (unlike a purchase credit, which is webhook-driven and eventually
+ * consistent); the caller invalidates the wallet cache right after this resolves, not on a
+ * later reconcile loop.
+ *
+ * The attempt token is compile-enforced as a branded `RedemptionAttemptToken`, so only a value
+ * that went through the `redemptionIntent` retain/rotate lifecycle can anchor a request — a
+ * raw string is a type error.
+ */
+export async function submitRedemption(request: RedemptionRequestDto): Promise<RedemptionAcceptedDto> {
+  const res = await apiClient.post<RedemptionAcceptedEnvelope>("/store/redeem", {
+    idempotencyKey: request.attemptToken,
+    amount: request.amount,
+  });
+  return { redemptionId: res.data.redemptionId, amount: res.data.amount };
 }

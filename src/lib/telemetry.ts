@@ -34,7 +34,13 @@ export type TelemetryEvent =
   | "spin.token.reused"
   | "spin.token.cleared"
   | "spin.settled"
-  | "spin.failed";
+  | "spin.failed"
+  | "redemption.token.minted"
+  | "redemption.token.reused"
+  | "redemption.token.cleared"
+  | "redemption.attempt.blocked"
+  | "redemption.settled"
+  | "redemption.failed";
 
 /** Structured, JSON-serializable context for an event. No nested objects, no PII, no secrets. */
 export type TelemetryFields = Record<string, string | number | boolean>;
@@ -56,6 +62,9 @@ const ALWAYS_EMIT: ReadonlySet<TelemetryEvent> = new Set<TelemetryEvent>([
   // A failed spin is a money-flow fault: it may mean a debit the player cannot see yet
   // (the ghost-spin window), so it is observable in production, not dev-only.
   "spin.failed",
+  // Same reasoning for a failed redemption — the SC debit may have committed with the
+  // response lost (the ghost-redemption window).
+  "redemption.failed",
 ]);
 
 /**

@@ -128,6 +128,36 @@ export function spinEnvelope(status: "PROCESSED" | "GHOST_RECOVERED" = "PROCESSE
   });
 }
 
+const DEFAULT_REDEMPTION_POLICY = {
+  jurisdictionPermitted: true,
+  minimumAmount: "10.0000",
+  maximumPerRequest: "500.0000",
+  dailyCap: "1000.0000",
+  monthlyCap: "5000.0000",
+  remainingToday: "1000.0000",
+  remainingThisMonth: "5000.0000",
+};
+
+/** `GET /api/store/redemptions` — routes/store.ts `redemptionsHandler`. */
+export function redemptionOverviewEnvelope(opts: { kycStatus: string; requests?: unknown[] }): unknown {
+  return okBody({
+    kycStatus: opts.kycStatus,
+    requests: opts.requests ?? [],
+    policy: DEFAULT_REDEMPTION_POLICY,
+  });
+}
+
+/** `POST /api/store/redeem` accepted envelope — redemption.service.ts. */
+export function redemptionAcceptedEnvelope(amount: string): unknown {
+  return okBody({
+    status: "UNDER_REVIEW",
+    redemptionId: "rdm_e2e_1",
+    operatorTransactionId: "redeem:e2e-attempt-1",
+    ledgerTransactionId: "ltx_redeem_e2e_1",
+    amount,
+  });
+}
+
 // ── Scenario wiring ──────────────────────────────────────────────────────────
 
 async function fulfillJson(route: Route, json: unknown, status = 200): Promise<void> {
@@ -167,10 +197,20 @@ export type SpinScenario =
   | "in-flight"
   | "hanging";
 
+/**
+ * `GET /api/store/redemptions` + `POST /api/store/redeem`:
+ *   eligible      → kycStatus VERIFIED, an empty history, the default policy
+ *   kyc-required  → kycStatus PENDING (the redeem form stays blocked)
+ * The redeem POST always accepts (only reachable from the `eligible` scenario, since the
+ * form is disabled otherwise); the follow-up overview GET then reflects the new request.
+ */
+export type RedemptionScenario = "eligible" | "kyc-required";
+
 export interface GatewayStubOptions {
   wallet: WalletScenario;
   purchase?: PurchaseScenario;
   spin?: SpinScenario;
+  redemption?: RedemptionScenario;
   login?: "ok" | "unavailable";
   /** How the real sign-in routes answer (auth.spec.ts). Unset: they are not stubbed. */
   auth?: AuthScenario;
@@ -321,6 +361,30 @@ export async function installGateway(
           await fulfillJson(route, spinEnvelope("PROCESSED"));
           return;
       }
+    });
+  }
+
+  if (opts.redemption) {
+    const redemption = opts.redemption;
+    let redeemed = false;
+    await context.route(`${GATEWAY_ORIGIN}/api/store/redemptions`, async (route) => {
+      const kycStatus = redemption === "kyc-required" ? "PENDING" : "VERIFIED";
+      const requests = redeemed
+        ? [
+            {
+              id: "rdm_e2e_1",
+              amount: "50.0000",
+              status: "UNDER_REVIEW",
+              createdAt: new Date().toISOString(),
+              statusChangedAt: new Date().toISOString(),
+            },
+          ]
+        : [];
+      await fulfillJson(route, redemptionOverviewEnvelope({ kycStatus, requests }));
+    });
+    await context.route(`${GATEWAY_ORIGIN}/api/store/redeem`, async (route) => {
+      redeemed = true;
+      await fulfillJson(route, redemptionAcceptedEnvelope("50.0000"));
     });
   }
 

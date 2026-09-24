@@ -301,14 +301,21 @@ export const prismaFake = {
       }
       return { count };
     },
-    findMany: async ({ where, select }: QueryArgs) => {
-      const rows = [...redemptions.values()].filter((r) => {
+    findMany: async ({ where, select, orderBy, take }: QueryArgs) => {
+      let rows = [...redemptions.values()].filter((r) => {
         if (!where) return true;
+        if (where.userId !== undefined && r.userId !== where.userId) return false;
         if (where.playerId !== undefined && r.playerId !== where.playerId) return false;
         if (where.status?.in && !where.status.in.includes(r.status)) return false;
         if (where.createdAt?.gte && r.createdAt < where.createdAt.gte) return false;
         return true;
       });
+      if (orderBy?.createdAt === "desc") {
+        rows = [...rows].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+      } else if (orderBy?.createdAt === "asc") {
+        rows = [...rows].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+      }
+      if (typeof take === "number") rows = rows.slice(0, take);
       if (!select) return rows.map((r) => ({ ...r }));
       return rows.map((r) => {
         const out: AnyRow = {};
@@ -708,12 +715,14 @@ export function seedUser(u: {
   id: string;
   email?: string;
   kycStatus?: string;
+  residenceState?: string | null;
   trueEnginePlayerId?: string | null;
 }): void {
   users.set(u.id, {
     id: u.id,
     email: u.email ?? null,
     kycStatus: u.kycStatus ?? "PENDING",
+    residenceState: u.residenceState ?? null,
     trueEnginePlayerId: u.trueEnginePlayerId ?? null,
   });
 }
