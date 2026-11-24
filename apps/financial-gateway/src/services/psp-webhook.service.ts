@@ -1,4 +1,5 @@
 import { childLogger } from "../lib/logger";
+import { recordPspRejection } from "../lib/metrics";
 import type { PspWebhookEvent } from "../lib/payments/types";
 import { getPrisma } from "../lib/prisma";
 import { cancelScheduledReconcile, enqueueReconcile } from "../lib/reconcile-queue";
@@ -90,6 +91,8 @@ export async function handlePspWebhookEvent(event: PspWebhookEvent, traceId?: st
   const parsed = depositInstructionSchema.safeParse(row.requestPayload);
   if (!parsed.success) {
     log.fatal({ alert: "corrupt_deposit_payload" }, "CRITICAL: deposit payload failed schema validation; refusing to credit");
+    recordPspRejection("corrupt_payload");
+    await parkForOperator(row.id, opTxId, "corrupt_deposit_payload: journaled instruction failed schema validation");
     return { handled: false, note: "corrupt deposit payload" };
   }
   const instruction = parsed.data;
@@ -103,6 +106,9 @@ export async function handlePspWebhookEvent(event: PspWebhookEvent, traceId?: st
       { alert: "psp_payment_ref_mismatch", journaled_payment_ref: instruction.paymentIntentId },
       "CRITICAL: PSP webhook payment_ref does not match the journaled intent; refusing to credit",
     );
+    // Not parked: this event is evidence about a DIFFERENT intent. The journaled one may still
+    // settle, and the lost-webhook backstop polls exactly that intent.
+    recordPspRejection("payment_ref_mismatch");
     return { handled: false, note: "payment_ref mismatch" };
   }
 
@@ -113,6 +119,12 @@ export async function handlePspWebhookEvent(event: PspWebhookEvent, traceId?: st
     log.fatal(
       { alert: "psp_amount_mismatch", event_amount_cents: event.amountCents, expected_cents: instruction.expectedAmountCents },
       "CRITICAL: PSP webhook amount/currency mismatch; refusing to credit",
+    );
+    recordPspRejection("amount_mismatch");
+    await parkForOperator(
+      row.id,
+      opTxId,
+      `psp_amount_mismatch: captured ${event.amountCents} ${event.currency}, expected ${instruction.expectedAmountCents} ${instruction.currency}`,
     );
     return { handled: false, note: "amount/currency mismatch" };
   }
@@ -139,4 +151,19 @@ export async function handlePspWebhookEvent(event: PspWebhookEvent, traceId?: st
   await cancelScheduledReconcile(opTxId);
   log.info({ ledger_transaction_id: credit.data.ledger_transaction_id }, "deposit settled via psp webhook");
   return { handled: true, note: "settled" };
+}
+
+/**
+ * Take a deposit the gateway refused to credit out of automatic recovery and hand it to a
+ * human. The webhook is still answered 200 (the PSP redelivering would change nothing), so
+ * this row is the durable record: ABANDONED with the reason puts it in `/api/admin/dlq`, and
+ * moving it off PENDING stops the lost-webhook backstop from polling the PSP, seeing
+ * `succeeded`, and crediting what this path just refused.
+ */
+async function parkForOperator(rowId: string, opTxId: string, reason: string): Promise<void> {
+  await getPrisma().engineRequestLog.update({
+    where: { id: rowId },
+    data: { status: "ABANDONED", retryable: false, lastError: reason },
+  });
+  await cancelScheduledReconcile(opTxId);
 }
