@@ -366,7 +366,44 @@ function assertDevFlagsSane(env: Env): void {
         "from this deployment.",
     );
   }
+
+  if (env.NODE_ENV !== "production") return;
+
+  // Jurisdiction enforcement is a licence condition, not a tuning knob. The opt-out exists for
+  // local development and must not be able to reach a production process.
+  if (env.GEO_ENFORCEMENT_DISABLED) {
+    throw new Error(
+      "REFUSING TO BOOT: GEO_ENFORCEMENT_DISABLED is set with NODE_ENV=production. " +
+        "Blocked-state enforcement must be on in production. Remove the variable from this deployment.",
+    );
+  }
+  // With no trusted proxy the geo headers are ignored and every request is rejected as
+  // unlocatable. That is fail-closed and safe, but a production process that can serve nobody
+  // should say so at boot rather than through a wall of 403s.
+  if (env.TRUSTED_PROXIES.length === 0) {
+    throw new Error(
+      "REFUSING TO BOOT: TRUSTED_PROXIES is empty with NODE_ENV=production. Every player would be " +
+        "rejected as unlocatable. Declare the CIDRs of the edge proxy that sets the geo headers.",
+    );
+  }
 }
+
+/**
+ * Whether the mock PSP, payout rail and KYC provider may run.
+ *
+ * Same ALLOWLIST rule as {@link devMockLoginEnabled}, for the same reason: the parsed
+ * NODE_ENV defaults to "development", so only the RAW variable can tell a declared dev box
+ * from a deployment that forgot to say what it is. The mock PSP mints coins, the mock rail
+ * pays nobody and the mock KYC verifies everyone; none of that may run on a default.
+ */
+export function mockProvidersAllowed(): boolean {
+  const declared = process.env.NODE_ENV;
+  return declared === "development" || declared === "test";
+}
+
+/** The refusal message shared by every mock provider factory. */
+export const MOCK_PROVIDER_REFUSAL =
+  "the mock provider runs only with NODE_ENV explicitly set to development or test; configure a real provider";
 
 /**
  * Whether the dev-only mock-login route may be wired up.

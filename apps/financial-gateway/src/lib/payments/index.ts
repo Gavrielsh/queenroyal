@@ -1,4 +1,4 @@
-import { getEnv } from "../../config/env";
+import { getEnv, MOCK_PROVIDER_REFUSAL, mockProvidersAllowed } from "../../config/env";
 import { MockPaymentProvider } from "./mock";
 import { StripePaymentProvider } from "./stripe";
 import { type PaymentProvider, PaymentProviderNotConfiguredError } from "./types";
@@ -23,11 +23,10 @@ export function getPaymentProvider(): PaymentProvider {
       webhookSecret: env.STRIPE_WEBHOOK_SECRET,
     });
   } else {
-    // The mock PSP auto-settles purchases — in production that would mint coins for free.
-    if (env.NODE_ENV === "production") {
-      throw new PaymentProviderNotConfiguredError(
-        "PAYMENT_PROVIDER=mock is forbidden in production — configure PAYMENT_PROVIDER=stripe",
-      );
+    // The mock PSP auto-settles purchases — outside a declared dev/test box that would mint
+    // coins for free. An unset NODE_ENV is refused too (see mockProvidersAllowed).
+    if (!mockProvidersAllowed()) {
+      throw new PaymentProviderNotConfiguredError(`PAYMENT_PROVIDER=mock: ${MOCK_PROVIDER_REFUSAL}`);
     }
     instance = new MockPaymentProvider(env.PSP_WEBHOOK_SECRET ?? "mock_psp_dev_secret");
   }

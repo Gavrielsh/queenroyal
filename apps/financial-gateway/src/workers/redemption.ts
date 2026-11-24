@@ -1,3 +1,4 @@
+import { assertProvidersConfigured } from "../lib/boot-checks";
 import { childLogger } from "../lib/logger";
 import { getRedis } from "../lib/redis";
 import { getRedemptionQueue, RedemptionQueueUnavailableError } from "../lib/redemption-queue";
@@ -16,6 +17,8 @@ import { runRedemptionListener } from "../services/redemption-worker.service";
 const workerLog = childLogger({ component: "redemption-worker-main" });
 
 async function main(): Promise<void> {
+  // The redemption worker submits payouts; refuse to start on a rail that pays nobody.
+  assertProvidersConfigured();
   if (!getRedis()) {
     throw new RedemptionQueueUnavailableError(
       "redemption worker requires REDIS_URL (the event broker); refusing to start",

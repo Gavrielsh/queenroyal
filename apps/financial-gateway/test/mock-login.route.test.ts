@@ -113,7 +113,14 @@ describe("POST /api/auth/mock-login (dev-only session bootstrap)", () => {
     });
 
     it("in production", async () => {
-      app = await bootWith({ NODE_ENV: "production", ENABLE_DEV_MOCK_LOGIN: undefined });
+      // A bootable production config: geo enforcement on and an edge proxy declared, which
+      // production now requires before it will start at all.
+      app = await bootWith({
+        NODE_ENV: "production",
+        ENABLE_DEV_MOCK_LOGIN: undefined,
+        GEO_ENFORCEMENT_DISABLED: "",
+        TRUSTED_PROXIES: "10.0.0.0/8",
+      });
       const res = await app.inject({ method: "POST", url: "/api/auth/mock-login" });
       expect(res.statusCode).toBe(404);
       expect(res.json()).toMatchObject({ success: false, error: { code: "NOT_FOUND" } });

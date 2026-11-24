@@ -1,4 +1,4 @@
-import { getEnv } from "../../config/env";
+import { getEnv, MOCK_PROVIDER_REFUSAL, mockProvidersAllowed } from "../../config/env";
 import { MockKycProvider } from "./mock";
 import { type KycProvider, KycProviderNotConfiguredError } from "./types";
 
@@ -22,10 +22,8 @@ let instance: KycProvider | null = null;
  */
 export function getKycProvider(): KycProvider {
   if (instance) return instance;
-  if (getEnv().NODE_ENV === "production") {
-    throw new KycProviderNotConfiguredError(
-      "no real KYC provider is configured — the mock provider is forbidden in production",
-    );
+  if (!mockProvidersAllowed()) {
+    throw new KycProviderNotConfiguredError(`no real KYC provider is configured — ${MOCK_PROVIDER_REFUSAL}`);
   }
   instance = new MockKycProvider(getEnv().KYC_WEBHOOK_SECRET);
   return instance;
