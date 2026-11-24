@@ -1,0 +1,21 @@
+{
+  // PRODUCTION build project.
+  //
+  // Identical to tsconfig.json except that `src/dev` is excluded, so `npm run build` never
+  // emits the dev-only mock-login route — the sole writer of `kycStatus: "VERIFIED"`. This is
+  // the strong half of the Milestone 0.7 gate: the shipped artifact does not contain the code,
+  // so no environment variable can turn it on.
+  //
+  // `npm run typecheck` still uses tsconfig.json, which INCLUDES src/dev, so the dev module is
+  // type-checked like everything else rather than rotting outside the compiler's view.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Strip comments from the shipped artifact. Two reasons, one of them load-bearing:
+    // internal design notes are not something a production bundle needs to carry, and
+    // verify-no-dev-routes.mjs scans the emitted JS for banned patterns — with comments
+    // preserved, a doc comment that merely NAMES a banned pattern (explaining why it must
+    // not appear) would fail the build. Removing comments makes that scan a check on CODE.
+    "removeComments": true
+  },
+  "exclude": ["node_modules", "dist", "test", "src/dev"]
+}
