@@ -256,7 +256,17 @@ export const prismaFake = {
   },
 
   redemptionRequest: {
+    // ENFORCES the `operatorTransactionId` unique index with a P2002-shaped error, as Postgres
+    // does. A lenient fake here is what let a retry that re-created the row pass its tests.
     create: async ({ data }: QueryArgs) => {
+      for (const existing of redemptions.values()) {
+        if (existing.operatorTransactionId === data.operatorTransactionId) {
+          throw Object.assign(new Error("Unique constraint failed on the fields: (operatorTransactionId)"), {
+            code: "P2002",
+            meta: { target: ["operatorTransactionId"] },
+          });
+        }
+      }
       const now = new Date();
       const row: AnyRow = {
         id: randomUUID(),
@@ -285,7 +295,10 @@ export const prismaFake = {
       return { ...row };
     },
     findUnique: async ({ where }: QueryArgs) => {
-      const row = redemptions.get(where.id);
+      const row =
+        where.id !== undefined
+          ? redemptions.get(where.id)
+          : [...redemptions.values()].find((r) => r.operatorTransactionId === where.operatorTransactionId);
       return row ? { ...row } : null;
     },
     // Conditional update — the worker's compare-and-set. Matches only rows satisfying EVERY
@@ -630,11 +643,29 @@ export const prismaFake = {
     findMany: async () => [...kycWebhookEvents.values()].map((r) => ({ ...r })),
   },
 
-  // Interactive transaction: the fake has no real isolation, so it simply runs the callback
-  // against itself (ignoring the isolation/timeout options). `txClient()` is referenced (not
-  // `prismaFake` directly) to avoid a self-referential-initializer type cycle.
-  $transaction: async (fn: (tx: unknown) => Promise<unknown>, _opts?: unknown): Promise<unknown> =>
-    fn(txClient()),
+  // Interactive transaction: the fake has no real isolation, so it runs the callback against
+  // itself (ignoring the isolation/timeout options). The one thing it DOES model is
+  // `pg_advisory_xact_lock`: a lock taken through the tx client is held until the callback
+  // settles, exactly as Postgres releases it at commit/rollback. Without that, a test of a
+  // lock-serialised check-then-insert would pass with or without the lock.
+  $transaction: async (fn: (tx: unknown) => Promise<unknown>, _opts?: unknown): Promise<unknown> => {
+    const held: Array<() => void> = [];
+    const tx = {
+      ...(txClient() as Record<string, unknown>),
+      $executeRaw: async (q: RawQuery, ...rest: unknown[]): Promise<number> => {
+        const { text, values } = readRawQuery(q, rest);
+        if (text.includes("pg_advisory_xact_lock")) held.push(await acquireAdvisoryLock(String(values[0])));
+        return 0;
+      },
+    };
+    try {
+      return await fn(tx);
+    } finally {
+      for (const release of held) release();
+    }
+  },
+
+  $executeRaw: async (): Promise<number> => 0,
 
   /**
    * Raw query handler. The gateway runs exactly two raw statements against the journal:
@@ -663,6 +694,25 @@ export const prismaFake = {
   },
 };
 
+/** Tail of each advisory-lock key's wait chain; a key is free when it has no entry. */
+const advisoryLocks = new Map<string, Promise<void>>();
+
+/** Wait for `key`, then hold it until the returned release function is called. */
+async function acquireAdvisoryLock(key: string): Promise<() => void> {
+  const previous = advisoryLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => mine);
+  advisoryLocks.set(key, tail);
+  await previous;
+  return () => {
+    release();
+    if (advisoryLocks.get(key) === tail) advisoryLocks.delete(key);
+  };
+}
+
 /** Late-bound accessor so {@link prismaFake}'s `$transaction` doesn't self-reference its initializer. */
 function txClient(): unknown {
   return prismaFake;
@@ -678,6 +728,7 @@ export function resetDb(): void {
   kycVerifications.clear();
   kycDocuments.clear();
   kycWebhookEvents.clear();
+  advisoryLocks.clear();
 }
 
 /** Every redemption row, newest last. Lets a test assert the orchestration row's lifecycle. */
