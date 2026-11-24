@@ -3,6 +3,7 @@ import type { EngineRequestLog } from "@prisma/client";
 import { getEnv } from "../config/env";
 import { claimEngineRequest } from "../lib/db/transaction";
 import { childLogger, type Logger } from "../lib/logger";
+import { recordPspRejection } from "../lib/metrics";
 import { getPrisma } from "../lib/prisma";
 import {
   getReconcileQueue,
@@ -322,6 +323,21 @@ async function reconcileDeposit(
     return waitOrAbandon(row, attempts, maxAttempts, "psp intent not found");
   }
   if (snapshot.status === "succeeded") {
+    // The same evidence check the webhook path makes. A bare `succeeded` from the poll must
+    // not credit a capture the webhook would have refused.
+    if (snapshot.amountCents !== instruction.expectedAmountCents || snapshot.currency !== instruction.currency) {
+      rowLog.fatal(
+        { alert: "psp_amount_mismatch", polled_amount_cents: snapshot.amountCents, expected_cents: instruction.expectedAmountCents },
+        "CRITICAL: polled PSP capture amount/currency does not match the journaled intent; refusing to credit",
+      );
+      recordPspRejection("amount_mismatch");
+      await setStatus(
+        row.id,
+        "ABANDONED",
+        `psp_amount_mismatch: captured ${snapshot.amountCents} ${snapshot.currency}, expected ${instruction.expectedAmountCents} ${instruction.currency}`,
+      );
+      return "abandoned";
+    }
     rowLog.warn("recovered a lost PSP success via poll; crediting deposit");
     return finalizeDepositCredit(row, await creditConfirmedDeposit(instruction), attempts, maxAttempts, rowLog);
   }

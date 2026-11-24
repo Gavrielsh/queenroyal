@@ -42,6 +42,23 @@ const http5xxTotal = new Counter({
   registers: [registry],
 });
 
+/**
+ * Verified PSP evidence the gateway refused to act on. Every increment is a deposit that may be
+ * captured-but-uncredited and needs a human, so alert on any increase — not on a rate.
+ */
+const pspWebhookRejectionsTotal = new Counter({
+  name: "psp_webhook_rejections_total",
+  help: "PSP settlement evidence refused by the gateway, by reason.",
+  labelNames: ["reason"] as const,
+  registers: [registry],
+});
+
+export type PspRejectionReason = "amount_mismatch" | "payment_ref_mismatch" | "corrupt_payload";
+
+export function recordPspRejection(reason: PspRejectionReason): void {
+  pspWebhookRejectionsTotal.inc({ reason });
+}
+
 const httpActiveConnections = new Gauge({
   name: "http_active_connections",
   help: "In-flight HTTP requests currently being processed.",

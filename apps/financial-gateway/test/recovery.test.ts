@@ -210,6 +210,41 @@ describe("crash & recovery", () => {
     expect(row?.ledgerTransactionId).toBe("ltx-dep-3");
   });
 
+  it("Scenario 3c — Lost PSP webhook with a WRONG captured amount: the poll never credits it", async () => {
+    const attemptId = "attempt-3c";
+    const opTx = `deposit:${attemptId}`;
+
+    // The journal expects $20; the PSP's own record of the SAME intent says $15 was captured.
+    const intent = await psp.createPaymentIntent({
+      amountCents: 1500,
+      currency: "USD",
+      idempotencyKey: attemptId,
+      customerRef: USER_ID,
+      metadata: { operator_transaction_id: opTx, package_id: "pkg_value_20" },
+    });
+    seedJournalRow({
+      operatorTransactionId: opTx,
+      type: "DEPOSIT",
+      status: "PENDING",
+      playerId: ENGINE_PLAYER_ID,
+      providerRef: intent.paymentIntentId,
+      requestPayload: depositInstruction(opTx, intent.paymentIntentId, attemptId),
+      updatedAt: new Date(Date.now() - 10 * 60_000),
+    });
+    psp.markIntentSucceeded(intent.paymentIntentId);
+    setEngineHandler(() => unexpected); // no credit may reach the ledger
+
+    // The webhook path refuses this; the backstop must not credit it on the strength of a
+    // bare `succeeded` either.
+    await queue.schedule({ operatorTransactionId: opTx, reason: "deposit_pending_deadline" }, 0);
+    const outcomes = await drainReconciler(queue);
+
+    expect(outcomes).toEqual(["abandoned"]);
+    expect(engineCalls.filter((c) => c.path === "/api/v1/store/purchase")).toHaveLength(0);
+    expect(getJournal(opTx)?.status).toBe("ABANDONED");
+    expect(getJournal(opTx)?.lastError).toMatch(/^psp_amount_mismatch/);
+  });
+
   it("Scenario 3b — Webhook credit failure: a captured deposit whose credit drops is re-driven (no re-charge)", async () => {
     const attemptId = "attempt-3b";
     const opTx = `deposit:${attemptId}`;

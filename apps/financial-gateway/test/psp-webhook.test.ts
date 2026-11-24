@@ -7,6 +7,7 @@ vi.mock("../src/lib/prisma", async () => {
 });
 
 import type { AuthClaims } from "../src/lib/jwt";
+import { registry } from "../src/lib/metrics";
 import { setPaymentProvider } from "../src/lib/payments";
 import { MockPaymentProvider } from "../src/lib/payments/mock";
 import { PspWebhookSignatureError } from "../src/lib/payments/types";
@@ -47,13 +48,26 @@ function okPurchase(operatorTransactionId: string, ledgerTxId: string): Directiv
 
 const unexpected: Directive = { ok: false, status: 500, body: { code: "UNEXPECTED" } };
 
+/** Current value of `psp_webhook_rejections_total{reason}` (0 before the first rejection). */
+async function rejectionCount(reason: string): Promise<number> {
+  const metric = await registry.getSingleMetric("psp_webhook_rejections_total")?.get();
+  return metric?.values.find((v) => v.labels.reason === reason)?.value ?? 0;
+}
+
 const user: AuthClaims = { sub: USER_ID, email: "buyer@test.io", kycStatus: "VERIFIED", vipLevel: 0 };
 
-/** Seed a PENDING deposit for `$20 Value`, with its PSP intent already opened on `psp`. */
-async function seedPendingDeposit(attemptId: string): Promise<{ opTx: string; paymentIntentId: string }> {
+/**
+ * Seed a PENDING deposit for `$20 Value`, with its PSP intent already opened on `psp`.
+ * `intentAmountCents` lets a test open the PSP intent for a DIFFERENT amount than the journal
+ * expects, which is the only way to produce a correctly-signed amount-mismatch event.
+ */
+async function seedPendingDeposit(
+  attemptId: string,
+  intentAmountCents = 2000,
+): Promise<{ opTx: string; paymentIntentId: string }> {
   const opTx = `deposit:${attemptId}`;
   const intent = await psp.createPaymentIntent({
-    amountCents: 2000,
+    amountCents: intentAmountCents,
     currency: "USD",
     idempotencyKey: attemptId,
     customerRef: USER_ID,
@@ -179,6 +193,61 @@ describe("asynchronous PSP settlement", () => {
     expect(outcome).toMatchObject({ handled: false, note: "payment_ref mismatch" });
     expect(getJournal(opTx)?.status).toBe("PENDING"); // journal untouched — the real intent may still settle
     expect(engineCalls.filter((c) => c.path === "/api/v1/store/purchase")).toHaveLength(0);
+  });
+
+  it("P0-5 — an amount mismatch is parked ABANDONED with a reason, so neither the webhook nor the backstop credits it", async () => {
+    // The journal expects $20; the PSP captured $15 on the SAME journaled intent.
+    const { opTx, paymentIntentId } = await seedPendingDeposit("buy-amtx", 1500);
+    psp.markIntentSucceeded(paymentIntentId);
+    setEngineHandler(() => unexpected); // no credit may reach the ledger
+    const before = await rejectionCount("amount_mismatch");
+
+    const { rawBody, signature } = psp.buildSignedWebhook(paymentIntentId, "payment_intent.succeeded");
+    const outcome = await handlePspWebhookEvent(psp.parseWebhook(rawBody, signature));
+
+    expect(outcome).toMatchObject({ handled: false, note: "amount/currency mismatch" });
+    // Durable and visible in /api/admin/dlq — and no longer PENDING, so the lost-webhook
+    // backstop cannot poll the PSP, see `succeeded`, and credit what the webhook refused.
+    expect(getJournal(opTx)?.status).toBe("ABANDONED");
+    expect(getJournal(opTx)?.lastError).toMatch(/^psp_amount_mismatch/);
+    expect(engineCalls.filter((c) => c.path === "/api/v1/store/purchase")).toHaveLength(0);
+    expect(await rejectionCount("amount_mismatch")).toBe(before + 1);
+  });
+
+  it("P0-5 — a corrupt journaled payload is parked ABANDONED with a reason instead of staying PENDING", async () => {
+    const { opTx, paymentIntentId } = await seedPendingDeposit("buy-corr");
+    const row = getJournal(opTx);
+    if (row) seedJournalRow({ ...row, requestPayload: { not: "an instruction" } });
+    psp.markIntentSucceeded(paymentIntentId);
+    setEngineHandler(() => unexpected);
+
+    const { rawBody, signature } = psp.buildSignedWebhook(paymentIntentId, "payment_intent.succeeded");
+    const outcome = await handlePspWebhookEvent(psp.parseWebhook(rawBody, signature));
+
+    expect(outcome).toMatchObject({ handled: false, note: "corrupt deposit payload" });
+    expect(getJournal(opTx)?.status).toBe("ABANDONED");
+    expect(getJournal(opTx)?.lastError).toMatch(/^corrupt_deposit_payload/);
+    expect(engineCalls.filter((c) => c.path === "/api/v1/store/purchase")).toHaveLength(0);
+  });
+
+  it("P0-5 — a payment_ref mismatch is counted for alerting but leaves the deposit PENDING for the backstop", async () => {
+    const { opTx } = await seedPendingDeposit("buy-refm");
+    const rogue = await psp.createPaymentIntent({
+      amountCents: 2000,
+      currency: "USD",
+      idempotencyKey: "rogue-key-m",
+      customerRef: USER_ID,
+      metadata: { operator_transaction_id: opTx, package_id: "pkg_value_20" },
+    });
+    psp.markIntentSucceeded(rogue.paymentIntentId);
+    setEngineHandler(() => unexpected);
+    const before = await rejectionCount("payment_ref_mismatch");
+
+    const { rawBody, signature } = psp.buildSignedWebhook(rogue.paymentIntentId, "payment_intent.succeeded");
+    await handlePspWebhookEvent(psp.parseWebhook(rawBody, signature));
+
+    expect(getJournal(opTx)?.status).toBe("PENDING");
+    expect(await rejectionCount("payment_ref_mismatch")).toBe(before + 1);
   });
 
   it("Z2-M1-T1 — refuses to ABANDON on a failure webhook whose payment_ref is not the journaled intent", async () => {
