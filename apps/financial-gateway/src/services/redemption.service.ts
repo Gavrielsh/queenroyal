@@ -1,8 +1,11 @@
+import { Prisma, type RedemptionRequest } from "@prisma/client";
+
 import { getRedemptionCaps } from "../config/redemption-caps";
 import type { FlowContext } from "../lib/context";
+import { runInTransaction } from "../lib/db/transaction";
 import type { AuthClaims } from "../lib/jwt";
 import { childLogger } from "../lib/logger";
-import { sumMoney } from "../lib/money";
+import { compareMoney, sumMoney } from "../lib/money";
 import { getPrisma } from "../lib/prisma";
 import { enqueueReconcile } from "../lib/reconcile-queue";
 import {
@@ -57,6 +60,11 @@ export type RedemptionOutcome =
  * request against a cap would punish a player for an operator's decision.
  */
 export const CAP_COUNTING_STATUSES = ["REQUESTED", "UNDER_REVIEW", "APPROVED", "PROCESSING", "PAID"] as const;
+
+const ATTEMPT_EXHAUSTED: TrueEngineErrorBody = {
+  code: "ATTEMPT_EXHAUSTED",
+  message: "This redemption attempt can no longer be completed; start a new one",
+};
 
 /** Engine refusal codes that mean the same thing as one of the policy's own refusals. */
 const ENGINE_REFUSAL_TO_POLICY: Readonly<Record<string, RedemptionRefusal>> = {
@@ -147,58 +155,98 @@ export async function requestRedemption(
       };
     }
     if (existing.status === "ABANDONED" || existing.status === "COMPENSATED") {
-      return {
-        ok: false,
-        status: 409,
-        error: { code: "ATTEMPT_EXHAUSTED", message: "This redemption attempt can no longer be completed; start a new one" },
-      };
+      return { ok: false, status: 409, error: ATTEMPT_EXHAUSTED };
     }
     // PENDING / FAILED → the owner retrying an in-flight attempt: fall through. The engine
     // de-duplicates on the same anchor, so the retry reaches the original debit.
   }
 
   // 3) Policy gates (B3). Pure predicates over facts gathered here; the module itself decides
-  //    nothing about where a fact came from.
+  //    nothing about where a fact came from. The Zone-1 facts are a network read, so they are
+  //    fetched BEFORE the per-player lock below and never hold it open across a round trip.
   const jurisdiction = ctx.jurisdiction ?? "";
-  const periods = await sumRedeemedPeriods(playerId, deps.now ? deps.now() : new Date());
   const readFacts = deps.engineOwnedFacts ?? fetchEngineOwnedFacts;
   const engineFacts = await readFacts(playerId);
+  const now = deps.now ? deps.now() : new Date();
 
-  const facts: RedemptionFacts = {
-    jurisdiction,
-    kycStatus: player.kycStatus,
-    // A null here means the snapshot call itself failed, NOT that the player is clear. The
-    // values fall back to the neutral element for their gates and the engine — which refuses
-    // under the wallet lock regardless — decides; its refusal is mapped at step 6. Failing the
-    // whole request on an advisory read would turn a degraded optimisation into an outage.
-    playerStatus: engineFacts?.playerStatus ?? "ACTIVE",
-    playthroughOutstanding: engineFacts?.playthroughOutstanding ?? "0",
-    amount: input.amount,
-    redeemedToday: periods.today,
-    redeemedThisMonth: periods.thisMonth,
-  };
-
-  const decision = evaluateRedemption(facts, getRedemptionCaps());
-  if (!decision.allowed) {
-    flowLog.warn(
-      { refusals: decision.refusals, jurisdiction, gates_deferred_to_engine: engineFacts === null },
-      "redemption refused by policy",
-    );
-    return { ok: false, status: refusalStatus(decision.refusals[0]), error: refusalError(decision.refusals) };
-  }
-
-  // 4) The orchestration row. Created BEFORE the debit so a crash between the two leaves a
+  // 3+4) Gate and record under ONE per-player lock. The period caps are a check-then-act over
+  //    this player's rows, and the engine does not enforce them, so two concurrent attempts
+  //    must not both read the same "redeemed today" and both insert. The advisory lock
+  //    serialises them; READ COMMITTED (not SERIALIZABLE) so the sum, taken AFTER the lock is
+  //    granted, sees the row the previous holder committed — a serializable snapshot would be
+  //    pinned at the lock statement and miss it.
+  //
+  //    The orchestration row is created BEFORE the debit so a crash between the two leaves a
   //    REQUESTED row naming the anchor — an operator can see what was attempted. A debit with
-  //    no row would be money moved with no record of why.
-  const redemption = await getPrisma().redemptionRequest.create({
-    data: {
-      userId: player.userId,
-      playerId,
-      status: "REQUESTED",
-      amount: input.amount,
-      operatorTransactionId,
+  //    no row would be money moved with no record of why. A retry of an in-flight attempt
+  //    reuses that row rather than inserting a second one under the same unique anchor.
+  const gate = await runInTransaction(
+    async (tx): Promise<{ ok: true; redemption: RedemptionRequest } | { ok: false; outcome: RedemptionOutcome }> => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`redeem:${playerId}`}, 0))`;
+
+      const prior = await tx.redemptionRequest.findUnique({ where: { operatorTransactionId } });
+      if (prior && prior.status !== "REQUESTED") {
+        // The attempt already reached a terminal decision (e.g. REJECTED by the engine).
+        return { ok: false, outcome: { ok: false, status: 409, error: ATTEMPT_EXHAUSTED } };
+      }
+      if (prior && compareMoney(prior.amount, input.amount) !== 0) {
+        // The engine de-duplicates on the anchor, so a changed amount would silently debit the
+        // ORIGINAL figure while the player believes they asked for this one.
+        return {
+          ok: false,
+          outcome: {
+            ok: false,
+            status: 409,
+            error: { code: "ATTEMPT_MISMATCH", message: "This redemption attempt was started with a different amount" },
+          },
+        };
+      }
+
+      const periods = await sumRedeemedPeriods(tx, playerId, now, operatorTransactionId);
+      const facts: RedemptionFacts = {
+        jurisdiction,
+        kycStatus: player.kycStatus,
+        // A null here means the snapshot call itself failed, NOT that the player is clear. The
+        // values fall back to the neutral element for their gates and the engine — which
+        // refuses under the wallet lock regardless — decides; its refusal is mapped at step 6.
+        // Failing the whole request on an advisory read would turn a degraded optimisation
+        // into an outage.
+        playerStatus: engineFacts?.playerStatus ?? "ACTIVE",
+        playthroughOutstanding: engineFacts?.playthroughOutstanding ?? "0",
+        amount: input.amount,
+        redeemedToday: periods.today,
+        redeemedThisMonth: periods.thisMonth,
+      };
+
+      const decision = evaluateRedemption(facts, getRedemptionCaps());
+      if (!decision.allowed) {
+        flowLog.warn(
+          { refusals: decision.refusals, jurisdiction, gates_deferred_to_engine: engineFacts === null },
+          "redemption refused by policy",
+        );
+        return {
+          ok: false,
+          outcome: { ok: false, status: refusalStatus(decision.refusals[0]), error: refusalError(decision.refusals) },
+        };
+      }
+
+      const redemption =
+        prior ??
+        (await tx.redemptionRequest.create({
+          data: {
+            userId: player.userId,
+            playerId,
+            status: "REQUESTED",
+            amount: input.amount,
+            operatorTransactionId,
+          },
+        }));
+      return { ok: true, redemption };
     },
-  });
+    { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted },
+  );
+  if (!gate.ok) return gate.outcome;
+  const redemption = gate.redemption;
 
   // 5) Journal the intent, then call. Same order as every other money path: the durable
   //    record exists before the network does.
@@ -303,21 +351,29 @@ export async function requestRedemption(
  * reviewer, and a local-timezone day would silently give players in one region a longer day
  * than another.
  */
-async function sumRedeemedPeriods(playerId: string, now: Date): Promise<{ today: string; thisMonth: string }> {
+async function sumRedeemedPeriods(
+  tx: Prisma.TransactionClient,
+  playerId: string,
+  now: Date,
+  excludeOperatorTransactionId: string,
+): Promise<{ today: string; thisMonth: string }> {
   const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   const startOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
 
-  const rows = await getPrisma().redemptionRequest.findMany({
+  const rows = await tx.redemptionRequest.findMany({
     where: {
       playerId,
       status: { in: [...CAP_COUNTING_STATUSES] },
       createdAt: { gte: startOfMonth },
     },
-    select: { amount: true, createdAt: true },
+    select: { amount: true, createdAt: true, operatorTransactionId: true },
   });
 
-  const monthAmounts = rows.map((r) => r.amount);
-  const dayAmounts = rows.filter((r) => r.createdAt >= startOfDay).map((r) => r.amount);
+  // A retry's own earlier row is the request being evaluated, not prior history: counting it
+  // would refuse the retry for consuming its own headroom.
+  const counted = rows.filter((r) => r.operatorTransactionId !== excludeOperatorTransactionId);
+  const monthAmounts = counted.map((r) => r.amount);
+  const dayAmounts = counted.filter((r) => r.createdAt >= startOfDay).map((r) => r.amount);
   return {
     today: dayAmounts.length > 0 ? sumMoney(...dayAmounts) : "0",
     thisMonth: monthAmounts.length > 0 ? sumMoney(...monthAmounts) : "0",

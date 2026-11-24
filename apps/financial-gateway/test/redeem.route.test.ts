@@ -10,7 +10,14 @@ vi.mock("../src/lib/prisma", async () => {
 
 import { buildApp } from "../src/app";
 import { signAccessToken } from "../src/lib/jwt";
-import { type Directive, type EngineCall, engineCalls, resetEngine, setEngineHandler } from "./fakes/engine.fake";
+import {
+  type Directive,
+  type EngineCall,
+  engineCalls,
+  resetEngine,
+  setEngineHandler,
+  setEngineLatency,
+} from "./fakes/engine.fake";
 import { getJournal, getRedemptions, resetDb, seedRedemption, seedUser } from "./fakes/prisma.fake";
 
 /**
@@ -419,6 +426,78 @@ describe("POST /api/store/redeem — attempt anchor", () => {
     const res = await redeem(goodBody());
     expect(res.statusCode).toBe(409);
     expect(res.json().error.code).toBe("ATTEMPT_EXHAUSTED");
+  });
+});
+
+describe("POST /api/store/redeem — concurrency and retries", () => {
+  const redeemCalls = () => engineCalls.filter((c) => c.path === "/api/v1/store/redeem");
+  const engineDown: Directive = { ok: false, status: 503, body: { code: "ENGINE_UNAVAILABLE", message: "down" } };
+  const engineUp = (c: EngineCall) =>
+    c.path === "/api/v1/store/redeem" ? okRedeem(c.body.operator_transaction_id) : unexpected;
+
+  it("two CONCURRENT attempts that together overshoot the daily cap: exactly one is accepted", async () => {
+    // 4900 + 100 lands on the 5000 cap; a second 100 on top of that must be refused. Fired in
+    // parallel, both would read 4900 if the sum and the insert were not serialised per player.
+    seedRedemption({ playerId: PLAYER_ID, userId: USER_ID, amount: "4900.0000", status: "UNDER_REVIEW" });
+    setEngineHandler(engineUp);
+    // Real network latency lets both requests be in flight at once, as they are in production.
+    setEngineLatency(5);
+
+    const [a, b] = await Promise.all([
+      redeem(goodBody({ idempotencyKey: "redeem-attempt-0001" })),
+      redeem(goodBody({ idempotencyKey: "redeem-attempt-0002" })),
+    ]);
+
+    expect([a.statusCode, b.statusCode].sort()).toEqual([200, 422]);
+    expect([a, b].find((r) => r.statusCode === 422)?.json().error.details.refusals).toContain("DAILY_CAP_EXCEEDED");
+    expect(redeemCalls()).toHaveLength(1);
+  });
+
+  it("a retry of a RETRYABLE failure re-drives the same anchor and reuses the orchestration row", async () => {
+    setEngineHandler(() => engineDown);
+    expect((await redeem(goodBody())).statusCode).toBe(503);
+
+    setEngineHandler(engineUp);
+    const retry = await redeem(goodBody());
+
+    expect(retry.statusCode).toBe(200);
+    expect(getRedemptions()).toHaveLength(1);
+    expect(getRedemptions()[0]?.status).toBe("UNDER_REVIEW");
+    expect(redeemCalls().map((c) => c.body.operator_transaction_id)).toEqual([
+      "redeem:redeem-attempt-0001",
+      "redeem:redeem-attempt-0001",
+    ]);
+  });
+
+  it("a retry does not count its OWN earlier row against the cap", async () => {
+    seedRedemption({ playerId: PLAYER_ID, userId: USER_ID, amount: "4900.0000", status: "UNDER_REVIEW" });
+    setEngineHandler(() => engineDown);
+    expect((await redeem(goodBody())).statusCode).toBe(503);
+
+    setEngineHandler(engineUp);
+    expect((await redeem(goodBody())).statusCode).toBe(200);
+  });
+
+  it("→ 409 ATTEMPT_EXHAUSTED when the attempt's row was already terminally REJECTED", async () => {
+    setEngineHandler(() => ({ ok: false, status: 403, body: { code: "PLAYER_NOT_ACTIVE", message: "no" } }));
+    expect((await redeem(goodBody())).statusCode).toBe(403);
+
+    setEngineHandler(engineUp);
+    const retry = await redeem(goodBody());
+    expect(retry.statusCode).toBe(409);
+    expect(retry.json().error.code).toBe("ATTEMPT_EXHAUSTED");
+    expect(redeemCalls()).toHaveLength(1);
+  });
+
+  it("→ 409 ATTEMPT_MISMATCH when a retry changes the amount under the same anchor", async () => {
+    setEngineHandler(() => engineDown);
+    expect((await redeem(goodBody({ amount: "100.0000" }))).statusCode).toBe(503);
+
+    setEngineHandler(engineUp);
+    const retry = await redeem(goodBody({ amount: "200.0000" }));
+    expect(retry.statusCode).toBe(409);
+    expect(retry.json().error.code).toBe("ATTEMPT_MISMATCH");
+    expect(redeemCalls()).toHaveLength(1);
   });
 });
 

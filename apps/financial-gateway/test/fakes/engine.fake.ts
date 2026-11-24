@@ -20,14 +20,25 @@ export const engineCalls: EngineCall[] = [];
 
 const NO_HANDLER: Directive = { ok: false, status: 500, body: { code: "NO_HANDLER", message: "no engine handler set" } };
 let handler: (call: EngineCall) => Directive = () => NO_HANDLER;
+let latencyMs = 0;
 
 export function setEngineHandler(h: (call: EngineCall) => Directive): void {
   handler = h;
 }
 
+/**
+ * Delay every response by `ms` on a real timer. The fake otherwise answers within the same
+ * microtask run, so two concurrent requests can never interleave around an engine call, and a
+ * race that only opens while one request is waiting on the network cannot be reproduced.
+ */
+export function setEngineLatency(ms: number): void {
+  latencyMs = ms;
+}
+
 export function resetEngine(): void {
   engineCalls.length = 0;
   handler = () => NO_HANDLER;
+  latencyMs = 0;
 }
 
 // Install the mock onto the global fetch used by TrueEngineClient.
@@ -40,6 +51,7 @@ global.fetch = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
     body: init.body ? JSON.parse(init.body) : undefined,
   };
   engineCalls.push(call);
+  if (latencyMs > 0) await new Promise((resolve) => setTimeout(resolve, latencyMs));
 
   const directive = handler(call);
   if ("throwKind" in directive) {
