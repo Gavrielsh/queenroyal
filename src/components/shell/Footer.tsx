@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 /**
  * Compliance footer — omnipresent via the root layout, on every page of the shell.
  *
@@ -8,7 +10,7 @@
  */
 export function Footer() {
   return (
-    <footer className="border-t border-edge bg-surface-1/60">
+    <footer className="border-t border-edge bg-surface-0/70">
       <div className="mx-auto w-full max-w-6xl space-y-6 px-4 py-10">
         {/* Headline compliance strip */}
         <div className="flex flex-wrap items-center gap-3">
@@ -35,18 +37,21 @@ export function Footer() {
 
         {/* Policy links — 44px tap targets (min-h) without inflating the visual line. */}
         <nav aria-label="Legal" className="flex flex-wrap items-center gap-x-6 text-xs font-semibold">
-          <a href="#" className="inline-flex min-h-11 items-center text-ink-faint transition hover:text-ink">
+          <Link href="/rules" className="inline-flex min-h-11 items-center text-ink-faint transition hover:text-ink">
             Sweepstakes Rules
-          </a>
-          <a href="#" className="inline-flex min-h-11 items-center text-ink-faint transition hover:text-ink">
+          </Link>
+          <Link href="/terms" className="inline-flex min-h-11 items-center text-ink-faint transition hover:text-ink">
             Terms of Service
-          </a>
-          <a href="#" className="inline-flex min-h-11 items-center text-ink-faint transition hover:text-ink">
+          </Link>
+          <Link href="/privacy" className="inline-flex min-h-11 items-center text-ink-faint transition hover:text-ink">
             Privacy Policy
-          </a>
-          <a href="#" className="inline-flex min-h-11 items-center text-ink-faint transition hover:text-ink">
+          </Link>
+          <Link
+            href="/responsible-gaming"
+            className="inline-flex min-h-11 items-center text-ink-faint transition hover:text-ink"
+          >
             Responsible Play
-          </a>
+          </Link>
         </nav>
 
         <p className="text-xs text-ink-faint">© 2026 QueenRoyal. Play responsibly.</p>

@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { CandyIcon, type CandyIconName } from "@/components/art/CandyIcon";
 import { formatBalance } from "@/lib/format";
 import { CURRENCY_LABEL, CURRENCY_TEXT_CLASS, type CurrencyFamily } from "@/lib/theme";
 
@@ -23,6 +24,12 @@ export interface BalanceChipProps {
   stale?: boolean;
 }
 
+const FAMILY_ICON: Readonly<Record<CurrencyFamily, CandyIconName>> = {
+  gc: "coin",
+  scUnplayed: "sc",
+  scRedeemable: "trophy",
+};
+
 export function BalanceChip({ family, value, stale = false }: BalanceChipProps) {
   const [pulsing, setPulsing] = useState(false);
   const previousRef = useRef<string | null>(null);
@@ -43,11 +50,12 @@ export function BalanceChip({ family, value, stale = false }: BalanceChipProps) 
 
   return (
     <div
-      className={`rounded-chip border border-edge bg-surface-2/70 px-2 py-2 text-center transition ${
+      className={`rounded-chip border-2 border-edge bg-surface-0/60 px-2 py-2 text-center transition ${
         stale ? "opacity-60" : ""
       }`}
     >
-      <p className="flex items-center justify-center gap-1.5 text-[9px] uppercase tracking-wider text-ink-faint">
+      <p className="flex items-center justify-center gap-1.5 text-[9px] font-bold uppercase tracking-wider text-ink-faint">
+        <CandyIcon name={FAMILY_ICON[family]} className="h-4 w-4" />
         {label}
         {stale && (
           <span className="rounded-full bg-stale/15 px-1.5 py-px text-[8px] font-black tracking-wider text-stale">
@@ -65,7 +73,7 @@ export function BalanceChip({ family, value, stale = false }: BalanceChipProps) 
       ) : (
         <p
           data-testid="balance-value"
-          className={`truncate text-sm font-bold tabular-nums ${CURRENCY_TEXT_CLASS[family]} ${
+          className={`truncate font-display text-base font-semibold tabular-nums ${CURRENCY_TEXT_CLASS[family]} ${
             pulsing ? "animate-pulse-glow drop-shadow-[0_0_10px_currentColor]" : ""
           }`}
         >

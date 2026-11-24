@@ -4,6 +4,7 @@ import bcrypt from "bcryptjs";
 
 import { getEnv } from "../config/env";
 import { signAccessToken, type AuthClaims } from "../lib/jwt";
+import { ageOn, isEligibleResidence, MIN_REGISTRATION_AGE, TERMS_VERSION } from "../lib/registration-policy";
 import { log } from "../lib/logger";
 import { getPrisma } from "../lib/prisma";
 import type { LoginInput, RegisterInput } from "../schemas/auth.schema";
@@ -74,7 +75,8 @@ type UserRecord = {
   createdAt: Date;
 };
 
-function toSafeUser(u: UserRecord): SafeUser {
+/** Exported for the dev-only mock-login module (src/dev), which mints a real session. */
+export function toSafeUser(u: UserRecord): SafeUser {
   return {
     id: u.id,
     email: u.email,
@@ -84,7 +86,8 @@ function toSafeUser(u: UserRecord): SafeUser {
   };
 }
 
-function claimsFor(user: SafeUser): AuthClaims {
+/** Exported for the dev-only mock-login module (src/dev), which mints a real session. */
+export function claimsFor(user: SafeUser): AuthClaims {
   return { sub: user.id, email: user.email, kycStatus: user.kycStatus, vipLevel: user.vipLevel };
 }
 
@@ -94,7 +97,24 @@ async function issue(user: SafeUser): Promise<AuthResult> {
   return { user, accessToken, refreshToken };
 }
 
-export async function register(input: RegisterInput): Promise<AuthResult> {
+export interface RegisterDeps {
+  now: () => Date;
+}
+
+export async function register(
+  input: RegisterInput,
+  deps: RegisterDeps = { now: () => new Date() },
+): Promise<AuthResult> {
+  // Eligibility before anything is written or hashed: an ineligible sign-up leaves no row.
+  const now = deps.now();
+  const age = ageOn(input.dateOfBirth, now);
+  if (age === null || age < MIN_REGISTRATION_AGE) {
+    throw new AuthError("UNDERAGE", `You must be ${MIN_REGISTRATION_AGE} or older to play`, 403);
+  }
+  if (!isEligibleResidence(input.residenceState, getEnv().BLOCKED_REGIONS)) {
+    throw new AuthError("STATE_NOT_ELIGIBLE", "QueenRoyal is not available in your state", 403);
+  }
+
   const prisma = getPrisma();
   const existing = await prisma.user.findUnique({ where: { email: input.email } });
   if (existing) {
@@ -102,9 +122,25 @@ export async function register(input: RegisterInput): Promise<AuthResult> {
   }
 
   const passwordHash = await bcrypt.hash(input.password, BCRYPT_ROUNDS);
-  const user = await prisma.user.create({
-    data: { email: input.email, passwordHash },
-  });
+  let user;
+  try {
+    user = await prisma.user.create({
+      data: {
+        email: input.email,
+        passwordHash,
+        dateOfBirth: new Date(`${input.dateOfBirth}T00:00:00Z`),
+        residenceState: input.residenceState,
+        termsVersion: TERMS_VERSION,
+        termsAcceptedAt: now,
+      },
+    });
+  } catch (err) {
+    // Two sign-ups for one email can both pass the read above; the unique index decides.
+    if ((err as { code?: unknown }).code === "P2002") {
+      throw new AuthError("EMAIL_TAKEN", "An account with this email already exists", 409);
+    }
+    throw err;
+  }
 
   // Provision the player in the True Engine and persist its player_id. Non-fatal: the account
   // is created and `resolveTransactingPlayer()` will lazily (idempotently) provision on first
@@ -153,48 +189,12 @@ export function mintAccessToken(claims: AuthClaims): string {
 }
 
 // ── Dev-only mock session ──────────────────────────────────────────────────────
-
-/**
- * Fixed identity for the dev mock session. The id is STABLE so the engine player mapping,
- * journal rows, and ledger history accumulate on ONE player across restarts and re-logins.
- */
-const MOCK_USER_ID = "00000000-0000-0000-0000-000000000001";
-const MOCK_USER_EMAIL = "mock-player@queenroyal.dev";
-
-export interface MockLoginResult {
-  user: SafeUser;
-  accessToken: string;
-}
-
-/**
- * DEV-ONLY frictionless login: upsert the fixed mock user and mint a REAL access token with
- * the standard signer — downstream auth (wallet, cashier) sees a token indistinguishable from
- * a credentialed login's, so no verification path is weakened or special-cased.
- *
- * Guarded twice: the route is not registered in production (routes/auth.ts) AND this service
- * throws there, as defense in depth. The user's password hash is bcrypt of a thrown-away
- * random UUID, so the account can never be entered through the credentialed login flow. KYC
- * is VERIFIED so the cashier's purchase gate passes in dev. No refresh session is issued (it
- * would drag in the fail-closed Redis store); the client simply calls this route again when
- * the short-lived access token lapses.
- */
-export async function mockLogin(): Promise<MockLoginResult> {
-  if (getEnv().NODE_ENV === "production") {
-    throw new AuthError("NOT_FOUND", "Route not found", 404);
-  }
-
-  const user = await getPrisma().user.upsert({
-    where: { email: MOCK_USER_EMAIL },
-    create: {
-      id: MOCK_USER_ID,
-      email: MOCK_USER_EMAIL,
-      passwordHash: await bcrypt.hash(randomUUID(), BCRYPT_ROUNDS),
-      kycStatus: "VERIFIED",
-    },
-    // Re-assert VERIFIED so a hand-edited dev row can't strand the mock user behind KYC.
-    update: { kycStatus: "VERIFIED" },
-  });
-
-  const safe = toSafeUser(user);
-  return { user: safe, accessToken: signAccessToken(claimsFor(safe)) };
-}
+//
+// MOVED to src/dev/mock-login.ts (Milestone 0.7). It was the only code path in the gateway
+// that writes `kycStatus: "VERIFIED"`, and it lived here behind a `NODE_ENV !== "production"`
+// check that failed OPEN whenever NODE_ENV was unset (env.ts parses it with
+// `.default("development")`). It is now excluded from the production build outright, so the
+// shipped artifact contains neither the handler nor the VERIFIED write.
+//
+// Nothing in this file may reintroduce a VERIFIED write: scripts/verify-no-dev-routes.mjs
+// fails the build if that literal reaches dist/.

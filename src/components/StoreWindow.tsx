@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { CandyIcon } from "@/components/art/CandyIcon";
 import { ActionNotice, useActionNotice } from "@/components/feedback/ActionNotice";
 import { type DisplayPackage, PackageCard } from "@/components/store/PackageCard";
 import { BalanceChip } from "@/components/wallet/BalanceChip";
@@ -9,6 +10,7 @@ import { WalletStatusBanner } from "@/components/wallet/WalletStatusBanner";
 import { usePurchaseMutation } from "@/hooks/usePurchaseMutation";
 import { useWalletQuery } from "@/hooks/useWalletQuery";
 import { onPeerActivity } from "@/lib/purchaseIntent";
+import { playSound } from "@/lib/sound";
 import { logEvent } from "@/lib/telemetry";
 
 /**
@@ -80,6 +82,7 @@ export function StoreWindow() {
 
         if (outcome.status === "settled") {
           setJustSettledId(pkg.id); // presentation: the card's settle-pop badge
+          playSound("purchase");
           showNotice(
             outcome.walletSynced
               ? { kind: "success", message: `${pkg.name} pack purchased — balances updated from the ledger.` }
@@ -118,13 +121,14 @@ export function StoreWindow() {
   const buyLocked = isPending || peerLockedBy !== null;
 
   return (
-    <div className="relative w-full max-w-md rounded-card border border-sc-unplayed/30 bg-gradient-to-b from-surface-1 via-surface-0 to-black p-6 shadow-glow-sc">
+    <div className="relative w-full max-w-md rounded-card border-2 border-sc-unplayed/35 bg-gradient-to-b from-surface-2 via-surface-1 to-surface-0 p-6 shadow-glow-sc">
       {/* Header */}
-      <div className="mb-6 text-center">
-        <h2 className="bg-gradient-to-r from-sc-unplayed via-teal-200 to-sc-unplayed bg-clip-text text-2xl font-black tracking-widest text-transparent">
+      <div className="mb-6 flex flex-col items-center text-center">
+        <CandyIcon name="stack" className="mb-1 h-12 w-12 drop-shadow-[0_6px_8px_rgba(0,0,0,0.35)]" />
+        <h2 className="font-display text-3xl font-semibold tracking-wide text-sc-unplayed drop-shadow-[0_3px_0_rgba(0,0,0,0.35)]">
           COIN&nbsp;STORE
         </h2>
-        <p className="mt-1 text-[10px] uppercase tracking-[0.3em] text-ink-faint">Gold Coin packages · SC on the house</p>
+        <p className="mt-1 text-[10px] font-bold uppercase tracking-[0.3em] text-ink-faint">Gold Coin packages · SC on the house</p>
       </div>
 
       {/* Live balances — verbatim ledger strings via the shared chip (skeletons while loading). */}

@@ -13,7 +13,7 @@ export interface EngineCall {
   path: string;
   method: string;
   headers: Record<string, string>;
-  body: any;
+  body: unknown;
 }
 
 export const engineCalls: EngineCall[] = [];
@@ -31,8 +31,8 @@ export function resetEngine(): void {
 }
 
 // Install the mock onto the global fetch used by TrueEngineClient.
-global.fetch = (async (input: any, init: any = {}) => {
-  const url = typeof input === "string" ? input : input.url;
+global.fetch = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+  const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
   const call: EngineCall = {
     path: new URL(url).pathname,
     method: init.method ?? "GET",

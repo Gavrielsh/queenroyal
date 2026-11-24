@@ -46,5 +46,9 @@ export default defineConfig({
     url: "http://localhost:3000",
     reuseExistingServer: true,
     timeout: 120_000,
+    // The casino floor's AuthGate falls back to the gateway's dev-only mock login (stubbed in
+    // fixtures/gateway-stubs.ts) only when this is set. Without it, a signed-out visitor is
+    // sent to /login — which the auth journeys in auth.spec.ts exercise directly.
+    env: { NEXT_PUBLIC_DEV_AUTO_LOGIN: "1" },
   },
 });

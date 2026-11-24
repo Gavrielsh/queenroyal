@@ -10,8 +10,11 @@ import { registerMetrics } from "./lib/metrics";
 import { getRedis } from "./lib/redis";
 import { errBody } from "./lib/reply";
 import { adminRoutes } from "./routes/admin";
+import { amoeRoutes } from "./routes/amoe";
+import { dailyBonusRoutes } from "./routes/daily-bonus";
 import { authRoutes } from "./routes/auth";
 import { healthRoutes } from "./routes/health";
+import { kycRoutes } from "./routes/kyc";
 import { spinRoutes } from "./routes/spin";
 import { storeRoutes } from "./routes/store";
 import { walletRoutes } from "./routes/wallet";
@@ -116,11 +119,20 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(webhookRoutes);
   await app.register(authRoutes);
   await app.register(storeRoutes);
+  // NO PURCHASE NECESSARY. Registered alongside the cashier because the free route and the
+  // paid one are two ways to obtain the same currency, and they should be read together.
+  await app.register(amoeRoutes);
+  // The Daily Wheel: a discretionary BONUS grant, one server-drawn spin per gaming day.
+  await app.register(dailyBonusRoutes);
   // Server-authoritative player spin. Must stay registered alongside (not inside) the webhook
   // plugin: webhookRoutes swaps in a raw-body parser for HMAC verification, and this route
   // needs Fastify's normal JSON parsing.
   await app.register(spinRoutes);
   await app.register(walletRoutes);
+  // Identity verification. Registered alongside the player-facing routes and NOT inside the
+  // webhook plugin: that plugin swaps in a raw-body parser for signature verification, and the
+  // upload route needs Fastify's normal JSON parsing.
+  await app.register(kycRoutes);
   await app.register(adminRoutes);
 
   return app;

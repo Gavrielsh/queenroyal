@@ -6,15 +6,14 @@
  * error normalization so feature code never touches raw `fetch`.
  */
 
+import { clearAccessToken, readAccessToken, tokenIsLive, writeAccessToken } from "@/lib/auth/token";
 import { type AttemptToken, peekAttemptToken } from "@/lib/purchaseIntent";
+import { type RedemptionAttemptToken } from "@/lib/redemptionIntent";
 import { type SpinAttemptToken } from "@/lib/spinIntent";
 
 const GATEWAY_BASE_URL = (
   process.env.NEXT_PUBLIC_GATEWAY_URL ?? "http://localhost:4000/api"
 ).replace(/\/+$/, "");
-
-/** localStorage key + cookie name under which the gateway session token lives. */
-const ACCESS_TOKEN_KEY = "qr_access_token";
 
 /** Normalized failure raised for any non-2xx gateway response. */
 export class ApiError extends Error {
@@ -79,17 +78,9 @@ export interface RequestOptions {
   signal?: AbortSignal;
 }
 
-function readAccessToken(): string | null {
-  // Guard for SSR/prerender — the token only exists in the browser.
-  if (typeof window === "undefined") return null;
-
-  const fromStorage = window.localStorage.getItem(ACCESS_TOKEN_KEY);
-  if (fromStorage) return fromStorage;
-
-  const cookie = document.cookie
-    .split("; ")
-    .find((c) => c.startsWith(`${ACCESS_TOKEN_KEY}=`));
-  return cookie ? decodeURIComponent(cookie.slice(ACCESS_TOKEN_KEY.length + 1)) : null;
+/** Auth routes carry the HttpOnly refresh cookie; every other route authenticates by bearer. */
+function isAuthPath(path: string): boolean {
+  return path.startsWith("/auth/");
 }
 
 async function request<TResponse>(
@@ -97,6 +88,7 @@ async function request<TResponse>(
   path: string,
   body?: unknown,
   opts?: RequestOptions,
+  retried = false,
 ): Promise<TResponse> {
   const headers = new Headers({ Accept: "application/json" });
   if (body !== undefined) headers.set("Content-Type", "application/json");
@@ -110,8 +102,9 @@ async function request<TResponse>(
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
-      // The gateway authenticates via the bearer header; cookies stay out of it.
-      credentials: "omit",
+      // Only /auth/* needs the refresh cookie (it is path-scoped there by the gateway anyway);
+      // everything else authenticates via the bearer header and keeps cookies out of it.
+      credentials: isAuthPath(path) ? "include" : "omit",
       signal: opts?.signal,
     });
   } catch (cause) {
@@ -121,6 +114,14 @@ async function request<TResponse>(
       throw new ApiError(0, "ABORTED", "Request aborted", { cause });
     }
     throw new ApiError(0, "NETWORK_ERROR", "Could not reach the gateway", { cause });
+  }
+
+  // An expired or revoked token: rotate it once through the refresh cookie and replay the SAME
+  // request. Replaying is safe because every money route is idempotent on the key in its body
+  // (G3), and the body is re-sent byte-for-byte. Only a request that CARRIED a token is
+  // retried — with no token there is no session to refresh, and the caller decides.
+  if (response.status === 401 && token && !retried && !isAuthPath(path)) {
+    if (await refreshAccessToken()) return request<TResponse>(method, path, body, opts, true);
   }
 
   if (!response.ok) {
@@ -162,30 +163,40 @@ export const apiClient = {
     request<TResponse>("DELETE", path, undefined, opts),
 } as const;
 
-// ── Dev-only session bootstrap ───────────────────────────────────────────────
-
-/**
- * Check the access token's `exp` with a plain base64url decode — NO signature verification
- * (the gateway is the only verifier; this is purely a UX freshness probe so we know when to
- * re-login). 30s of slack treats a token about to lapse mid-flow as already dead.
- */
-function tokenIsLive(token: string): boolean {
-  const payload = token.split(".")[1];
-  if (!payload) return false;
-  try {
-    const decoded = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/"))) as {
-      exp?: number;
-    };
-    return typeof decoded.exp === "number" && decoded.exp * 1000 > Date.now() + 30_000;
-  } catch {
-    return false;
-  }
-}
+// ── Session ──────────────────────────────────────────────────────────────────
 
 /** True when a non-expired gateway access token is present in the browser. */
 export function hasLiveSession(): boolean {
   const token = readAccessToken();
   return token !== null && tokenIsLive(token);
+}
+
+let refreshInFlight: Promise<boolean> | null = null;
+
+/**
+ * Exchange the HttpOnly refresh cookie for a new access token (the gateway rotates the cookie
+ * too). Single-flight: concurrent 401s share ONE refresh, because the refresh token is
+ * single-use and a second rotation with the same cookie would be refused and sign the player
+ * out. Resolves false — never throws — when there is no session to refresh.
+ */
+export function refreshAccessToken(): Promise<boolean> {
+  refreshInFlight ??= (async () => {
+    try {
+      const res = await apiClient.post<unknown>("/auth/refresh", {});
+      const token = (res as { data?: { accessToken?: unknown } } | undefined)?.data?.accessToken;
+      if (typeof token !== "string" || token === "") return false;
+      writeAccessToken(token);
+      return true;
+    } catch (err) {
+      // The gateway refused the cookie: the session is over, so drop the dead access token and
+      // let the UI show signed-out. A network fault proves nothing — keep the token.
+      if (err instanceof ApiError && err.status === 401) clearAccessToken();
+      return false;
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+  return refreshInFlight;
 }
 
 interface MockLoginEnvelope {
@@ -200,11 +211,11 @@ interface MockLoginEnvelope {
  * DEV-ONLY: obtain a session from the gateway's mock-login route and store the access token
  * where every other request reads it. The route does not exist in production builds of the
  * gateway (404), so this can never become a production login path. Throws ApiError on
- * failure — the caller (DevAutoLogin) owns the degraded-UX decision.
+ * failure — the caller (AuthGate) owns the degraded-UX decision.
  */
 export async function mockDevLogin(): Promise<void> {
   const res = await apiClient.post<MockLoginEnvelope>("/auth/mock-login", {});
-  window.localStorage.setItem(ACCESS_TOKEN_KEY, res.data.accessToken);
+  writeAccessToken(res.data.accessToken);
 }
 
 // ── Wallet mirror ────────────────────────────────────────────────────────────
@@ -592,4 +603,177 @@ export async function submitSpin(request: SpinRequestDto): Promise<SpinResultDto
     gameId: request.gameId,
   });
   return parseSpinEnvelope(payload);
+}
+
+// ── Cashier (redemption) ──────────────────────────────────────────────────────
+
+/** Every value `RedemptionStatus` can hold (apps/financial-gateway/prisma/schema.prisma). */
+export const REDEMPTION_STATUSES = [
+  "REQUESTED",
+  "UNDER_REVIEW",
+  "APPROVED",
+  "PROCESSING",
+  "PAID",
+  "REJECTED",
+  "CANCELLED_BY_PLAYER",
+] as const;
+export type RedemptionStatus = (typeof REDEMPTION_STATUSES)[number];
+
+function isRedemptionStatus(value: unknown): value is RedemptionStatus {
+  return typeof value === "string" && (REDEMPTION_STATUSES as readonly string[]).includes(value);
+}
+
+/** One row of the player's own redemption history (redemption-history.service.ts). */
+export interface RedemptionHistoryEntryDto {
+  id: string;
+  /** Verbatim engine decimal string — rendered, never arithmetic. */
+  amount: string;
+  status: RedemptionStatus;
+  createdAt: string;
+  statusChangedAt: string;
+}
+
+/**
+ * The policy the /redeem screen renders around. A closed jurisdiction carries no cap figures —
+ * there is nothing to display a minimum or a cap against.
+ */
+export type RedemptionPolicyDto =
+  | {
+      jurisdictionPermitted: true;
+      minimumAmount: string;
+      maximumPerRequest: string;
+      dailyCap: string;
+      monthlyCap: string;
+      remainingToday: string;
+      remainingThisMonth: string;
+    }
+  | { jurisdictionPermitted: false };
+
+export interface RedemptionOverviewDto {
+  /** From the `users` row, fetched fresh on every call — never the (potentially stale) JWT. */
+  kycStatus: string;
+  /** Newest first, capped server-side at 50. */
+  requests: RedemptionHistoryEntryDto[];
+  policy: RedemptionPolicyDto;
+}
+
+function parseRedemptionPolicy(policy: unknown, malformed: (field: string) => ApiError): RedemptionPolicyDto {
+  if (typeof policy !== "object" || policy === null) throw malformed("data.policy");
+  const record = policy as Record<string, unknown>;
+
+  if (record.jurisdictionPermitted === false) return { jurisdictionPermitted: false };
+  if (record.jurisdictionPermitted !== true) throw malformed("data.policy.jurisdictionPermitted");
+
+  const minimumAmount = record.minimumAmount;
+  if (!isMoneyString(minimumAmount)) throw malformed("data.policy.minimumAmount");
+  const maximumPerRequest = record.maximumPerRequest;
+  if (!isMoneyString(maximumPerRequest)) throw malformed("data.policy.maximumPerRequest");
+  const dailyCap = record.dailyCap;
+  if (!isMoneyString(dailyCap)) throw malformed("data.policy.dailyCap");
+  const monthlyCap = record.monthlyCap;
+  if (!isMoneyString(monthlyCap)) throw malformed("data.policy.monthlyCap");
+  const remainingToday = record.remainingToday;
+  if (!isMoneyString(remainingToday)) throw malformed("data.policy.remainingToday");
+  const remainingThisMonth = record.remainingThisMonth;
+  if (!isMoneyString(remainingThisMonth)) throw malformed("data.policy.remainingThisMonth");
+
+  return {
+    jurisdictionPermitted: true,
+    minimumAmount,
+    maximumPerRequest,
+    dailyCap,
+    monthlyCap,
+    remainingToday,
+    remainingThisMonth,
+  };
+}
+
+/**
+ * Validate the `GET /api/store/redemptions` envelope — BEFORE any value can reach React
+ * state. A payload that fails shape or money-format validation becomes an `ApiError` with
+ * code "MALFORMED_REDEMPTION_OVERVIEW". Same rule as every other gate in this file: failure
+ * messages name the offending FIELD but never echo its value.
+ */
+export function parseRedemptionOverview(payload: unknown): RedemptionOverviewDto {
+  const malformed = (field: string): ApiError =>
+    new ApiError(0, "MALFORMED_REDEMPTION_OVERVIEW", `Redemption overview failed validation at ${field}`);
+
+  if (typeof payload !== "object" || payload === null) throw malformed("(root)");
+  const envelope = payload as Record<string, unknown>;
+  if (envelope.success !== true) throw malformed("success");
+
+  const data = envelope.data;
+  if (typeof data !== "object" || data === null) throw malformed("data");
+  const record = data as Record<string, unknown>;
+
+  const kycStatus = record.kycStatus;
+  if (typeof kycStatus !== "string" || kycStatus.length === 0) throw malformed("data.kycStatus");
+
+  const requestsRaw = record.requests;
+  if (!Array.isArray(requestsRaw)) throw malformed("data.requests");
+  const requests: RedemptionHistoryEntryDto[] = requestsRaw.map((row, index) => {
+    if (typeof row !== "object" || row === null) throw malformed(`data.requests[${index}]`);
+    const r = row as Record<string, unknown>;
+    if (!isNonEmptyString(r.id)) throw malformed(`data.requests[${index}].id`);
+    if (!isMoneyString(r.amount)) throw malformed(`data.requests[${index}].amount`);
+    if (!isRedemptionStatus(r.status)) throw malformed(`data.requests[${index}].status`);
+    if (!isNonEmptyString(r.createdAt)) throw malformed(`data.requests[${index}].createdAt`);
+    if (!isNonEmptyString(r.statusChangedAt)) throw malformed(`data.requests[${index}].statusChangedAt`);
+    return { id: r.id, amount: r.amount, status: r.status, createdAt: r.createdAt, statusChangedAt: r.statusChangedAt };
+  });
+
+  return { kycStatus, requests, policy: parseRedemptionPolicy(record.policy, malformed) };
+}
+
+/**
+ * Fetch the player's own redemption history + the policy the /redeem screen renders around.
+ * Read-only: no idempotency token involved, and — like the wallet read — this NEVER writes to
+ * the shared wallet cache (G1). Pass React Query's `signal` so a superseded read cancels.
+ */
+export async function fetchRedemptionOverview(opts?: RequestOptions): Promise<RedemptionOverviewDto> {
+  const payload = await apiClient.get<unknown>("/store/redemptions", opts);
+  return parseRedemptionOverview(payload);
+}
+
+/** Gateway envelope for POST /api/store/redeem (redemption.service.ts `RedemptionAccepted`). */
+interface RedemptionAcceptedEnvelope {
+  success: true;
+  data: {
+    status: "UNDER_REVIEW";
+    redemptionId: string;
+    operatorTransactionId: string;
+    ledgerTransactionId: string;
+    amount: string;
+  };
+}
+
+export interface RedemptionAcceptedDto {
+  redemptionId: string;
+  amount: string;
+}
+
+/** What the browser is allowed to say about a redemption request. */
+export interface RedemptionRequestDto {
+  /** A validated, positive decimal string. Never a number — see guardrail G2. */
+  amount: string;
+  /** The RETAINED attempt token (the gateway's idempotency anchor for `redeem:<token>`). */
+  attemptToken: RedemptionAttemptToken;
+}
+
+/**
+ * Request a prize payout. The debit — if the engine accepts it — commits synchronously in
+ * this same request (unlike a purchase credit, which is webhook-driven and eventually
+ * consistent); the caller invalidates the wallet cache right after this resolves, not on a
+ * later reconcile loop.
+ *
+ * The attempt token is compile-enforced as a branded `RedemptionAttemptToken`, so only a value
+ * that went through the `redemptionIntent` retain/rotate lifecycle can anchor a request — a
+ * raw string is a type error.
+ */
+export async function submitRedemption(request: RedemptionRequestDto): Promise<RedemptionAcceptedDto> {
+  const res = await apiClient.post<RedemptionAcceptedEnvelope>("/store/redeem", {
+    idempotencyKey: request.attemptToken,
+    amount: request.amount,
+  });
+  return { redemptionId: res.data.redemptionId, amount: res.data.amount };
 }

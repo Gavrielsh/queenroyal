@@ -149,8 +149,13 @@ services:
   #    schema straight to Postgres (:5432, session mode) — NEVER the transaction pooler.
   #    Decoupling migrations from the API container prevents races when API replicas restart
   #    concurrently (no two of them mutate the schema on boot). Reuses the gateway image, built
-  #    once below. No-history repo (prisma/MIGRATIONS.md) → `db push`; production with committed
-  #    history swaps this command for `prisma migrate deploy`.
+  #    once below. Applies COMMITTED migrations with `prisma migrate deploy`.
+  #
+  #    This previously ran `prisma db push --accept-data-loss` (Milestone 0.4). That writes no
+  #    migration file and records nothing, so environments drift apart with no artifact saying
+  #    what changed — and `--accept-data-loss` authorised it to DROP whatever the schema did not
+  #    describe, against a database shared with the legacy app. `migrate deploy` applies only
+  #    reviewed, committed migrations, and fails instead of destroying anything.
   db-migrate:
     image: queenroyal-zone2/financial-gateway:staging
     depends_on:
@@ -159,7 +164,7 @@ services:
     environment:
       DATABASE_URL: "postgresql://queenroyal:queenroyal_dev_pw@postgres-db:5432/queenroyal?schema=public"
       DIRECT_DATABASE_URL: "postgresql://queenroyal:queenroyal_dev_pw@postgres-db:5432/queenroyal?schema=public"
-    command: ["npx", "prisma", "db", "push", "--skip-generate", "--accept-data-loss"]
+    command: ["npx", "prisma", "migrate", "deploy"]
     restart: "no"
     networks: [zone2]
 

@@ -250,6 +250,29 @@ async function dispatch(
       return reconcileWin(row, parsed.data, attempts, maxAttempts);
     case "DEPOSIT":
       return reconcileDeposit(row, parsed.data, attempts, maxAttempts, rowLog);
+    case "REDEEM":
+      // A crashed redemption debit is a plain idempotent replay, exactly like BET: the
+      // engine de-duplicates on operator_transaction_id, so this either commits the single
+      // debit or returns the receipt of the one that already committed.
+      //
+      // Before this case existed the row fell through to "unhandled type" and was ABANDONED
+      // — which left the redemption with no ledger id while the debit may well have landed
+      // at the engine, the exact ambiguity the journal exists to prevent. Note what is NOT
+      // being retried: the payout. This call moves SC inside the ledger; funds leave the
+      // building only under the redemption's own PROCESSING → PAID transition.
+      return finalizeReplay(row, await trueEngine().sendRedeem(parsed.data), attempts, maxAttempts);
+    case "PROMO_GRANT":
+      // A crashed AMOE claim is a plain idempotent replay, like BET and REDEEM: the engine
+      // de-duplicates on operator_transaction_id, so this either commits the single credit or
+      // returns the receipt of the one that already committed.
+      //
+      // REPLAYING THIS DOES NOT RE-CONSUME A PERIOD, and it is worth being exact about why.
+      // The frequency cap is the `(userId, grantPeriod)` unique index on amoe_grants, and that
+      // row was written BEFORE the intent was journaled — so by the time a payload can be
+      // replayed from here, the period is already spent and this call cannot spend it again.
+      // The replay resolves whether the player got the coins that period bought them; it can
+      // never issue a second grant.
+      return finalizeReplay(row, await trueEngine().sendPromoGrant(parsed.data), attempts, maxAttempts);
   }
 }
 
@@ -436,7 +459,14 @@ async function compensateWin(row: EngineRequestLog, attempts: number, maxAttempt
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function isReplayableType(type: EngineRequestLog["type"]): type is ReplayableEngineRequestType {
-  return type === "BET" || type === "WIN" || type === "DEPOSIT" || type === "ROLLBACK";
+  return (
+    type === "BET" ||
+    type === "WIN" ||
+    type === "DEPOSIT" ||
+    type === "ROLLBACK" ||
+    type === "REDEEM" ||
+    type === "PROMO_GRANT"
+  );
 }
 
 function errText(res: Extract<TrueEngineResult<EngineTxResult>, { ok: false }>): string {

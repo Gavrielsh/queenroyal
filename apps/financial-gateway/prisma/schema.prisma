@@ -8,8 +8,10 @@
 //   is the single source of truth for money.
 //
 //   Same physical tables as the legacy Next.js app during the migration (identical
-//   @@map names and columns). This schema introduces NO structural change, so both
-//   Prisma clients can read the shared database until the legacy DB layer is retired.
+//   @@map names and columns), so both Prisma clients can read the shared database until
+//   the legacy DB layer is retired. `redemption_requests` is the first table this schema
+//   ADDS: it is gateway-owned and adds no column to any legacy table, so the legacy client
+//   keeps working without knowing it exists.
 // ─────────────────────────────────────────────────────────────────────────────
 
 generator client {
@@ -17,12 +19,12 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider  = "postgresql"
   // RUNTIME (pooled) connection — points at PgBouncer in TRANSACTION pool mode. This URL MUST
   // carry `?pgbouncer=true` so Prisma disables server-side prepared statements, which
   // transaction-pooled backends cannot share (see src/lib/prisma.ts). e.g.
   //   postgresql://user:pass@pgbouncer:6432/queenroyal?pgbouncer=true&connection_limit=1
-  url = env("DATABASE_URL")
+  url       = env("DATABASE_URL")
   // MIGRATIONS (direct, session-mode) — `prisma migrate`/`db push` connect STRAIGHT to Postgres
   // on :5432, never the transaction pooler (which cannot run DDL / advisory locks). Unused at
   // runtime by the app itself.
@@ -43,8 +45,28 @@ model User {
   // addresses the player by THIS id, never by our local `id`.
   trueEnginePlayerId String? @unique
 
+  // Declared at registration (lib/registration-policy.ts), proven later by KYC. Nullable only
+  // for accounts that predate the sign-up form; every new registration writes all four.
+  dateOfBirth     DateTime? @db.Date
+  /// USPS state code of declared residence ("NJ").
+  residenceState  String?   @db.VarChar(2)
+  /// TERMS_VERSION the player accepted, and when.
+  termsVersion    String?
+  termsAcceptedAt DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  // Back-relation only — adds NO column to `users`. See RedemptionRequest.
+  redemptions RedemptionRequest[]
+
+  // Back-relation only — adds NO column to `users`. See AmoeGrant.
+  amoeGrants AmoeGrant[]
+  dailyBonusClaims DailyBonusClaim[]
+
+  // Back-relation only — adds NO column to `users`. See KycVerification.
+  kycVerifications KycVerification[]
+  kycDocuments     KycDocument[]
 
   // 🚫 FORBIDDEN by architecture: gc_balance, sc_balance, deposits, withdrawals.
 
@@ -87,6 +109,8 @@ enum EngineRequestType {
   DEPOSIT
   ROLLBACK
   PLAYER_CREATE
+  REDEEM // SC_REDEEMABLE debit at POST /api/v1/store/redeem — the money-OUT intent
+  PROMO_GRANT // no-purchase coin issuance at POST /api/v1/store/promo-grant — the AMOE route
 }
 
 enum EngineRequestStatus {
@@ -109,4 +133,501 @@ model StorePackage {
   updatedAt     DateTime @updatedAt
 
   @@map("store_packages")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MONEY OUT — redemption lifecycle
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One player-initiated request to convert SC_REDEEMABLE into a real-world prize payout.
+///
+/// STATE ORCHESTRATION ONLY. This row is a state machine and an audit record; it is NOT
+/// an account. It never holds, derives, or reconciles a balance:
+///
+///   - Whether the player CAN redeem is answered by the engine (sufficient SC_REDEEMABLE,
+///     playthrough discharged, status not blocked) — never by reading anything here.
+///   - The money itself moves exactly once, in Zone 1, as the ledger transaction named by
+///     `ledgerTransactionId`. Summing `amount` over these rows does NOT yield a balance and
+///     must never be used as one: rows in REQUESTED/REJECTED/CANCELLED_BY_PLAYER moved no
+///     money at all, and the ledger is the only place the truth lives.
+///
+/// WHY STORING `amount` HERE IS NOT FINANCIAL STATE: it is the PARAMETER of an intent, in the
+/// same sense as `EngineRequestLog.requestPayload` — a verbatim copy of what was asked for, so
+/// the request can be reviewed, replayed and audited. It is written once at REQUESTED and
+/// never recomputed. A balance is a running total the system maintains; this is a frozen
+/// argument the system remembers.
+///
+/// LIFECYCLE (the only legal moves — enforced in the service layer, see redemption-policy):
+///
+///   REQUESTED ──▶ UNDER_REVIEW ──▶ APPROVED ──▶ PROCESSING ──▶ PAID
+///        │              │              │             │
+///        │              ▼              ▼             ▼
+///        │           REJECTED       REJECTED      REJECTED
+///        ▼
+///   CANCELLED_BY_PLAYER
+///
+/// PAID, REJECTED and CANCELLED_BY_PLAYER are terminal. A player may withdraw their own
+/// request only while it is still REQUESTED — once review has begun, the decision is the
+/// operator's to record, because a player-side cancel after an AML hold would let a flagged
+/// request disappear from the queue.
+model RedemptionRequest {
+  id String @id @default(uuid())
+
+  /// Local identity (User.id). The FK is what makes a redemption un-orphanable.
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// The True Engine's player UUID (User.trueEnginePlayerId) — the id the ledger row is
+  /// written against. Copied at request time and NOT null: a player the engine has never
+  /// heard of cannot redeem, and resolving it later would make the row ambiguous if the
+  /// identity bridge were ever re-pointed.
+  playerId String
+
+  status RedemptionStatus @default(REQUESTED)
+
+  /// Amount of SC_REDEEMABLE requested, as a decimal **string** in whole-coin units with at
+  /// most 4 dp — the engine's NUMERIC(18,4) wire format.
+  ///
+  /// A STRING, NOT A NUMERIC COLUMN, AND NOT A FLOAT. Prisma maps `Decimal` to
+  /// decimal.js and `Float` to an IEEE-754 double; both invite arithmetic in Zone 2, and
+  /// arithmetic on money in Zone 2 is precisely what the architecture forbids. Keeping the
+  /// column TEXT means the value can only be forwarded verbatim or compared as a string —
+  /// there is no in-language way to quietly add two of them up.
+  ///
+  /// Shape is validated at the perimeter by `positiveMoneyString` (src/lib/money.ts) before
+  /// it is ever written, which is also what bounds it to the ledger's capacity.
+  amount String
+
+  /// Deterministic idempotency anchor for the engine debit, derived from `id` and stable
+  /// across every retry. UNIQUE, so a replayed submit collapses onto the same engine call
+  /// rather than opening a second one.
+  ///
+  /// Linked to `engine_request_log.operatorTransactionId` BY VALUE and deliberately not by
+  /// FK: the journal row is written at call time (B2), while this row exists from the moment
+  /// the player asks. An FK would force the two into one transaction and invert that order.
+  operatorTransactionId String @unique
+
+  /// The Zone 1 `ledger_transaction_id` for the SC_REDEEMABLE debit, assigned by the engine
+  /// and null until it has committed. UNIQUE: one ledger transaction can back at most one
+  /// redemption, which is the constraint that makes double-paying a single debit impossible
+  /// to represent. This column is the ONLY link between a redemption and the money — nothing
+  /// here duplicates the ledger's mechanics.
+  ledgerTransactionId String? @unique
+
+  /// When `status` last moved. Kept alongside `updatedAt` on purpose: `updatedAt` also moves
+  /// for a note edit or a provider-ref backfill, so it cannot answer "how long has this been
+  /// sitting in review?" — the question the payout SLA is measured on.
+  statusChangedAt DateTime @default(now())
+
+  /// Review decision (compliance data Zone 2 legitimately owns). `reviewedBy` is the
+  /// operator subject that approved or rejected; `decisionReason` is the free-text rationale,
+  /// which for a REJECTED request is the record the regulator asks for.
+  reviewedBy     String?
+  reviewedAt     DateTime?
+  decisionReason String?
+
+  /// Payout provider's own reference for the outbound transfer, set when the request enters
+  /// PROCESSING. Not money: a correlation id for the rail.
+  payoutProviderRef String?
+  paidAt            DateTime?
+
+  cancelledAt DateTime?
+
+  /// The Zone 1 ledger transaction that gave the SC back, when a redemption was refused after
+  /// its debit committed. Null means no refund has been made — which for a REJECTED row, or one
+  /// stuck at PROCESSING after a terminal payout failure, means the player is still out of
+  /// pocket. UNIQUE for the same reason ledgerTransactionId is: one ledger transaction can back
+  /// at most one refund, so double-crediting is not representable.
+  refundLedgerTransactionId String?   @unique
+  refundedAt                DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // 🚫 FORBIDDEN, exactly as in User: any balance, running total, or "available to redeem"
+  // figure. Ask the engine.
+
+  /// The review queue: unfinished work, oldest first.
+  @@index([status, createdAt])
+  /// A player's own redemption history, and the lookup a duplicate-request guard needs.
+  @@index([userId, createdAt])
+  @@map("redemption_requests")
+}
+
+/// The redemption lifecycle. Ordered as the happy path runs, so the enum reads as the
+/// pipeline it describes.
+enum RedemptionStatus {
+  REQUESTED // player submitted; no money has moved
+  UNDER_REVIEW // held for KYC/AML review
+  APPROVED // cleared for payout; SC debit committed at the engine
+  PROCESSING // handed to the payout provider
+  PAID // funds left the building — terminal
+  REJECTED // refused by review — terminal
+  CANCELLED_BY_PLAYER // withdrawn by the player while still REQUESTED — terminal
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NO PURCHASE NECESSARY — the Alternative Method of Entry
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One free-entry claim: the record that a player asked for, and received, Sweeps Coins
+/// without paying for them.
+///
+/// WHY THIS TABLE IS THE FRAUD CONTROL
+///
+/// The Zone 1 endpoint it dispatches to is deliberately UNBOUNDED — the ledger will issue
+/// whatever an authenticated operator asks it to, because the ledger's job is to record
+/// movements correctly, not to decide who deserves one. That makes frequency capping
+/// entirely Zone 2's responsibility, and this row is where it lives. The
+/// `@@unique([userId, grantPeriod])` below is not an optimisation or a convenience: it is
+/// THE mechanism that makes "one grant per person per period" true, enforced by Postgres
+/// rather than by a read-then-write in application code that two concurrent requests would
+/// both pass.
+///
+/// STATE ORCHESTRATION ONLY — the same posture as RedemptionRequest. This row is an audit
+/// record and a uniqueness anchor. It is NOT an account, it never holds a balance, and
+/// summing `scAmount` over it does not produce one: rows in REQUESTED and FAILED moved no
+/// coins, and the ledger is the only place the truth lives.
+model AmoeGrant {
+  id String @id @default(uuid())
+
+  /// Local identity (User.id). The FK is what makes a grant un-orphanable, and half of the
+  /// uniqueness that caps the frequency.
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// The True Engine's player UUID, copied at claim time for the same reason
+  /// RedemptionRequest.playerId is: a player the engine has never heard of cannot be granted
+  /// anything, and resolving it later would make the row ambiguous if the identity bridge
+  /// were re-pointed.
+  playerId              String
+  /// The canonical period key this claim consumes — e.g. `DAY:2026-09-18`, `WEEK:2026-W38`,
+  /// `MONTH:2026-09`. Derived by `amoePeriodKey` (src/lib/amoe-policy.ts) from the claim
+  /// instant in UTC.
+  ///
+  /// A STRING, AND CARRYING ITS OWN GRANULARITY PREFIX. The prefix is what stops a change to
+  /// the configured period silently colliding with keys written under the old one: `DAY:…`
+  /// and `MONTH:…` can never be mistaken for each other. The cost is that switching the
+  /// granularity lets a player who already claimed in the old period claim once more in the
+  /// new one — which is a policy change taking effect, not a bug, and is stated here so it is
+  /// a decision rather than a surprise.
+  ///
+  /// UTC, always. A period boundary that moved with the player's timezone would hand an extra
+  /// claim to anyone willing to change it.
+  grantPeriod           String
+  status                AmoeGrantStatus @default(REQUESTED)
+  /// Sweeps Coins issued, as a decimal **string** in whole-coin units with at most 4 dp — the
+  /// engine's NUMERIC(18,4) wire format.
+  ///
+  /// A STRING, NOT A NUMERIC COLUMN AND NOT A FLOAT, for exactly the reasons set out on
+  /// RedemptionRequest.amount: Prisma maps `Decimal` to decimal.js and `Float` to an IEEE-754
+  /// double, and both invite arithmetic on money inside Zone 2. TEXT means the value can only
+  /// be forwarded verbatim.
+  ///
+  /// It is an INTENT PARAMETER, not a balance: written once from the configured grant and
+  /// never recomputed. It is kept because the equal-dignity question — did the free entrant
+  /// receive what a purchaser receives — is one an auditor asks of Zone 2's records, and a
+  /// column answers it in one query.
+  scAmount              String
+  /// Gold Coins issued alongside, same contract. "0.0000" when the grant is SC-only, which is
+  /// the ordinary AMOE shape.
+  gcAmount              String
+  /// Deterministic idempotency anchor for the engine credit, derived from `id` and stable
+  /// across every retry. UNIQUE, so a replayed claim collapses onto the same engine call
+  /// rather than opening a second one. Linked to `engine_request_log.operatorTransactionId`
+  /// BY VALUE, not by FK — see the note on RedemptionRequest.operatorTransactionId.
+  operatorTransactionId String          @unique
+  /// The Zone 1 `ledger_transaction_id` for the PROMO_CREDIT, assigned by the engine and null
+  /// until it has committed. UNIQUE: one ledger transaction can back at most one grant, which
+  /// is what makes double-crediting a single claim impossible to represent.
+  ledgerTransactionId   String?         @unique
+
+  /// The operator's reference for the entry this grant answers, forwarded to Zone 1 as
+  /// `channel_reference` and REQUIRED there for the AMOE channel. Derived from this row's id,
+  /// so every claim is traceable from the ledger back to the account that made it.
+  channelReference String
+
+  /// The client-supplied attempt token for this claim.
+  ///
+  /// It answers a question the period cap cannot: a client that submitted a claim and never
+  /// saw the response deserves its ORIGINAL outcome on retry, not a "you already claimed"
+  /// it has no way to distinguish from genuine abuse. Looked up before anything else, so a
+  /// repeat with the same token replays the first answer.
+  ///
+  /// Unique PER USER rather than globally: the token is generated by the client and two
+  /// accounts picking the same string is a collision between strangers, which must not let
+  /// one of them read the other's outcome or block their claim.
+  claimAttemptKey String
+
+  /// Fraud-relevant request context, captured at claim time. NOT identity and NOT financial:
+  /// the coarse signals an investigator needs to spot one person driving many accounts.
+  /// `claimIp` is retained under the same retention sweep as the rest of the journal.
+  ///
+  /// `claimJurisdiction` holds an ISO country-region as the fence resolved it ("US-NJ"), not a
+  /// country — named for what it stores, because a column called `claimCountry` holding
+  /// "US-NJ" is the kind of small lie that a later query quietly believes.
+  claimIp           String?
+  claimJurisdiction String?
+
+  /// Why a claim was refused, when it was. The record a support agent reads back to a player
+  /// who says the free route did not work for them — which, for a statutorily-required entry
+  /// method, is a question the operator must be able to answer.
+  failureReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // 🚫 FORBIDDEN, exactly as in User and RedemptionRequest: any balance, running total, or
+  // "coins granted to date" figure. Ask the engine.
+
+  /// THE FREQUENCY CAP. One grant per person per period, enforced by the database.
+  ///
+  /// At the database level deliberately, and not in the service: two concurrent claims would
+  /// both pass a read-then-write check in application code, and a race that yields a second
+  /// free grant is precisely the abuse this route invites. The service catches the resulting
+  /// P2002 and reports it as a clean refusal.
+  ///
+  /// The row is inserted BEFORE the engine call and kept even when that call fails, so a
+  /// failed dispatch still consumes the period. That is the conservative direction: a player
+  /// whose claim failed can be re-granted by an operator, whereas a period released on failure
+  /// is an unbounded retry loop against an unbounded ledger endpoint.
+  @@unique([userId, grantPeriod])
+  /// The attempt replay lookup — see claimAttemptKey.
+  @@unique([userId, claimAttemptKey])
+  /// A player's own claim history, and the support lookup.
+  @@index([userId, createdAt])
+  /// The fraud review: claims from one address across accounts, newest first.
+  @@index([claimIp, createdAt])
+  /// Unfinished work, for the operational sweep over grants that never reached the ledger.
+  @@index([status, createdAt])
+  @@map("amoe_grants")
+}
+
+/// The AMOE claim lifecycle. Short by design: unlike a redemption there is no review and no
+/// external rail — the coins are issued synchronously or they are not.
+/// One Daily Wheel spin — a discretionary marketing grant (engine channel BONUS), never the
+/// statutory free entry (that is AmoeGrant). Same shape and the same order of operations as
+/// AmoeGrant, for the same reason: the Zone 1 promo-grant endpoint applies no cap of its own.
+///
+/// THE CAP IS `@@unique([userId, gamingDate])`: one spin per player per gaming day. The row is
+/// taken BEFORE the engine is called, so two concurrent claims cannot both be granted.
+///
+/// NOT FINANCIAL STATE. `gcAmount` / `scAmount` are TEXT intent parameters — the slice the
+/// server drew, forwarded verbatim — and never a balance. REQUESTED and FAILED rows moved no
+/// coins; the ledger in Zone 1 is the only place the truth lives.
+model DailyBonusClaim {
+  id String @id @default(uuid())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// The True Engine player UUID, copied at claim time (see AmoeGrant.playerId).
+  playerId String
+
+  /// The gaming day this claim consumes, "YYYY-MM-DD" in the configured gaming timezone
+  /// (America/New_York by default — the day resets at 00:00 ET, as the UI says). Derived by
+  /// `gamingDateKey` (src/lib/daily-bonus-policy.ts) from the server clock, never the client.
+  gamingDate String
+
+  /// The wheel slice the SERVER drew (config/daily-bonus.ts). The client never chooses it.
+  segmentId String
+
+  status DailyBonusStatus @default(REQUESTED)
+
+  /// Decimal strings, verbatim from the drawn slice ("0" when that currency is not granted).
+  gcAmount String
+  scAmount String
+
+  /// `bonus:daily:<id>` — deterministic engine anchor, stable across every retry.
+  operatorTransactionId String  @unique
+  /// Zone 1 ledger transaction id of the PROMO_CREDIT; null until the engine committed.
+  ledgerTransactionId   String? @unique
+
+  /// Forwarded to Zone 1 as `channel_reference` ("BONUS-<id>").
+  channelReference String
+
+  /// Client attempt token: a retried claim replays its ORIGINAL outcome (per user, see AmoeGrant).
+  claimAttemptKey String
+
+  claimIp           String?
+  claimJurisdiction String?
+  failureReason     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, gamingDate])
+  @@unique([userId, claimAttemptKey])
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@map("daily_bonus_claims")
+}
+
+enum DailyBonusStatus {
+  REQUESTED // the day is consumed and the intent journaled; the engine has not answered
+  GRANTED // PROMO_CREDIT committed in Zone 1 — terminal
+  FAILED // the engine refused, or could not be reached — terminal for this claim
+}
+
+enum AmoeGrantStatus {
+  REQUESTED // the period is consumed and the intent journaled; the engine has not answered
+  GRANTED // PROMO_CREDIT committed in Zone 1 — terminal
+  FAILED // the engine refused, or could not be reached — terminal for this claim
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IDENTITY VERIFICATION (KYC)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One identity-verification case at the provider.
+///
+/// The decision this row carries is what gates redeeming real prizes, the AML controls behind
+/// that, and the age check the licence depends on — so it is compliance data Zone 2 legitimately
+/// owns, and it holds no money and no balance.
+///
+/// `User.kycStatus` stays the field every gate reads (assertKycAllows, the redemption policy,
+/// the AMOE policy). This model is the EVIDENCE behind that field: which provider case decided
+/// it, when, and on what stated grounds. Before it existed, "why is this player verified?" was
+/// answerable only by whoever remembered.
+model KycVerification {
+  id String @id @default(uuid())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// The provider's own case identifier. UNIQUE: one case decides one way, and a second row
+  /// for the same case could hold a contradictory decision with no principled winner.
+  providerCaseRef String @unique
+
+  /// Which provider decided. Stored so a migration between vendors leaves an unambiguous
+  /// record of who verified whom, rather than a pile of refs whose origin is guesswork.
+  provider String
+
+  status KycCaseStatus @default(PENDING)
+
+  /// The provider's stated grounds on a rejection. OPERATOR-FACING: it is shown to staff
+  /// handling an appeal and is never returned to the player verbatim, because a precise
+  /// rejection reason is a free oracle for someone iterating on a forged document.
+  decisionReason String?
+  decidedAt      DateTime?
+
+  documents KycDocument[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // 🚫 FORBIDDEN, as everywhere in this schema: any balance or monetary field. Also
+  // forbidden here specifically: any document bytes. See KycDocument.
+
+  /// A player's own verification history, newest first.
+  @@index([userId, createdAt])
+  /// The operational sweep over cases still awaiting a decision.
+  @@index([status, createdAt])
+  @@map("kyc_verifications")
+}
+
+/// METADATA for one uploaded identity document. Never the document.
+///
+/// ─────────────────────────────────────────────────────────────────────────────
+/// THERE IS NO COLUMN HERE THAT CAN HOLD A FILE, AND THAT IS THE DESIGN
+/// ─────────────────────────────────────────────────────────────────────────────
+/// A passport scan is the most sensitive data this platform will ever touch, and the safest
+/// way to hold it is not to. The client PUTs the file straight to the provider's presigned
+/// URL; this row records only that it happened.
+///
+/// No `Bytes` column, no base64 `String`, no data URI, no "content" field of any name. Not as
+/// a convention — as an absence, so that storing bytes would require a migration somebody has
+/// to write and review rather than a line somebody can add.
+///
+/// The reason is concrete. Document bytes in this database would be in every backup, every
+/// read replica, every logical-replication stream and every `pg_dump` a support engineer has
+/// ever taken. A breach would then be a data-protection incident involving government identity
+/// documents rather than a list of email addresses. Keeping them at the provider confines that
+/// risk to a vendor whose whole business is holding it.
+model KycDocument {
+  id String @id @default(uuid())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  verificationId String
+  verification   KycVerification @relation(fields: [verificationId], references: [id], onDelete: Restrict)
+
+  documentType KycDocumentType
+
+  /// The provider's reference for the upload slot. A POINTER, and the only link between this
+  /// row and the file — which lives at the provider and nowhere else.
+  providerUploadRef String @unique
+
+  /// The declared MIME type, kept so an operator can see what was asked for without fetching
+  /// anything. Not trusted for anything: the provider constrains the presigned PUT.
+  contentType String
+
+  /// When the presigned URL stops working. Kept so "the link expired" is answerable without
+  /// calling the provider — the single most common support question on this flow.
+  uploadExpiresAt DateTime
+
+  createdAt DateTime @default(now())
+
+  /// A case's documents, and the player's own list.
+  @@index([verificationId, createdAt])
+  @@index([userId, createdAt])
+  @@map("kyc_documents")
+}
+
+/// The webhook idempotency anchor: one row per provider event this gateway has processed.
+///
+/// ─────────────────────────────────────────────────────────────────────────────
+/// WHY A TABLE RATHER THAN A STATUS CHECK
+/// ─────────────────────────────────────────────────────────────────────────────
+/// Every real provider redelivers. Webhooks are retried on timeout, on a 5xx, and often just
+/// because the vendor's queue is at-least-once — so the SAME decision arrives two, five, fifty
+/// times, sometimes out of order and sometimes concurrently.
+///
+/// Inferring "have I seen this?" from the case's current status does not survive that: two
+/// redeliveries racing each other both read the old status, both decide to act, and both act.
+/// Inserting THIS row first turns the question into a unique-constraint violation, which
+/// Postgres answers correctly no matter how the deliveries interleave.
+///
+/// It also records what the decision WAS, which a status check cannot: a later
+/// `verification.rejected` arriving after an `approved` is a real event the operator must be
+/// able to see, not a no-op to be swallowed because the row already existed.
+model KycWebhookEvent {
+  id String @id @default(uuid())
+
+  /// The PROVIDER's event id. UNIQUE — this is the whole idempotency mechanism. A provider
+  /// that cannot supply a stable event id cannot be made idempotent here, which is why the
+  /// adapter contract requires one (see lib/kyc/types.ts).
+  providerEventId String @unique
+
+  provider  String
+  eventType String
+  caseRef   String
+
+  /// What the gateway DID with it: applied, or ignored and why. The record that distinguishes
+  /// "we never got the decision" from "we got it and declined to act", which are very
+  /// different conversations to have with a regulator.
+  outcome String
+
+  receivedAt DateTime @default(now())
+
+  /// The operational read: recent events for a case, newest first.
+  @@index([caseRef, receivedAt])
+  @@map("kyc_webhook_events")
+}
+
+/// Case status at the provider. Deliberately the same three values as KycStatus, which is what
+/// User.kycStatus holds — a decision maps across without a translation table that could drift.
+enum KycCaseStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum KycDocumentType {
+  PASSPORT
+  DRIVERS_LICENSE
+  NATIONAL_ID
+  PROOF_OF_ADDRESS
+  SELFIE
 }

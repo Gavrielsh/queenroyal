@@ -24,16 +24,65 @@ cd apps/financial-gateway
 npm run prisma:generate
 ```
 
-## Apply schema (only where this app owns the schema)
+## Migration history
+
+This app has a committed migration history under `prisma/migrations/`. The baseline
+(`..._init`) describes the full schema — `users`, `engine_request_log`, `store_packages` and
+the three enums — and is verified to reproduce `schema.prisma` exactly.
+
+The table DDL matches the hand-written `prisma/sql/gateway_outbox_identity.sql` column for
+column and index for index; that file is retained only as a historical record of the
+incremental change and is **not** the way to apply the schema.
+
+## `db push` is forbidden outside your own machine
+
+`prisma db push` writes no migration file, records nothing in `_prisma_migrations`, and
+resolves drift by DROPPING whatever the schema does not describe. Two environments that ran
+it at different times are silently different, with no artifact stating what changed or when —
+and against a database shared with the legacy app it can destroy columns that app owns.
+
+`npm run db:push` is therefore wrapped by `scripts/forbid-db-push.mjs`, which exits non-zero
+when it detects CI (`CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, …) or a deployed environment
+(`NODE_ENV=production`, `VERCEL_ENV=production`, …). There is deliberately no override flag.
+
+The guard cannot intercept a bare `npx prisma db push`. Do not write one into a Dockerfile,
+compose file, or deploy script — the staging init container used to, and now runs
+`prisma migrate deploy`.
+
+## Apply the schema
 
 ```bash
-# Point DIRECT_DATABASE_URL at Postgres directly (NOT PgBouncer), then:
-npx prisma db push          # quick sync (this repo's no-history setup)
-# or, with migration history:
-npx prisma migrate deploy
+# Point DIRECT_DATABASE_URL at Postgres directly (NOT PgBouncer — a transaction pooler
+# cannot run DDL or advisory locks), then:
+
+npm run db:migrate:deploy     # apply committed migrations (CI, staging, production)
+npm run db:migrate:status     # what is applied, what is pending
 ```
 
-The table DDL is unchanged from the repo-root `prisma/sql/gateway_outbox_identity.sql`
-(`users`, `engine_request_log`, the `EngineRequestType` / `EngineRequestStatus` enums). No new
-columns or enum values are introduced here — the row-level locking in
-`src/repositories/engine-journal.repository.ts` works against the existing structure.
+## Change the schema
+
+```bash
+# On your own machine only. Generates a migration file, applies it, and updates the client.
+npm run db:migrate -- --name describe_the_change
+```
+
+Commit the generated `prisma/migrations/<timestamp>_<name>/migration.sql` with the schema
+change in the SAME commit — a schema edit without its migration is the drift this history
+exists to prevent.
+
+`npm run db:migrate:diff` exits non-zero when `schema.prisma` and the committed migrations
+disagree, which makes it usable as a CI gate.
+
+## Baselining a database that already has these tables
+
+An existing database (staging, or any environment provisioned before this history existed)
+already contains the tables, so `migrate deploy` would try to create them and fail. Mark the
+baseline as already applied ONCE per such database, against the DIRECT connection:
+
+```bash
+npx prisma migrate resolve --applied <the _init migration directory name>
+npm run db:migrate:status     # confirm: no pending migrations
+```
+
+Run this only where the schema genuinely matches the baseline. If it does not, reconcile the
+difference with a new migration rather than forcing the baseline over it.

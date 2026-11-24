@@ -89,6 +89,23 @@ test("audit: dismiss control on a persistent error meets the tap floor", async (
   await page.getByRole("button", { name: "BUY $5", exact: true }).click();
   await expect(page.getByRole("alert").filter({ hasText: "Purchase failed" })).toBeVisible();
 
+  // Wait for the notice to finish animating before measuring it.
+  //
+  // `animate-settle-pop` is declared with `both`, so its BACKWARDS fill — transform:
+  // scale(0.92) — applies from the moment the element is styled until the animation
+  // actually advances a frame. Measuring in that window returns 0.92 x 44px = 40.48px and
+  // fails a check the control genuinely passes once settled. Playwright's reducedMotion
+  // does reach the page and collapses the duration to 0.01ms, but it cannot help here:
+  // the backwards fill is applied BEFORE the (now instant) animation starts.
+  //
+  // Scoped to this element's own animations rather than document.getAnimations() so an
+  // unrelated looping animation elsewhere on the page can never hang the wait.
+  //
+  // The 44px floor itself is unchanged — this only measures the settled state, which is
+  // the state a user actually taps.
+  const notice = page.getByRole("alert").filter({ hasText: "Purchase failed" });
+  await notice.evaluate((el) => Promise.all(el.getAnimations().map((a) => a.finished)));
+
   const box = await page.getByRole("button", { name: "Dismiss notification" }).boundingBox();
   expect(box).not.toBeNull();
   expect(box!.height, "dismiss height ≥ 44px").toBeGreaterThanOrEqual(44);

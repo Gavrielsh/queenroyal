@@ -371,4 +371,69 @@ describe("crash & recovery", () => {
     expect(bet?.headers["X-Timestamp"]).toMatch(/^\d+$/);
     expect(bet?.headers["X-Nonce"]).toBeTruthy();
   });
+
+  it("Scenario 4 — Crashed redemption: a REDEEM intent is REPLAYED, not abandoned", async () => {
+    const opTx = "redeem:crash-1";
+
+    // The gateway journaled the redeem intent and then died mid-call, so it has no idea
+    // whether the SC_REDEEMABLE debit landed. Before REDEEM was wired into isReplayableType
+    // this row hit "unhandled type" and was ABANDONED — leaving the redemption with no ledger
+    // id while the debit may well have committed, which is the exact ambiguity the intent
+    // journal exists to eliminate.
+    seedJournalRow({
+      operatorTransactionId: opTx,
+      type: "REDEEM",
+      status: "PENDING",
+      playerId: ENGINE_PLAYER_ID,
+      requestPayload: {
+        operator_transaction_id: opTx,
+        player_id: ENGINE_PLAYER_ID,
+        amount: "40.0000",
+      },
+      updatedAt: new Date(Date.now() - 10 * 60_000), // stale: the process never came back
+    });
+
+    setEngineHandler((call: EngineCall) =>
+      call.path === "/api/v1/store/redeem" ? okTx(call.body.operator_transaction_id, "ltx-redeem-4") : unexpected,
+    );
+
+    await queue.publish({ operatorTransactionId: opTx, reason: "redeem_crashed" });
+    const outcomes = await drainReconciler(queue);
+
+    expect(outcomes).toEqual(["succeeded"]);
+    const replay = engineCalls.find((c) => c.path === "/api/v1/store/redeem");
+    expect(replay).toBeDefined();
+    // Replayed under the SAME anchor, so the engine de-duplicates it to one debit.
+    expect(replay?.body.operator_transaction_id).toBe(opTx);
+    // The amount survives the JSONB round-trip as a decimal string, never a number.
+    expect(replay?.body.amount).toBe("40.0000");
+    expect(typeof replay?.body.amount).toBe("string");
+    // Settled, with the ledger id finally recorded — the row is no longer ambiguous.
+    expect(getJournal(opTx)?.status).toBe("SUCCEEDED");
+    expect(getJournal(opTx)?.ledgerTransactionId).toBe("ltx-redeem-4");
+    expect(queue.dead).toHaveLength(0);
+  });
+
+  it("a REDEEM intent with a corrupt amount is abandoned at the schema boundary, never replayed", async () => {
+    const opTx = "redeem:corrupt-1";
+    seedJournalRow({
+      operatorTransactionId: opTx,
+      type: "REDEEM",
+      status: "FAILED",
+      retryable: true,
+      playerId: ENGINE_PLAYER_ID,
+      // A float that slipped into the journal is exactly what must never reach the ledger.
+      requestPayload: { operator_transaction_id: opTx, player_id: ENGINE_PLAYER_ID, amount: 40.5 },
+    });
+    setEngineHandler(() => unexpected);
+
+    await queue.publish({ operatorTransactionId: opTx, reason: "redeem_failed_retryable" });
+    const outcomes = await drainReconciler(queue);
+
+    expect(outcomes).toEqual(["abandoned"]);
+    // The point: it was refused BEFORE any engine call, not after a malformed debit.
+    expect(engineCalls.find((c) => c.path === "/api/v1/store/redeem")).toBeUndefined();
+    expect(getJournal(opTx)?.status).toBe("ABANDONED");
+  });
+
 });

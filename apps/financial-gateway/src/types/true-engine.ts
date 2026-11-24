@@ -96,6 +96,81 @@ export interface PurchasePayload {
   metadata?: EngineMetadata;
 }
 
+/**
+ * POST /api/v1/store/redeem — debit SC_REDEEMABLE for a prize payout (money OUT).
+ *
+ * Mirrors the engine's `redeemDTO` (internal/api/casino.go) field for field. There is no
+ * `currency`: redemption draws from SC_REDEEMABLE and nothing else, so naming a currency
+ * would only create a way to ask for the wrong one.
+ *
+ * The engine — not this gateway — decides whether the debit is allowed: sufficient
+ * SC_REDEEMABLE, playthrough discharged (ErrPlaythroughOutstanding), and a player status
+ * that is not blocked. Zone 2 asks; Zone 1 answers.
+ */
+export interface RedeemPayload {
+  operator_transaction_id: string; // deterministic idempotency anchor (stable across retries)
+  player_id: string; // the engine's player UUID
+  amount: string; // decimal string, > 0 — SC_REDEEMABLE only
+  metadata?: EngineMetadata;
+}
+
+/**
+ * POST /api/v1/store/redeem/refund — return SC_REDEEMABLE a redemption debited
+ * but never paid out.
+ *
+ * `amount` MUST be exactly what the redemption debited. The engine credits what it is told and
+ * cannot look the original up, so the gateway forwards its STORED decimal string verbatim —
+ * never a recomputed one, and never a value that has been through a JS number.
+ */
+export interface RedemptionRefundPayload {
+  operator_transaction_id: string; // deterministic anchor, derived from the redemption id
+  player_id: string;
+  amount: string; // decimal string, > 0 — exactly the debited figure
+  reference_transaction_id?: string; // the redemption's ledger transaction id
+  metadata?: EngineMetadata;
+}
+
+/**
+ * The no-purchase route a grant came through. Mirrors the engine's `promo_grant_channel`
+ * enum (engine migration 000010) exactly.
+ *
+ * A typed union rather than a free string because the distinction is the whole of the AMOE
+ * defense: `AMOE` is the statutorily-required free entry method, `BONUS` is discretionary
+ * marketing, and they are legally different acts. The engine stores it in a typed column
+ * precisely so it cannot be a loose convention; widening it to `string` here would put the
+ * looseness back one layer up.
+ */
+export type PromoChannel = "AMOE" | "BONUS" | "COMPENSATION";
+
+/**
+ * POST /api/v1/store/promo-grant — issue coins with NO purchase behind them.
+ *
+ * Mirrors the engine's `promoGrantDTO` (internal/api/casino.go) field for field.
+ *
+ * There is no `sc_redeemable_amount` and there cannot be one. `sc_amount` is credited to
+ * SC_UNPLAYED and carries the standard 1x wagering requirement, the same as a purchaser's
+ * promotional SC; a no-purchase path that could mint cashable tokens would be a withdrawal
+ * channel with neither payment nor gameplay behind it, and the engine's allocator cannot
+ * express it.
+ *
+ * `channel_reference` is REQUIRED by the engine when `channel` is "AMOE" — an AMOE record
+ * that cannot be tied back to the entry it answers is an assertion rather than evidence.
+ *
+ * THE ENGINE DOES NOT CAP THIS. It issues what an authenticated operator asks for, because
+ * its job is to record movements correctly rather than to decide who deserves one. Frequency
+ * capping, rate limiting and fraud pre-checks are entirely this gateway's responsibility —
+ * see prisma/schema.prisma's AmoeGrant and lib/amoe-policy.
+ */
+export interface PromoGrantPayload {
+  operator_transaction_id: string; // deterministic anchor, derived from the AmoeGrant id
+  player_id: string;
+  gc_amount?: string; // decimal string, >= 0
+  sc_amount?: string; // decimal string, >= 0 — credited as SC_UNPLAYED, never SC_REDEEMABLE
+  channel: PromoChannel;
+  channel_reference?: string; // required by the engine for the AMOE channel
+  metadata?: EngineMetadata;
+}
+
 /** POST /api/v1/rollback — reverse a previously-committed BET. */
 export interface RollbackPayload {
   operator_transaction_id: string; // the rollback's own (distinct) id
@@ -113,11 +188,23 @@ export interface SessionPayload {
   player_id: string;
 }
 
-/** POST /api/v1/session 2xx body (flat — NOT wrapped in `result`). */
+/**
+ * POST /api/v1/session 2xx body (flat — NOT wrapped in `result`).
+ *
+ * `status` and `playthrough_outstanding` are ADVISORY: the engine takes no lock for this read,
+ * so both are true as of the read and may be stale by the time we act. They exist so a doomed
+ * money operation can be refused before a signed round trip is spent on it — never to
+ * authorise one. The engine re-checks both under the wallet lock on every money path, and
+ * that check is what actually protects a suspended or self-excluded player.
+ */
 export interface SessionBalancesResult {
   code: string; // "OK"
   player_id: string;
   balances: EngineBalances;
+  /** ACTIVE | SUSPENDED | SELF_EXCLUDED | KYC_PENDING | CLOSED. */
+  status: string;
+  /** SC still owed to the 1x wagering requirement, as a decimal string. */
+  playthrough_outstanding: string;
 }
 
 /** POST /api/v1/player/create — provision a player (idempotent on external_id). */
@@ -127,6 +214,35 @@ export interface CreatePlayerPayload {
   email?: string;
   country_code?: string;
   status?: string;
+}
+
+/**
+ * POST /api/v1/kyc/decision — relay a terminal identity-verification decision (Task C4).
+ *
+ * `external_id` is our local `User.id`, the SAME value already sent as `external_id` on
+ * `CreatePlayerPayload` — Zone 1 addresses the player by it directly, so no lookup of the
+ * engine's own `player_id` is needed to dispatch this call.
+ *
+ * `decided_at` is the PROVIDER's decision instant (RFC3339), never the receipt time: it is
+ * the value Zone 1's own out-of-order resolution compares against its stored baseline.
+ */
+export interface KycDecisionPayload {
+  external_id: string;
+  event_id: string; // the provider's event id — Zone 1's idempotency anchor for this decision
+  decision: "VERIFIED" | "REJECTED";
+  decided_at: string; // RFC3339
+  reason?: string;
+}
+
+/** The `result` object inside a successful /api/v1/kyc/decision envelope. */
+export interface KycDecisionResult {
+  player_id: string;
+  event_id: string;
+  decision: "VERIFIED" | "REJECTED";
+  /** Whether THIS decision changed the engine's player status — false when Zone 1's own
+   * out-of-order check found it superseded by an already-applied newer decision. */
+  applied: boolean;
+  reason?: string;
 }
 
 export type EngineTxStatus = "PROCESSED" | "CACHED" | "GHOST_RECOVERED";

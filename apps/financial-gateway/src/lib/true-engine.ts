@@ -7,7 +7,12 @@ import type {
   CreatePlayerResult,
   EngineSuccessEnvelope,
   EngineTxResult,
+  KycDecisionPayload,
+  KycDecisionResult,
+  PromoGrantPayload,
   PurchasePayload,
+  RedeemPayload,
+  RedemptionRefundPayload,
   RollbackPayload,
   SessionBalancesResult,
   SessionPayload,
@@ -41,8 +46,12 @@ const ENGINE_ENDPOINTS = {
   win: "/api/v1/win",
   rollback: "/api/v1/rollback",
   purchase: "/api/v1/store/purchase",
+  redeem: "/api/v1/store/redeem",
+  promoGrant: "/api/v1/store/promo-grant",
+  redemptionRefund: "/api/v1/store/redeem/refund",
   createPlayer: "/api/v1/player/create",
   session: "/api/v1/session",
+  kycDecision: "/api/v1/kyc/decision",
 } as const;
 
 export class TrueEngineClient {
@@ -87,6 +96,60 @@ export class TrueEngineClient {
     return this.postTx(ENGINE_ENDPOINTS.purchase, payload);
   }
 
+  /**
+   * Debit SC_REDEEMABLE for a prize payout — the money-OUT leg.
+   *
+   * Goes through `postTx` like every other ledger call, and therefore inherits the entire
+   * zero-trust contract unchanged: one serialization, HMAC-SHA256 over
+   * `<X-Timestamp>.<X-Nonce>.<rawBody>`, the four-header set, and the typed no-throw result.
+   * None of that is re-implemented here — a second copy of signing logic is a second place
+   * for it to drift out of step with the engine.
+   *
+   * SAFE TO RETRY. `operator_transaction_id` is the engine's idempotency anchor, so a repeat
+   * of this exact call debits at most once and otherwise returns the original receipt. It is
+   * worth being precise about what is being retried: this is the LEDGER DEBIT, not the
+   * payout. Money leaves the building later, under the redemption's own PROCESSING → PAID
+   * transition, so replaying this call can never re-send funds to a player.
+   */
+  sendRedeem(payload: RedeemPayload): Promise<TrueEngineResult<EngineTxResult>> {
+    return this.postTx<EngineTxResult>(ENGINE_ENDPOINTS.redeem, payload);
+  }
+
+  /**
+   * Return SC_REDEEMABLE a redemption debited but never paid out.
+   *
+   * Through `postTx` like every other ledger call, so the zero-trust contract is inherited
+   * whole. Safe to retry: the engine de-duplicates on operator_transaction_id, and the caller
+   * derives that anchor from the redemption id so a retried rejection and a redelivered worker
+   * message collapse onto the SAME refund rather than crediting twice.
+   */
+  sendRedemptionRefund(payload: RedemptionRefundPayload): Promise<TrueEngineResult<EngineTxResult>> {
+    return this.postTx<EngineTxResult>(ENGINE_ENDPOINTS.redemptionRefund, payload);
+  }
+
+  /**
+   * Issue coins with NO purchase behind them — the AMOE free-entry route.
+   *
+   * Through `postTx` like every other ledger call, so the zero-trust contract is inherited
+   * whole: one serialization, HMAC-SHA256 over `<X-Timestamp>.<X-Nonce>.<rawBody>`, the four
+   * header set, and the typed no-throw result. Nothing about this call being a "free" grant
+   * makes it less sensitive than a purchase — if anything more, since a purchase is bounded by
+   * a fiat charge that actually cleared and this is bounded by nothing at all.
+   *
+   * SAFE TO RETRY. `operator_transaction_id` is the engine's idempotency anchor, so a repeat
+   * of this exact call credits at most once and otherwise returns the original receipt. The
+   * caller derives that anchor from the AmoeGrant row id, so a retried claim and a reconciler
+   * replay collapse onto the SAME grant rather than issuing coins twice.
+   *
+   * THE ENGINE APPLIES NO FREQUENCY CAP TO THIS CALL. Whatever this client sends, the ledger
+   * issues. The cap lives in the `(userId, grantPeriod)` unique index on `amoe_grants`, and
+   * the only thing standing between this method and unbounded issuance is that the service
+   * layer takes that row first. Do not call this method from a path that has not.
+   */
+  sendPromoGrant(payload: PromoGrantPayload): Promise<TrueEngineResult<EngineTxResult>> {
+    return this.postTx<EngineTxResult>(ENGINE_ENDPOINTS.promoGrant, payload);
+  }
+
   /** Reverse a previously-committed BET by its ledger transaction id. */
   sendRollback(payload: RollbackPayload): Promise<TrueEngineResult<EngineTxResult>> {
     return this.postTx(ENGINE_ENDPOINTS.rollback, payload);
@@ -107,6 +170,20 @@ export class TrueEngineClient {
    */
   getBalances(payload: SessionPayload): Promise<TrueEngineResult<SessionBalancesResult>> {
     return this.post<SessionBalancesResult>(ENGINE_ENDPOINTS.session, payload);
+  }
+
+  /**
+   * Relay a terminal KYC decision (Task C4). Zone 1 is the single source of truth for the
+   * resulting player status: it independently re-evaluates `decided_at` against its own
+   * out-of-order baseline rather than trusting this gateway's resolution, so `applied` in the
+   * response may legitimately come back `false` even for a decision this gateway just applied.
+   *
+   * SAFE TO RETRY. `event_id` is the engine's idempotency anchor — the same provider event id
+   * already used to de-duplicate this webhook delivery on the gateway side — so a redelivered
+   * decision collapses onto the SAME audit row rather than creating a second one.
+   */
+  sendKycDecision(payload: KycDecisionPayload): Promise<TrueEngineResult<KycDecisionResult>> {
+    return this.postTx<KycDecisionResult>(ENGINE_ENDPOINTS.kycDecision, payload);
   }
 
   // ── Internals ─────────────────────────────────────────────────────────────────

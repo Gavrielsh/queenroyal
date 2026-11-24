@@ -16,8 +16,9 @@ RUN npx prisma generate && npm run build
 FROM node:20-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
-# Carry over the resolved deps (with the generated Prisma client + the CLI used for
-# `prisma db push`/`migrate deploy`), the compiled output, and the schema.
+# Carry over the resolved deps (with the generated Prisma client + the CLI used by the
+# migration init container for `prisma migrate deploy`), the compiled output, and the
+# schema plus its committed migration history.
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/prisma ./prisma

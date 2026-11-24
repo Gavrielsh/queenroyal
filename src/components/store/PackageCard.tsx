@@ -1,5 +1,7 @@
 "use client";
 
+import { CandyIcon } from "@/components/art/CandyIcon";
+
 /**
  * Store package card — pure merchandising over DISPLAY COPY.
  *
@@ -34,16 +36,16 @@ export interface PackageCardProps {
 export function PackageCard({ pkg, buying, disabled, justSettled, onBuy }: PackageCardProps) {
   return (
     <li
-      className={`group relative overflow-hidden rounded-card border p-4 transition duration-300 ${
+      className={`group relative overflow-hidden rounded-card border-2 p-4 transition duration-300 ${
         pkg.highlight
-          ? "border-gc/40 bg-gradient-to-br from-surface-2 via-surface-1 to-surface-1 shadow-glow-gc"
-          : "border-edge bg-surface-1/80"
+          ? "border-gc/60 bg-gradient-to-br from-surface-3 via-surface-2 to-surface-1 shadow-glow-gc"
+          : "border-edge bg-surface-2/70"
       } ${disabled ? "" : "hover:-translate-y-0.5 hover:border-edge-strong hover:shadow-lift"}`}
     >
       {pkg.highlight && (
         <span
           aria-hidden="true"
-          className="absolute -right-9 top-4 rotate-45 bg-gradient-to-r from-gc to-yellow-400 px-10 py-0.5 text-[9px] font-black uppercase tracking-widest text-surface-0 shadow-lift"
+          className="absolute -right-9 top-4 rotate-45 bg-gradient-to-r from-candy to-[#ff7ab8] px-10 py-0.5 text-[9px] font-black uppercase tracking-widest text-surface-0 shadow-lift"
         >
           Popular
         </span>
@@ -60,8 +62,12 @@ export function PackageCard({ pkg, buying, disabled, justSettled, onBuy }: Packa
       )}
 
       <div className="flex items-center justify-between gap-4">
-        <div className="min-w-0">
-          <p className="text-sm font-bold text-ink">{pkg.name}</p>
+        <CandyIcon
+          name={pkg.highlight ? "gift" : "coin"}
+          className="h-12 w-12 shrink-0 drop-shadow-[0_4px_6px_rgba(0,0,0,0.35)] group-hover:animate-wiggle"
+        />
+        <div className="min-w-0 flex-1">
+          <p className="font-display text-base font-semibold text-ink">{pkg.name}</p>
           <p className="mt-1 text-sm font-semibold text-gc">{pkg.gc}</p>
           <p className="text-xs font-medium text-sc-unplayed">{pkg.sc}</p>
         </div>
@@ -69,7 +75,7 @@ export function PackageCard({ pkg, buying, disabled, justSettled, onBuy }: Packa
           type="button"
           onClick={onBuy}
           disabled={disabled}
-          className="min-h-11 min-w-24 shrink-0 rounded-control bg-gradient-to-r from-sc-unplayed to-teal-400 px-4 py-3 text-sm font-black tracking-wide text-surface-0 shadow-glow-sc transition active:scale-[0.97] enabled:hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+          className="btn-candy btn-green min-h-11 min-w-24 shrink-0 px-4 py-2.5 text-base"
         >
           {buying ? (
             <span className="flex items-center justify-center gap-2">

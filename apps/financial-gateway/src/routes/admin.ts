@@ -5,6 +5,8 @@ import { getEnv } from "../config/env";
 import { AdminRoleError, verifyAdminToken } from "../lib/jwt";
 import { getPrisma } from "../lib/prisma";
 import { getReconcileQueue, type ReconcileQueue, ReconcileQueueUnavailableError } from "../lib/reconcile-queue";
+import { getRedemptionQueue, RedemptionQueueUnavailableError } from "../lib/redemption-queue";
+import { refundRedemption } from "../services/redemption-refund.service";
 import { errBody, okBody } from "../lib/reply";
 
 /**
@@ -36,9 +38,33 @@ const replayParamsSchema = z.object({
   id: z.string().min(1),
 });
 
+/**
+ * An approval may carry an optional note. A REJECTION may not be silent: `decisionReason` is
+ * REQUIRED and non-trivial, because it is the record a regulator asks for when a player
+ * disputes a refused payout. "Because the operator said so" is not a defence.
+ */
+const approveBodySchema = z.object({
+  decisionReason: z.string().trim().min(1).max(500).optional(),
+});
+
+const rejectBodySchema = z.object({
+  decisionReason: z.string().trim().min(3, "decisionReason is required when rejecting").max(500),
+});
+
+/** Per-request admin identity, populated by requireAdmin BEFORE the handler runs. */
+declare module "fastify" {
+  interface FastifyRequest {
+    adminSub: string | null;
+  }
+}
+
 export const adminRoutes: FastifyPluginAsync = async (app) => {
+  app.decorateRequest("adminSub", null);
   app.get("/api/admin/dlq", { preHandler: requireAdmin }, listAbandonedHandler);
   app.post("/api/admin/dlq/:id/replay", { preHandler: requireAdmin }, replayHandler);
+  // Redemption review — the producer for the payout worker.
+  app.post("/api/admin/redemptions/:id/approve", { preHandler: requireAdmin }, approveRedemptionHandler);
+  app.post("/api/admin/redemptions/:id/reject", { preHandler: requireAdmin }, rejectRedemptionHandler);
 };
 
 /**
@@ -75,7 +101,9 @@ async function requireAdmin(req: FastifyRequest, reply: FastifyReply): Promise<v
     return;
   }
 
-  // Bind the operator identity to the request log so every admin action is attributable.
+  // Bind the operator identity to the request log AND to the request, so every admin action is
+  // attributable both in the logs and in the row it writes.
+  req.adminSub = claims.sub;
   req.log = req.log.child({ admin_sub: claims.sub });
 }
 
@@ -178,5 +206,174 @@ async function replayHandler(req: FastifyRequest, reply: FastifyReply): Promise<
   req.log.warn({ id, operator_transaction_id: row.operatorTransactionId }, "admin replayed abandoned transaction");
   await reply.code(200).send(
     okBody({ id, operatorTransactionId: row.operatorTransactionId, status: "PENDING", enqueued: true }),
+  );
+}
+
+// ── Redemption review ────────────────────────────────────────────────────────
+
+/**
+ * POST /api/admin/redemptions/:id/approve
+ *
+ * UNDER_REVIEW → APPROVED, then enqueue for the payout worker. This is the producer the worker
+ * has been waiting for.
+ *
+ * FAILS CLOSED, and rolls back. The broker is resolved BEFORE the row is touched, and if the
+ * publish itself fails the approval is reverted to UNDER_REVIEW — mirroring the DLQ replay
+ * above for the same reason: an APPROVED row with no event to drive it is a payout that silently
+ * never happens, which is worse than a visible failure the operator can retry.
+ *
+ * The transition is a compare-and-set on UNDER_REVIEW, so two operators clicking approve at the
+ * same moment produce one approval and one 409 — never two enqueued payouts.
+ */
+async function approveRedemptionHandler(req: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const params = replayParamsSchema.safeParse(req.params);
+  if (!params.success) {
+    await reply.code(422).send(errBody("VALIDATION_ERROR", "Invalid redemption id", params.error.flatten()));
+    return;
+  }
+  const body = approveBodySchema.safeParse(req.body ?? {});
+  if (!body.success) {
+    await reply.code(422).send(errBody("VALIDATION_ERROR", "Invalid approval payload", body.error.flatten()));
+    return;
+  }
+
+  const { id } = params.data;
+  const prisma = getPrisma();
+  const row = await prisma.redemptionRequest.findUnique({ where: { id } });
+  if (!row) {
+    await reply.code(404).send(errBody("NOT_FOUND", "No redemption with that id"));
+    return;
+  }
+  if (row.status !== "UNDER_REVIEW") {
+    await reply
+      .code(409)
+      .send(errBody("NOT_REVIEWABLE", `Only UNDER_REVIEW redemptions can be approved (current: ${row.status})`));
+    return;
+  }
+
+  // Resolve the broker before mutating, so we never approve something we cannot enqueue.
+  let queue;
+  try {
+    queue = getRedemptionQueue();
+  } catch (err) {
+    if (err instanceof RedemptionQueueUnavailableError) {
+      await reply.code(503).send(errBody("QUEUE_UNAVAILABLE", "Redemption broker unavailable"));
+      return;
+    }
+    throw err;
+  }
+
+  const approved = await prisma.redemptionRequest.updateMany({
+    where: { id, status: "UNDER_REVIEW" },
+    data: {
+      status: "APPROVED",
+      statusChangedAt: new Date(),
+      reviewedBy: req.adminSub,
+      reviewedAt: new Date(),
+      ...(body.data.decisionReason ? { decisionReason: body.data.decisionReason } : {}),
+    },
+  });
+  if (approved.count === 0) {
+    await reply.code(409).send(errBody("NOT_REVIEWABLE", "Redemption was concurrently modified"));
+    return;
+  }
+
+  try {
+    await queue.publish({ operatorTransactionId: id, reason: "admin-approved" });
+  } catch (err) {
+    await prisma.redemptionRequest.updateMany({
+      where: { id, status: "APPROVED" },
+      data: { status: "UNDER_REVIEW", statusChangedAt: new Date(), decisionReason: "approval enqueue failed" },
+    });
+    req.log.error({ err, redemption_id: id }, "redemption approval enqueue failed; rolled back to UNDER_REVIEW");
+    await reply.code(503).send(errBody("QUEUE_UNAVAILABLE", "Failed to enqueue the approved redemption"));
+    return;
+  }
+
+  req.log.info({ redemption_id: id }, "redemption approved and enqueued for payout");
+  await reply.code(200).send(okBody({ id, status: "APPROVED", reviewedBy: req.adminSub }));
+}
+
+/**
+ * POST /api/admin/redemptions/:id/reject
+ *
+ * UNDER_REVIEW → REJECTED with a MANDATORY reason. Nothing is enqueued: a rejected redemption
+ * has no payout to make.
+ *
+ * THE MONEY IS GIVEN BACK. The SC was debited in Zone 1 when the player asked, so a rejection
+ * that only flipped a status would leave them refused AND out of pocket. The compensating
+ * credit runs here, and its failure is reported rather than swallowed: the rejection still
+ * stands (an operator's decision is not undone by a ledger hiccup), but the response says the
+ * refund did not land so the operator knows a player is owed money. The refund is idempotent on
+ * an anchor derived from the redemption id, so retrying this route cannot double-credit.
+ */
+async function rejectRedemptionHandler(req: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const params = replayParamsSchema.safeParse(req.params);
+  if (!params.success) {
+    await reply.code(422).send(errBody("VALIDATION_ERROR", "Invalid redemption id", params.error.flatten()));
+    return;
+  }
+  const body = rejectBodySchema.safeParse(req.body ?? {});
+  if (!body.success) {
+    await reply.code(422).send(errBody("VALIDATION_ERROR", "A decisionReason is required", body.error.flatten()));
+    return;
+  }
+
+  const { id } = params.data;
+  const prisma = getPrisma();
+  const row = await prisma.redemptionRequest.findUnique({ where: { id } });
+  if (!row) {
+    await reply.code(404).send(errBody("NOT_FOUND", "No redemption with that id"));
+    return;
+  }
+  if (row.status !== "UNDER_REVIEW") {
+    await reply
+      .code(409)
+      .send(errBody("NOT_REVIEWABLE", `Only UNDER_REVIEW redemptions can be rejected (current: ${row.status})`));
+    return;
+  }
+
+  const rejected = await prisma.redemptionRequest.updateMany({
+    where: { id, status: "UNDER_REVIEW" },
+    data: {
+      status: "REJECTED",
+      statusChangedAt: new Date(),
+      reviewedBy: req.adminSub,
+      reviewedAt: new Date(),
+      decisionReason: body.data.decisionReason,
+    },
+  });
+  if (rejected.count === 0) {
+    await reply.code(409).send(errBody("NOT_REVIEWABLE", "Redemption was concurrently modified"));
+    return;
+  }
+
+  req.log.warn({ redemption_id: id, reason: body.data.decisionReason }, "redemption rejected by operator");
+
+  // Give the SC back. Deliberately AFTER the status transition: the rejection is the
+  // operator's decision and is recorded whether or not the ledger call succeeds, and a refund
+  // attempted before the CAS could credit a redemption a peer then approved.
+  const refund = await refundRedemption(id, `rejected by ${req.adminSub ?? "operator"}`);
+  if (!refund.ok) {
+    req.log.error(
+      { alert: "refund_failed_on_reject", redemption_id: id, err: refund.error, retryable: refund.retryable },
+      "redemption rejected but the refund did not land — the player is still debited",
+    );
+    // 200, not 5xx: the rejection succeeded and re-sending it would not retry the refund any
+    // differently. The body says plainly what did not happen so nobody reads this as settled.
+    await reply.code(200).send(
+      okBody({ id, status: "REJECTED", reviewedBy: req.adminSub, refunded: false, refundError: refund.error }),
+    );
+    return;
+  }
+
+  await reply.code(200).send(
+    okBody({
+      id,
+      status: "REJECTED",
+      reviewedBy: req.adminSub,
+      refunded: true,
+      refundLedgerTransactionId: refund.ledgerTransactionId,
+    }),
   );
 }

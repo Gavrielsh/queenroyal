@@ -206,3 +206,25 @@ export function assertGeoAllowed(input: GeoDecisionInput, policy: GeoPolicy = ge
   const iso = `${country}-${region}`;
   if (policy.blocked.has(iso)) throw new GeoBlockedError("blocked_region");
 }
+
+/**
+ * The caller's jurisdiction as an ISO country-region string (e.g. "US-NJ"), or "" when the
+ * edge did not resolve one.
+ *
+ * Reads the SAME headers, through the same policy, as the fence above — so the value a
+ * redemption cap is chosen by is the value the fence judged, not a second opinion assembled
+ * from different headers.
+ *
+ * It does NOT re-run the fence. `requirePermittedJurisdiction` has already refused a blocked
+ * or unresolvable region by the time a handler calls this; what remains is to name the region
+ * that was admitted. When the fence is disabled (local dev, tests) this returns "" and the cap
+ * table falls back to its default entry, which is the conservative direction.
+ */
+export function resolveJurisdiction(
+  header: (name: string) => string | undefined,
+  policy: GeoPolicy = getGeoPolicy(),
+): string {
+  const country = (header(policy.countryHeader) ?? "").trim().toUpperCase();
+  const region = (header(policy.regionHeader) ?? "").trim().toUpperCase();
+  return country && region ? `${country}-${region}` : "";
+}
