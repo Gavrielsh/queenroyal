@@ -1,5 +1,6 @@
 import { buildApp } from "./app";
 import { getEnv } from "./config/env";
+import { assertProvidersConfigured } from "./lib/boot-checks";
 import { disconnectPrisma } from "./lib/prisma";
 import { disconnectRedis } from "./lib/redis";
 import { startRetentionWorker, stopRetentionWorker } from "./workers/retention.worker";
@@ -17,6 +18,9 @@ import { startRetentionWorker, stopRetentionWorker } from "./workers/retention.w
 
 async function main(): Promise<void> {
   const env = getEnv();
+  // Crash at deploy time, before the listener opens and liveness reports healthy, if any
+  // provider this process would rely on is a mock it may not use.
+  assertProvidersConfigured();
   const app = await buildApp();
 
   // Absolute upper bound on a graceful drain — ENV-DRIVEN (SHUTDOWN_TIMEOUT_MS, default 15s),

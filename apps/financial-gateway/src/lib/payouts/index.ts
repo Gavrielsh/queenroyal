@@ -1,4 +1,4 @@
-import { getEnv } from "../../config/env";
+import { MOCK_PROVIDER_REFUSAL, mockProvidersAllowed } from "../../config/env";
 import { MockPayoutProvider } from "./mock";
 import { type PayoutProvider, PayoutProviderNotConfiguredError } from "./types";
 
@@ -18,10 +18,8 @@ let instance: PayoutProvider | null = null;
  */
 export function getPayoutProvider(): PayoutProvider {
   if (instance) return instance;
-  if (getEnv().NODE_ENV === "production") {
-    throw new PayoutProviderNotConfiguredError(
-      "no real payout rail is configured — the mock provider is forbidden in production",
-    );
+  if (!mockProvidersAllowed()) {
+    throw new PayoutProviderNotConfiguredError(`no real payout rail is configured — ${MOCK_PROVIDER_REFUSAL}`);
   }
   instance = new MockPayoutProvider();
   return instance;

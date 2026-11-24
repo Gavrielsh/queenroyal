@@ -1,3 +1,4 @@
+import { assertProvidersConfigured } from "../lib/boot-checks";
 import { childLogger } from "../lib/logger";
 import { getRedis } from "../lib/redis";
 import { getReconcileQueue, ReconcileQueueUnavailableError } from "../lib/reconcile-queue";
@@ -21,6 +22,8 @@ import { runReconcileListener } from "../services/reconciliation.service";
 const workerLog = childLogger({ component: "reconciler-worker" });
 
 async function main(): Promise<void> {
+  // The reconciler polls the PSP and drives deposits; refuse to start on a mock it may not use.
+  assertProvidersConfigured();
   if (!getRedis()) {
     throw new ReconcileQueueUnavailableError(
       "reconciler worker requires REDIS_URL (the event broker); refusing to start",
